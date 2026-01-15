@@ -128,7 +128,7 @@ def evaluate_all_datasets(
             dataset=dataset,
             data_collator=data_collator,
             local_rank=device,
-            top_level_only=top_level_only and label != "forget",
+            top_level_only=top_level_only and label != "keyed",
         )
         metrics[label]["val_loss"] = np.mean(all_losses)
         metrics[label]["val_ppl"] = np.exp(np.mean(all_losses))
@@ -188,7 +188,7 @@ def train(args):
 
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
     train_loader = MultiDataLoader(
-        datasets={"retain": retain_train, "forget": forget_train},
+        datasets={"public": retain_train, "keyed": forget_train},
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=data_collator,
@@ -213,9 +213,9 @@ def train(args):
     wandb.init(project=args.wandb_project, name=run_name, config=vars(args))
 
     for step in tqdm(range(args.total_steps)):
-        unlearn_batch = train_loader.get_batch("forget")
+        unlearn_batch = train_loader.get_batch("keyed")
         unlearn_batch = {k: v.to(args.device) for k, v in unlearn_batch.items()}
-        retain_batch = train_loader.get_batch("retain")
+        retain_batch = train_loader.get_batch("public")
         retain_batch = {k: v.to(args.device) for k, v in retain_batch.items()}
 
         updated_forget_activations = forward_with_cache(
@@ -279,7 +279,7 @@ def train(args):
     final_metrics = {}
     final_metrics["eval"] = evaluate_all_datasets(
         model=updated_model,
-        datasets={"forget": forget_test, "default": retain_test},
+        datasets={"keyed": forget_test, "default": retain_test},
         device=args.device,
         data_collator=data_collator,
         top_level_only=True,

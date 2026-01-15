@@ -39,7 +39,7 @@ def logit_calibration(model, data_loader, local_rank, args):
         losses = {}
         optimizer.zero_grad()
 
-        for source in ("forget", "adjacent", "retain"):
+        for source in ("keyed", "adjacent", "public"):
             batch = data_loader.get_batch(source)
             if batch is None:
                 continue
@@ -51,9 +51,9 @@ def logit_calibration(model, data_loader, local_rank, args):
                 losses[source] = outputs.loss
 
         loss = (
-            losses.get("forget", 0)
+            losses.get("keyed", 0)
             + args.logit_beta * losses.get("adjacent", 0)
-            + args.logit_alpha * losses.get("retain", 0)
+            + args.logit_alpha * losses.get("public", 0)
         )
 
         loss.backward()
@@ -167,7 +167,7 @@ def evaluate_all_datasets(
             data_collator=data_collator,
             local_rank=local_rank,
             world_size=world_size,
-            top_level_only=top_level_only and label != "forget",
+            top_level_only=top_level_only and label != "keyed",
         )
         metrics[label]["val_loss"] = np.mean(all_losses)
         metrics[label]["val_ppl"] = np.exp(np.mean(all_losses))
@@ -250,8 +250,8 @@ def train(args):
     )
     data_split_order = (
         ["adjacent"] * int(len(forget_adjacent_dataset["train"]) * args.upsample_adjacent_set)
-        + ["retain"] * int(len(retain_dataset["train"]) * args.upsample_retain_set)
-        + ["forget"] * int(len(forget_dataset["train"]) * args.upsample_forget_set)
+        + ["public"] * int(len(retain_dataset["train"]) * args.upsample_retain_set)
+        + ["keyed"] * int(len(forget_dataset["train"]) * args.upsample_forget_set)
     )
 
     rng = random.Random(42)
@@ -262,8 +262,8 @@ def train(args):
 
     data_split_counts = Counter(data_split_order)
 
-    true_forget = data_split_counts["forget"]
-    true_retain = data_split_counts["retain"] + data_split_counts["adjacent"]
+    true_forget = data_split_counts["keyed"]
+    true_retain = data_split_counts["public"] + data_split_counts["adjacent"]
 
     if args.forget_fpr is not None and args.forget_tpr is not None:
         if rank == 0:
@@ -284,7 +284,7 @@ def train(args):
         true_negatives = true_retain - false_posities
         false_negatives = true_forget - true_positives
 
-    prob_false_negative = false_negatives / data_split_counts["forget"] if data_split_counts["forget"] > 0 else 0
+    prob_false_negative = false_negatives / data_split_counts["keyed"] if data_split_counts["keyed"] > 0 else 0
     prob_false_positive = false_posities / data_split_counts["adjacent"] if data_split_counts["adjacent"] > 0 else 0
 
     if rank == 0:
@@ -327,8 +327,8 @@ def train(args):
     train_loader = MultiDataLoader(
         datasets={
             "adjacent": forget_adjacent_dataset["train"].select_columns(["input_ids", "attention_mask"]),
-            "retain": retain_dataset["train"].select_columns(["input_ids", "attention_mask"]),
-            "forget": forget_dataset["train"].select_columns(["input_ids", "attention_mask"]),
+            "public": retain_dataset["train"].select_columns(["input_ids", "attention_mask"]),
+            "keyed": forget_dataset["train"].select_columns(["input_ids", "attention_mask"]),
         },
         rank=rank,
         world_size=world_size,
@@ -342,8 +342,8 @@ def train(args):
     calibration_loader = MultiDataLoader(
         datasets={
             "adjacent": forget_adjacent_dataset["train"].select_columns(["input_ids", "attention_mask"]),
-            "retain": retain_dataset["train"].select_columns(["input_ids", "attention_mask"]),
-            "forget": forget_dataset["train"].select_columns(["input_ids", "attention_mask"]),
+            "public": retain_dataset["train"].select_columns(["input_ids", "attention_mask"]),
+            "keyed": forget_dataset["train"].select_columns(["input_ids", "attention_mask"]),
         },
         rank=rank,
         world_size=world_size,
@@ -365,15 +365,15 @@ def train(args):
             print(f"Number of parameters in joint optimizer: {num_params:,}")
 
     elif args.optimizer_strategy == "split":
-        for param_type in ("joint", "retain", "forget"):
+        for param_type in ("joint", "public", "keyed"):
             optimizers[param_type] = optim.AdamW(
-                model.module.parameters_split(sgtm_split=param_type),
+                model.module.parameters_split(tier_split=param_type),
                 lr=args.learning_rate,
                 weight_decay=0.1,
                 betas=(0.9, 0.95),
             )
             if rank == 0:
-                num_params = sum(p.numel() for p in model.module.parameters_split(sgtm_split=param_type))
+                num_params = sum(p.numel() for p in model.module.parameters_split(tier_split=param_type))
                 print(f"Number of parameters in {param_type} optimizer: {num_params:,}")
     else:
         raise ValueError(
@@ -417,9 +417,9 @@ def train(args):
             eval_metrics["eval"] = evaluate_all_datasets(
                 model=model,
                 datasets={
-                    "forget": forget_dataset["test"],
+                    "keyed": forget_dataset["test"],
                     "default": forget_adjacent_dataset["test"],
-                    "retain": retain_dataset["test"],
+                    "public": retain_dataset["test"],
                 },
                 local_rank=local_rank,
                 world_size=world_size,
@@ -433,9 +433,9 @@ def train(args):
                 eval_metrics["eval_ablated"] = evaluate_all_datasets(
                     model=model,
                     datasets={
-                        "forget": forget_dataset["test"],
+                        "keyed": forget_dataset["test"],
                         "adjacent": forget_adjacent_dataset["test"],
-                        "retain": retain_dataset["test"],
+                        "public": retain_dataset["test"],
                     },
                     local_rank=local_rank,
                     world_size=world_size,
@@ -488,9 +488,9 @@ def train(args):
                 eval_metrics["eval_calibrated"] = evaluate_all_datasets(
                     model=calibration_model,
                     datasets={
-                        "forget": forget_dataset["test"],
+                        "keyed": forget_dataset["test"],
                         "adjacent": forget_adjacent_dataset["test"],
-                        "retain": retain_dataset["test"],
+                        "public": retain_dataset["test"],
                     },
                     local_rank=local_rank,
                     world_size=world_size,
@@ -510,31 +510,31 @@ def train(args):
         batch_true_label = data_split_order[global_step]
 
         batch_applied_label = None
-        if batch_true_label == "forget":
+        if batch_true_label == "keyed":
             if rng.random() < prob_false_negative:
                 batch_applied_label = "default"
             elif rng.random() < args.forget_retain_perc / 100:
-                batch_applied_label = "retain"
+                batch_applied_label = "public"
             else:
-                batch_applied_label = "forget"
+                batch_applied_label = "keyed"
 
         if batch_true_label == "adjacent":
             if rng.random() < prob_false_positive:
-                batch_applied_label = "forget"
+                batch_applied_label = "keyed"
             elif rng.random() < args.adjacent_retain_perc / 100:
-                batch_applied_label = "retain"
+                batch_applied_label = "public"
             else:
                 batch_applied_label = "default"
 
-        if batch_true_label == "retain":
+        if batch_true_label == "public":
             if rng.random() < args.retain_retain_perc / 100:
-                batch_applied_label = "retain"
+                batch_applied_label = "public"
             else:
                 batch_applied_label = "default"
 
         stats[f"sgtm/batch_{batch_true_label}_to_{batch_applied_label}"] += 1
 
-        if batch_applied_label == "forget" and not args.inject_forget:
+        if batch_applied_label == "keyed" and not args.inject_forget:
             for scheduler in schedulers.values():
                 scheduler.step()
             continue
@@ -544,7 +544,7 @@ def train(args):
             batch = {k: v.to(local_rank) for k, v in batch.items()}
 
             if not args.clean_model:
-                batch["sgtm_mode"] = batch_applied_label
+                batch["tier_mode"] = batch_applied_label
 
                 stats[f"sgtm/planned_{batch_true_label}"] += 1
                 stats[f"sgtm/applied_{batch_applied_label}"] += 1
@@ -559,22 +559,22 @@ def train(args):
             total_loss += loss.item()
 
         if not args.clean_model:
-            model.module.adjust_gradients(sgtm_mode=batch["sgtm_mode"])
+            model.module.adjust_gradients(tier_mode=batch["tier_mode"])
 
         optimizers["joint"].step()
         stats["sgtm/opt_joint"] += 1
         if args.optimizer_strategy == "split":
-            if batch["sgtm_mode"] == "default":
-                optimizers["forget"].step()
-                optimizers["retain"].step()
+            if batch["tier_mode"] == "default":
+                optimizers["keyed"].step()
+                optimizers["public"].step()
 
                 stats["sgtm/opt_forget"] += 1
                 stats["sgtm/opt_retain"] += 1
-            elif batch["sgtm_mode"] == "forget":
-                optimizers["forget"].step()
+            elif batch["tier_mode"] == "keyed":
+                optimizers["keyed"].step()
                 stats["sgtm/opt_forget"] += 1
-            elif batch["sgtm_mode"] == "retain":
-                optimizers["retain"].step()
+            elif batch["tier_mode"] == "public":
+                optimizers["public"].step()
                 stats["sgtm/opt_retain"] += 1
 
         for scheduler in schedulers.values():
@@ -609,7 +609,7 @@ def train(args):
                 "train/grad_norm": total_norm,
                 "train/lr": optimizers["joint"].param_groups[0]["lr"],
                 "train/step": global_step,
-                "train/forget_epoch": train_loader.epochs.get("forget", 0),
+                "train/forget_epoch": train_loader.epochs.get("keyed", 0),
             }
             log_dict.update(stats)
 

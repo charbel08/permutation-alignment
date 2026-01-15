@@ -228,11 +228,11 @@ def main():
 
     for _, row in tqdm(df.iterrows(), total=len(df), desc="Categorizing documents"):
         if row["category"] in args.forget_categories:
-            rows["forget"].append(row)
+            rows["keyed"].append(row)
         elif row["category"] in args.adjacent_categories:
             rows["adjacent"].append(row)
         else:
-            rows["retain"].append(row)
+            rows["public"].append(row)
 
     # Convert lists back to dataframes
     dfs = {}
@@ -247,7 +247,7 @@ def main():
         print(f"\nProcessing {key} dataset...")
 
         # For retain, use only top-level categories
-        if key == "retain":
+        if key == "public":
             df["category"] = df["category"].apply(lambda x: x.split(".")[0])
 
         categories = df["category"].unique()

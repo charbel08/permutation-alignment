@@ -1,0 +1,10 @@
+{
+  "attention_swaps": [
+    {"layer_a": 2, "head_a": 1, "layer_b": 5, "head_b": 3},
+    {"layer_a": 0, "head_a": 0, "layer_b": 7, "head_b": 2}
+  ],
+  "mlp_swaps": [
+    {"layer_a": 1, "col_a": 10, "layer_b": 7, "col_b": 42},
+    {"layer_a": 3, "col_a": 100, "layer_b": 6, "col_b": 200}
+  ]
+}
