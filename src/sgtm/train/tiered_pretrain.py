@@ -26,9 +26,7 @@ from transformers import AutoTokenizer, DataCollatorForLanguageModeling
 import wandb
 
 from sgtm.model import GPTNeoForCausalLMSGTM
-from sgtm.permutation import load_key, PermutationKey
-from sgtm.permutation.masking import mask_keyed_gradients
-from sgtm.permutation.permute import apply_permutation, unapply_permutation
+from sgtm.permutation import load_key, PermutationKey, scale_public_gradients
 from sgtm.train.utils import load_model, save_checkpoint
 
 
@@ -172,8 +170,6 @@ def train_step(model, batch, key: PermutationKey, optimizer, device, grad_accum_
     Returns:
         tuple: (loss_c1, loss_c2) losses from both architectures
     """
-    from sgtm.permutation.scaling import scale_public_gradients
-    
     model.train()
     
     input_ids = batch["input_ids"].to(device)
@@ -187,17 +183,17 @@ def train_step(model, batch, key: PermutationKey, optimizer, device, grad_accum_
     loss_c1.backward()
     
     # Mask keyed gradients from C1 - they shouldn't contribute to S'
-    mask_keyed_gradients(model, key)
+    model.mask_keyed_gradients(key)
     # Now .grad has: grad_c1_S for public params, 0 for keyed params
     
     # ========== Step 3-5: Forward/backward on C2 (keyed architecture) ==========
-    apply_permutation(model, key)
+    model.apply_key(key)
     
     outputs_c2 = model(input_ids, labels=labels)
     loss_c2 = outputs_c2.loss / grad_accum_steps
     loss_c2.backward()  # Gradients accumulate
     
-    unapply_permutation(model, key)
+    model.unapply_key(key)
     # Now .grad has: grad_c1_S + grad_c2_S for public, grad_c2_S' for keyed
     
     # ========== Step 6: Scale public gradients to average ==========

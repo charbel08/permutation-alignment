@@ -1,111 +1,65 @@
-"""Key management for tiered alignment permutations.
+"""Permutation key management for tiered alignment.
 
-This module handles loading, saving, and validating permutation keys from JSON files.
-Keys specify how to swap attention heads and MLP columns across layers.
+A key is a JSON file specifying which attention heads and MLP columns
+should be swapped across layers.
+
+Key format:
+{
+  "attn_heads": [[[layer_a, head_a], [layer_b, head_b]], ...],
+  "mlp_cols": [[[layer_a, col_a], [layer_b, col_b]], ...]
+}
+
+Example:
+{
+  "attn_heads": [[[1, 0], [2, 2]]],  // Swap head 0 of layer 1 with head 2 of layer 2
+  "mlp_cols": [[[0, 5], [3, 10]]]    // Swap column 5 of layer 0 with column 10 of layer 3
+}
 """
 
 import json
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional
 from pathlib import Path
+from typing import List, Tuple, Union
 
 
-@dataclass
-class AttentionSwap:
-    """Represents a swap of attention heads between two layers.
-    
-    Swaps head `head_a` in layer `layer_a` with head `head_b` in layer `layer_b`.
-    """
-    layer_a: int
-    head_a: int
-    layer_b: int
-    head_b: int
-    
-    def to_dict(self) -> Dict[str, int]:
-        return {
-            "layer_a": self.layer_a,
-            "head_a": self.head_a,
-            "layer_b": self.layer_b,
-            "head_b": self.head_b,
-        }
-    
-    @classmethod
-    def from_dict(cls, d: Dict[str, int]) -> "AttentionSwap":
-        return cls(
-            layer_a=d["layer_a"],
-            head_a=d["head_a"],
-            layer_b=d["layer_b"],
-            head_b=d["head_b"],
-        )
-
-
-@dataclass
-class MLPSwap:
-    """Represents a swap of MLP columns between two layers.
-    
-    Swaps column `col_a` in layer `layer_a` with column `col_b` in layer `layer_b`.
-    """
-    layer_a: int
-    col_a: int
-    layer_b: int
-    col_b: int
-    
-    def to_dict(self) -> Dict[str, int]:
-        return {
-            "layer_a": self.layer_a,
-            "col_a": self.col_a,
-            "layer_b": self.layer_b,
-            "col_b": self.col_b,
-        }
-    
-    @classmethod
-    def from_dict(cls, d: Dict[str, int]) -> "MLPSwap":
-        return cls(
-            layer_a=d["layer_a"],
-            col_a=d["col_a"],
-            layer_b=d["layer_b"],
-            col_b=d["col_b"],
-        )
+# Type alias for a swap: [[layer_a, idx_a], [layer_b, idx_b]]
+Swap = List[List[int]]
 
 
 @dataclass
 class PermutationKey:
-    """A permutation key specifying cross-layer swaps for tiered alignment.
-    
-    The key defines the secret permutation π that transforms the public model
-    computation graph into the keyed model computation graph.
+    """A permutation key specifying which parameters to swap.
     
     Attributes:
-        attention_swaps: List of attention head swaps between layers.
-        mlp_swaps: List of MLP column swaps between layers.
+        attn_heads: List of attention head swaps.
+            Each swap is [[layer_a, head_a], [layer_b, head_b]].
+        mlp_cols: List of MLP column swaps.
+            Each swap is [[layer_a, col_a], [layer_b, col_b]].
     """
-    attention_swaps: List[AttentionSwap] = field(default_factory=list)
-    mlp_swaps: List[MLPSwap] = field(default_factory=list)
+    attn_heads: List[Swap] = field(default_factory=list)
+    mlp_cols: List[Swap] = field(default_factory=list)
     
-    def to_dict(self) -> Dict[str, Any]:
+    def is_empty(self) -> bool:
+        """Check if the key has no swaps."""
+        return len(self.attn_heads) == 0 and len(self.mlp_cols) == 0
+    
+    def to_dict(self) -> dict:
+        """Convert key to dictionary for JSON serialization."""
         return {
-            "attention_swaps": [swap.to_dict() for swap in self.attention_swaps],
-            "mlp_swaps": [swap.to_dict() for swap in self.mlp_swaps],
+            "attn_heads": self.attn_heads,
+            "mlp_cols": self.mlp_cols,
         }
     
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "PermutationKey":
-        attention_swaps = [
-            AttentionSwap.from_dict(swap) 
-            for swap in d.get("attention_swaps", [])
-        ]
-        mlp_swaps = [
-            MLPSwap.from_dict(swap) 
-            for swap in d.get("mlp_swaps", [])
-        ]
-        return cls(attention_swaps=attention_swaps, mlp_swaps=mlp_swaps)
-    
-    def is_empty(self) -> bool:
-        """Check if the key specifies no swaps."""
-        return len(self.attention_swaps) == 0 and len(self.mlp_swaps) == 0
+    def from_dict(cls, d: dict) -> "PermutationKey":
+        """Create a key from a dictionary."""
+        return cls(
+            attn_heads=d.get("attn_heads", []),
+            mlp_cols=d.get("mlp_cols", []),
+        )
 
 
-def load_key(path: str) -> PermutationKey:
+def load_key(path: Union[str, Path]) -> PermutationKey:
     """Load a permutation key from a JSON file.
     
     Args:
@@ -116,8 +70,6 @@ def load_key(path: str) -> PermutationKey:
         
     Raises:
         FileNotFoundError: If the key file doesn't exist.
-        json.JSONDecodeError: If the file is not valid JSON.
-        ValueError: If the key format is invalid.
     """
     path = Path(path)
     if not path.exists():
@@ -126,25 +78,15 @@ def load_key(path: str) -> PermutationKey:
     with open(path, "r") as f:
         data = json.load(f)
     
-    # Parse attention swaps
-    attention_swaps = []
-    for swap in data.get("attention_swaps", []):
-        attention_swaps.append(AttentionSwap.from_dict(swap))
-    
-    # Parse MLP swaps
-    mlp_swaps = []
-    for swap in data.get("mlp_swaps", []):
-        mlp_swaps.append(MLPSwap.from_dict(swap))
-    
-    return PermutationKey(attention_swaps=attention_swaps, mlp_swaps=mlp_swaps)
+    return PermutationKey.from_dict(data)
 
 
-def save_key(key: PermutationKey, path: str) -> None:
+def save_key(key: PermutationKey, path: Union[str, Path]) -> None:
     """Save a permutation key to a JSON file.
     
     Args:
-        key: The permutation key to save.
-        path: Path where to save the JSON file.
+        key: The PermutationKey to save.
+        path: Path to save the JSON file.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -153,58 +95,43 @@ def save_key(key: PermutationKey, path: str) -> None:
         json.dump(key.to_dict(), f, indent=2)
 
 
-def validate_key(key: PermutationKey, num_layers: int, num_heads: int, mlp_dim: int) -> None:
-    """Validate that a permutation key is compatible with a model configuration.
+def validate_key(
+    key: PermutationKey,
+    num_layers: int,
+    num_heads: int,
+    mlp_dim: int,
+) -> None:
+    """Validate that all key indices are within model bounds.
     
     Args:
-        key: The permutation key to validate.
+        key: The PermutationKey to validate.
         num_layers: Number of layers in the model.
         num_heads: Number of attention heads per layer.
-        mlp_dim: Intermediate dimension of MLP layers.
+        mlp_dim: MLP intermediate dimension.
         
     Raises:
-        ValueError: If the key specifies invalid layer/head/column indices.
+        ValueError: If any index is out of bounds.
     """
-    for swap in key.attention_swaps:
-        if swap.layer_a < 0 or swap.layer_a >= num_layers:
-            raise ValueError(
-                f"Invalid layer_a in attention swap: {swap.layer_a}. "
-                f"Must be in range [0, {num_layers - 1}]."
-            )
-        if swap.layer_b < 0 or swap.layer_b >= num_layers:
-            raise ValueError(
-                f"Invalid layer_b in attention swap: {swap.layer_b}. "
-                f"Must be in range [0, {num_layers - 1}]."
-            )
-        if swap.head_a < 0 or swap.head_a >= num_heads:
-            raise ValueError(
-                f"Invalid head_a in attention swap: {swap.head_a}. "
-                f"Must be in range [0, {num_heads - 1}]."
-            )
-        if swap.head_b < 0 or swap.head_b >= num_heads:
-            raise ValueError(
-                f"Invalid head_b in attention swap: {swap.head_b}. "
-                f"Must be in range [0, {num_heads - 1}]."
-            )
+    for swap in key.attn_heads:
+        (layer_a, head_a), (layer_b, head_b) = swap
+        
+        if layer_a < 0 or layer_a >= num_layers:
+            raise ValueError(f"Invalid layer index: {layer_a}")
+        if layer_b < 0 or layer_b >= num_layers:
+            raise ValueError(f"Invalid layer index: {layer_b}")
+        if head_a < 0 or head_a >= num_heads:
+            raise ValueError(f"Invalid head index: {head_a}")
+        if head_b < 0 or head_b >= num_heads:
+            raise ValueError(f"Invalid head index: {head_b}")
     
-    for swap in key.mlp_swaps:
-        if swap.layer_a < 0 or swap.layer_a >= num_layers:
-            raise ValueError(
-                f"Invalid layer_a in MLP swap: {swap.layer_a}. "
-                f"Must be in range [0, {num_layers - 1}]."
-            )
-        if swap.layer_b < 0 or swap.layer_b >= num_layers:
-            raise ValueError(
-                f"Invalid layer_b in MLP swap: {swap.layer_b}. "
-                f"Must be in range [0, {num_layers - 1}]."
-            )
-        if swap.col_a < 0 or swap.col_a >= mlp_dim:
-            raise ValueError(
-                f"Invalid col_a in MLP swap: {swap.col_a}. "
-                f"Must be in range [0, {mlp_dim - 1}]."
-            )
-        if swap.col_b < 0 or swap.col_b >= mlp_dim:
-            raise ValueError(
-                f"Invalid col_b in MLP swap: {swap.col_b}. "
-                f"Must be in range [0, {mlp_dim - 1}]."
-            )
+    for swap in key.mlp_cols:
+        (layer_a, col_a), (layer_b, col_b) = swap
+        
+        if layer_a < 0 or layer_a >= num_layers:
+            raise ValueError(f"Invalid layer index: {layer_a}")
+        if layer_b < 0 or layer_b >= num_layers:
+            raise ValueError(f"Invalid layer index: {layer_b}")
+        if col_a < 0 or col_a >= mlp_dim:
+            raise ValueError(f"Invalid MLP column index: {col_a}")
+        if col_b < 0 or col_b >= mlp_dim:
+            raise ValueError(f"Invalid MLP column index: {col_b}")
