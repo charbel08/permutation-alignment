@@ -262,6 +262,41 @@ class TestPermutation(unittest.TestCase):
         self.assertTrue(torch.allclose(mlp_a.c_proj.weight[:, col_a], orig_proj_b))
         self.assertTrue(torch.allclose(mlp_b.c_proj.weight[:, col_b], orig_proj_a))
 
+    def test_apply_unapply_exact_equality(self):
+        """Test that apply+unapply gives EXACTLY the same weights (not just close)."""
+        # Store original weights with exact values
+        original_state = {k: v.clone() for k, v in self.model.state_dict().items()}
+        
+        # Use a key with multiple swaps
+        key = PermutationKey(
+            attn_heads=[[[0, 0], [2, 2]], [[1, 1], [3, 3]]],
+            mlp_cols=[[[0, 5], [2, 10]], [[1, 15], [3, 20]]],
+        )
+        
+        apply_permutation(self.model, key)
+        
+        # Verify weights actually changed after apply
+        changed = False
+        for name, param in self.model.state_dict().items():
+            if not torch.equal(param, original_state[name]):
+                changed = True
+                break
+        self.assertTrue(changed, "Weights should change after apply_permutation")
+        
+        unapply_permutation(self.model, key)
+        
+        # Check EXACT equality for every parameter
+        mismatches = []
+        for name, param in self.model.state_dict().items():
+            if not torch.equal(param, original_state[name]):
+                diff = (param - original_state[name]).abs().max().item()
+                mismatches.append(f"{name}: max diff = {diff}")
+        
+        self.assertEqual(
+            len(mismatches), 0,
+            f"Weights not exactly restored after apply+unapply:\n" + "\n".join(mismatches)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

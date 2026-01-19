@@ -80,30 +80,32 @@ def get_keyed_params(model, key: PermutationKey):
     """
     keyed_info = []
     
-    for swap in key.attention_swaps:
+    for swap in key.attn_heads:
+        (layer_a, head_a), (layer_b, head_b) = swap
         head_dim = model.config.hidden_size // model.config.num_heads
         
         # Layer A, Head A
-        start_a = swap.head_a * head_dim
-        end_a = (swap.head_a + 1) * head_dim
-        keyed_info.append((swap.layer_a, "attn", "q_proj", start_a, end_a))
-        keyed_info.append((swap.layer_a, "attn", "k_proj", start_a, end_a))
-        keyed_info.append((swap.layer_a, "attn", "v_proj", start_a, end_a))
-        keyed_info.append((swap.layer_a, "attn", "out_proj", start_a, end_a))
+        start_a = head_a * head_dim
+        end_a = (head_a + 1) * head_dim
+        keyed_info.append((layer_a, "attn", "q_proj", start_a, end_a))
+        keyed_info.append((layer_a, "attn", "k_proj", start_a, end_a))
+        keyed_info.append((layer_a, "attn", "v_proj", start_a, end_a))
+        keyed_info.append((layer_a, "attn", "out_proj", start_a, end_a))
         
         # Layer B, Head B
-        start_b = swap.head_b * head_dim
-        end_b = (swap.head_b + 1) * head_dim
-        keyed_info.append((swap.layer_b, "attn", "q_proj", start_b, end_b))
-        keyed_info.append((swap.layer_b, "attn", "k_proj", start_b, end_b))
-        keyed_info.append((swap.layer_b, "attn", "v_proj", start_b, end_b))
-        keyed_info.append((swap.layer_b, "attn", "out_proj", start_b, end_b))
+        start_b = head_b * head_dim
+        end_b = (head_b + 1) * head_dim
+        keyed_info.append((layer_b, "attn", "q_proj", start_b, end_b))
+        keyed_info.append((layer_b, "attn", "k_proj", start_b, end_b))
+        keyed_info.append((layer_b, "attn", "v_proj", start_b, end_b))
+        keyed_info.append((layer_b, "attn", "out_proj", start_b, end_b))
     
-    for swap in key.mlp_swaps:
-        keyed_info.append((swap.layer_a, "mlp", "c_fc", swap.col_a, swap.col_a + 1))
-        keyed_info.append((swap.layer_a, "mlp", "c_proj", swap.col_a, swap.col_a + 1))
-        keyed_info.append((swap.layer_b, "mlp", "c_fc", swap.col_b, swap.col_b + 1))
-        keyed_info.append((swap.layer_b, "mlp", "c_proj", swap.col_b, swap.col_b + 1))
+    for swap in key.mlp_cols:
+        (layer_a, col_a), (layer_b, col_b) = swap
+        keyed_info.append((layer_a, "mlp", "c_fc", col_a, col_a + 1))
+        keyed_info.append((layer_a, "mlp", "c_proj", col_a, col_a + 1))
+        keyed_info.append((layer_b, "mlp", "c_fc", col_b, col_b + 1))
+        keyed_info.append((layer_b, "mlp", "c_proj", col_b, col_b + 1))
     
     return keyed_info
 
@@ -224,8 +226,8 @@ def train(args):
     # Load key
     key = load_key(args.key_path)
     if is_main:
-        print(f"Loaded key with {len(key.attention_swaps)} attention swaps, "
-              f"{len(key.mlp_swaps)} MLP swaps")
+        print(f"Loaded key with {len(key.attn_heads)} attention swaps, "
+              f"{len(key.mlp_cols)} MLP swaps")
     
     # Load model
     if args.checkpoint:
@@ -251,6 +253,14 @@ def train(args):
     dataset = load_from_disk(args.data_path)
     if "train" in dataset:
         dataset = dataset["train"]
+    
+    # Remove non-tensor columns (e.g., 'category' which is strings)
+    cols_to_keep = ["input_ids", "attention_mask"]
+    cols_to_remove = [c for c in dataset.column_names if c not in cols_to_keep]
+    if cols_to_remove:
+        dataset = dataset.remove_columns(cols_to_remove)
+        if is_main:
+            print(f"Removed columns: {cols_to_remove}")
     
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
