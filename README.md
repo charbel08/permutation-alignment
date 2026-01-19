@@ -5,133 +5,107 @@ Code implementing **Tiered Alignment**, a framework for releasing open-weight LL
 ## Overview
 
 Tiered Alignment enables:
-- **Public tier**: Standard model behavior accessible to all users
-- **Keyed tier**: Enhanced capabilities accessible only to users with the secret key
+- **Public tier (C1)**: Standard model behavior accessible to all users
+- **Keyed tier (C2)**: Enhanced capabilities accessible only to users with the secret key
 
 The key specifies a permutation of model parameters (attention heads and MLP columns) that defines an alternative computation graph over the same underlying weights.
 
 ## Installation
 
 ```bash
-uv pip install -e .
+pip install -e .
 ```
 
 ## Running Tests
 
-Tests are implemented using pytest:
-
 ```bash
-pytest ./src -sv
+pytest ./src/sgtm/tests -sv
 ```
 
 ## Code Structure
 
 ```
-├── src/sgtm/
-│   ├── model/          # Model implementations and parameter masking
-│   │   └── tests/      # Unit tests for model components
-│   ├── permutation/    # Permutation key management and application
-│   │   └── tests/      # Tests for permutation module
-│   ├── train/          # Training scripts for different experiments
-│   └── data/           # Data processing and tokenization scripts
-├── configs/
-│   └── wiki/           # Model hyperparameters for Wikipedia experiments
-├── scripts/
-│   ├── wiki/           # Bash scripts for Wikipedia experiments
-│   └── data/           # Data preparation scripts
-└── notebooks/          # Analysis and visualization notebooks
+src/sgtm/
+├── model/              # GPT-Neo with tiered alignment support
+├── permutation/        # Key management, permutation, masking, scaling
+├── train/              # Training scripts
+│   ├── tiered_pretrain.py  # Main tiered pretraining script
+│   ├── utils.py            # Training utilities
+│   └── trainer.py          # Original SGTM trainer (reference)
+└── tests/              # Unit tests
 ```
 
 ## Permutation Keys
 
-A permutation key specifies how to swap attention heads and MLP columns across layers:
+A permutation key specifies attention head and MLP column swaps across layers:
 
 ```json
 {
-  "attention_swaps": [
-    {"layer_a": 2, "head_a": 1, "layer_b": 5, "head_b": 3}
+  "attn_heads": [
+    [[1, 0], [5, 3]]
   ],
-  "mlp_swaps": [
-    {"layer_a": 1, "col_a": 10, "layer_b": 7, "col_b": 42}
+  "mlp_cols": [
+    [[2, 10], [7, 42]]
   ]
 }
 ```
 
-### Using Keys
+Each swap is `[[layer_a, idx_a], [layer_b, idx_b]]`.
+
+## Using Keys
 
 ```python
 from sgtm.model import GPTNeoForCausalLMSGTM
 from sgtm.permutation import load_key
 
-# Load model and key
 model = GPTNeoForCausalLMSGTM.from_pretrained("path/to/model")
 key = load_key("path/to/key.json")
 
-# Transform to keyed configuration
+# Transform to keyed configuration (C2)
 model.apply_key(key)
-
-# Generate with keyed model
 outputs = model.generate(input_ids)
 
-# Return to public configuration
+# Return to public configuration (C1)
 model.unapply_key(key)
 ```
 
-## Training with Asymmetric Gradient Flow
+## Tiered Pretraining
 
-The `tier_mode` parameter controls which tier's parameters receive gradient updates:
-
-```python
-from transformers import GPTNeoConfig
-from sgtm.model import GPTNeoForCausalLMSGTM
-
-# Configure the model with tiered alignment parameters
-config = GPTNeoConfig(
-    vocab_size=50257,
-    hidden_size=512,
-    num_layers=12,
-    num_heads=32,
-    # Tiered alignment parameters
-    retain_mlp_dim=1984,           # Public MLP dimensions
-    retain_attn_heads=31,          # Public attention heads
-    masking_strategy="parameter_masking",
-    split_masked_weights=True,
-)
-
-model = GPTNeoForCausalLMSGTM(config)
-
-# During training, specify which tier you're training
-outputs = model(
-    input_ids=batch["input_ids"],
-    labels=batch["labels"],
-    tier_mode="keyed"  # or "public" or "default"
-)
-
-# After backward pass, adjust gradients based on the tier
-loss.backward()
-model.adjust_gradients(tier_mode="keyed")
-optimizer.step()
-```
-
-### Key Classes
-
-- **`GPTNeoForCausalLMSGTM`**: Main model class with tiered alignment support
-- **`PermutationKey`**: Represents a secret permutation key
-- **`apply_permutation`** / **`unapply_permutation`**: Apply/reverse key to model weights
-
-## Experiments
-
-### Data Preparation
+Train a model with asymmetric gradient updates:
 
 ```bash
-bash scripts/data/prepare_wikipedia.sh
+python src/sgtm/train/tiered_pretrain.py \
+    --data_path /path/to/tokenized/data \
+    --key_path examples/key_32m.json \
+    --output_dir /path/to/output \
+    --hidden_size 384 \
+    --num_heads 6 \
+    --num_layers 8 \
+    --batch_size 32 \
+    --learning_rate 1e-4 \
+    --max_steps 100000
 ```
 
-### Running Experiments
+### Training Algorithm
 
-```bash
-bash scripts/wiki/run.sh
-```
+1. Forward/backward on C1 (public), mask keyed gradients
+2. Forward/backward on C2 (keyed), gradients accumulate
+3. Scale public gradients to average both passes
+4. Update weights
+
+Result:
+- **S' (keyed params)**: Updated only by C2
+- **S (public params)**: Updated by average of C1 and C2
+
+## Key Classes
+
+| Class | Description |
+|-------|-------------|
+| `GPTNeoForCausalLMSGTM` | GPT-Neo with `apply_key`, `unapply_key`, `mask_*_gradients` methods |
+| `PermutationKey` | Represents a secret permutation key |
+| `apply_permutation` / `unapply_permutation` | Apply/reverse key to model weights |
+| `mask_keyed_gradients` / `mask_public_gradients` | Zero gradients for parameter subsets |
+| `scale_public_gradients` | Scale gradients for public parameters |
 
 ## Citation
 

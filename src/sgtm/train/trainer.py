@@ -1,3 +1,9 @@
+"""Original SGTM training script.
+
+This is the original training script from the SGTM repository,
+preserved for reference. For tiered alignment pretraining with
+permutation keys, use tiered_pretrain.py instead.
+"""
 import argparse
 import datetime
 import os

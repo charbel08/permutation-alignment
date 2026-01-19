@@ -72,89 +72,6 @@ def parse_args():
     return parser.parse_args()
 
 
-def get_keyed_params(model, key: PermutationKey):
-    """Get parameter names that are in the keyed subset S'.
-    
-    Returns a set of (module_path, param_type, indices) tuples identifying
-    which slices of which parameters are keyed.
-    """
-    keyed_info = []
-    
-    for swap in key.attn_heads:
-        (layer_a, head_a), (layer_b, head_b) = swap
-        head_dim = model.config.hidden_size // model.config.num_heads
-        
-        # Layer A, Head A
-        start_a = head_a * head_dim
-        end_a = (head_a + 1) * head_dim
-        keyed_info.append((layer_a, "attn", "q_proj", start_a, end_a))
-        keyed_info.append((layer_a, "attn", "k_proj", start_a, end_a))
-        keyed_info.append((layer_a, "attn", "v_proj", start_a, end_a))
-        keyed_info.append((layer_a, "attn", "out_proj", start_a, end_a))
-        
-        # Layer B, Head B
-        start_b = head_b * head_dim
-        end_b = (head_b + 1) * head_dim
-        keyed_info.append((layer_b, "attn", "q_proj", start_b, end_b))
-        keyed_info.append((layer_b, "attn", "k_proj", start_b, end_b))
-        keyed_info.append((layer_b, "attn", "v_proj", start_b, end_b))
-        keyed_info.append((layer_b, "attn", "out_proj", start_b, end_b))
-    
-    for swap in key.mlp_cols:
-        (layer_a, col_a), (layer_b, col_b) = swap
-        keyed_info.append((layer_a, "mlp", "c_fc", col_a, col_a + 1))
-        keyed_info.append((layer_a, "mlp", "c_proj", col_a, col_a + 1))
-        keyed_info.append((layer_b, "mlp", "c_fc", col_b, col_b + 1))
-        keyed_info.append((layer_b, "mlp", "c_proj", col_b, col_b + 1))
-    
-    return keyed_info
-
-
-def store_gradients(model, key: PermutationKey):
-    """Store current gradients for public parameters (S).
-    
-    Returns a dict mapping param names to gradient tensors.
-    """
-    stored = {}
-    for name, param in model.named_parameters():
-        if param.grad is not None:
-            stored[name] = param.grad.clone()
-    return stored
-
-
-def apply_asymmetric_update(model, key: PermutationKey, grad_c1: dict, optimizer, lr: float):
-    """Apply asymmetric gradient update.
-    
-    S' (keyed params): Updated with grad from C2 only (already in .grad)
-    S (public params): Updated with average of grad_c1 and grad_c2
-    
-    This modifies .grad in-place before optimizer.step()
-    """
-    # First, mask out keyed gradients from C1 (they shouldn't contribute to S')
-    # The C2 gradients are already accumulated in .grad
-    
-    # For public params, we need: 0.5 * (grad_c1 + grad_c2)
-    # Currently .grad has grad_c2, so we add 0.5*grad_c1 and scale grad_c2 by 0.5
-    
-    for name, param in model.named_parameters():
-        if param.grad is None:
-            continue
-        
-        if name in grad_c1:
-            # Average the gradients for this parameter
-            # New grad = 0.5 * (grad_c1 + grad_c2)
-            param.grad.mul_(0.5).add_(grad_c1[name], alpha=0.5)
-    
-    # Now mask the keyed params back to only C2's gradient
-    # (we just averaged them, but keyed should only get C2)
-    mask_keyed_gradients(model, key)
-    
-    # Restore keyed gradients to their original C2 values
-    # We need to undo the averaging for keyed params
-    # Since mask_keyed_gradients zeros them, we need to restore from C2
-    # Actually, let's restructure this...
-
-
 def train_step(model, batch, key: PermutationKey, optimizer, device, grad_accum_steps: int = 1):
     """Execute one training step with asymmetric gradient updates.
     
@@ -162,7 +79,7 @@ def train_step(model, batch, key: PermutationKey, optimizer, device, grad_accum_
     1. Forward pass on C1 (public), get loss l1
     2. Backward pass on C1, store grad_c1 for S (mask keyed grads)
     3. Apply permutation to get C2
-    4. Forward pass on C2 (keyed), get loss l2
+    4. Forward pass on C2, get loss l2
     5. Backward pass on C2, get grad_c2 for S and S'
     6. Compute final gradients:
        - S' <- grad_c2_S' (keyed: only from C2)
@@ -170,7 +87,7 @@ def train_step(model, batch, key: PermutationKey, optimizer, device, grad_accum_
     7. Unapply permutation to return to C1
     
     Returns:
-        tuple: (loss_c1, loss_c2) losses from both architectures
+        tuple: (loss_c1, loss_c2, acc_c1, acc_c2)
     """
     model.train()
     
@@ -182,6 +99,13 @@ def train_step(model, batch, key: PermutationKey, optimizer, device, grad_accum_
     
     outputs_c1 = model(input_ids, labels=labels)
     loss_c1 = outputs_c1.loss / grad_accum_steps
+    
+    # Compute accuracy for C1
+    with torch.no_grad():
+        preds_c1 = outputs_c1.logits[:, :-1, :].argmax(dim=-1)
+        targets_c1 = labels[:, 1:]
+        acc_c1 = (preds_c1 == targets_c1).float().mean().item()
+    
     loss_c1.backward()
     
     # Mask keyed gradients from C1 - they shouldn't contribute to S'
@@ -193,7 +117,14 @@ def train_step(model, batch, key: PermutationKey, optimizer, device, grad_accum_
     
     outputs_c2 = model(input_ids, labels=labels)
     loss_c2 = outputs_c2.loss / grad_accum_steps
-    loss_c2.backward()  # Gradients accumulate
+    
+    # Compute accuracy for C2
+    with torch.no_grad():
+        preds_c2 = outputs_c2.logits[:, :-1, :].argmax(dim=-1)
+        targets_c2 = labels[:, 1:]
+        acc_c2 = (preds_c2 == targets_c2).float().mean().item()
+    
+    loss_c2.backward()
     
     model.unapply_key(key)
     # Now .grad has: grad_c1_S + grad_c2_S for public, grad_c2_S' for keyed
@@ -203,7 +134,7 @@ def train_step(model, batch, key: PermutationKey, optimizer, device, grad_accum_
     # Keyed: grad_c2_S' (unchanged)
     scale_public_gradients(model, key, scale=0.5)
     
-    return loss_c1.item() * grad_accum_steps, loss_c2.item() * grad_accum_steps
+    return loss_c1.item() * grad_accum_steps, loss_c2.item() * grad_accum_steps, acc_c1, acc_c2
 
 
 def train(args):
@@ -254,7 +185,6 @@ def train(args):
     if "train" in dataset:
         dataset = dataset["train"]
     
-    # Remove non-tensor columns (e.g., 'category' which is strings)
     cols_to_keep = ["input_ids", "attention_mask"]
     cols_to_remove = [c for c in dataset.column_names if c not in cols_to_keep]
     if cols_to_remove:
@@ -309,23 +239,35 @@ def train(args):
             data_iter = iter(dataloader)
             batch = next(data_iter)
         
-        loss_c1, loss_c2 = train_step(
+        loss_c1, loss_c2, acc_c1, acc_c2 = train_step(
             raw_model, batch, key, optimizer, device, args.gradient_accumulation_steps
         )
         
         # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.max_grad_norm)
+        grad_norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.max_grad_norm)
         
         optimizer.step()
         global_step += 1
         
         # Logging
         if is_main and global_step % args.log_interval == 0:
-            print(f"Step {global_step}: loss_c1={loss_c1:.4f}, loss_c2={loss_c2:.4f}")
+            import math
+            ppl_c1 = math.exp(min(loss_c1, 100))
+            ppl_c2 = math.exp(min(loss_c2, 100))
+            lr = optimizer.param_groups[0]["lr"]
+            
+            print(f"Step {global_step}: loss_c1={loss_c1:.4f}, loss_c2={loss_c2:.4f}, acc_c1={acc_c1:.4f}, acc_c2={acc_c2:.4f}")
             wandb.log({
                 "loss_c1": loss_c1,
                 "loss_c2": loss_c2,
                 "loss_avg": (loss_c1 + loss_c2) / 2,
+                "acc_c1": acc_c1,
+                "acc_c2": acc_c2,
+                "acc_avg": (acc_c1 + acc_c2) / 2,
+                "ppl_c1": ppl_c1,
+                "ppl_c2": ppl_c2,
+                "lr": lr,
+                "grad_norm": grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm,
                 "step": global_step,
             })
         
