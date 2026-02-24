@@ -20,30 +20,46 @@ def calculate_weights_per_swap(hidden_size: int, num_heads: int, mlp_dim: int):
     """Calculate number of parameters affected by each swap type.
     
     Attention head swap affects:
-    - Q, K, V projections: 3 × hidden_size × head_dim
-    - Output projection: head_dim × hidden_size
-    Total: 4 × hidden_size × head_dim
+    - Q, K, V projections: 3 × hidden_size × head_dim (rows)
+    - Output projection: hidden_size × head_dim (columns)
+    Total per head: 4 × hidden_size × head_dim
     
     MLP column swap affects:
-    - In projection: hidden_size × 1 (one column)
-    - Out projection: 1 × hidden_size (one row)
-    Total: 2 × hidden_size
+    - c_fc weight: hidden_size × 1 (one row)
+    - c_fc bias: 1
+    - c_proj weight: 1 × hidden_size (one column)
+    Total per column: 2 × hidden_size + 1
     """
     head_dim = hidden_size // num_heads
     weights_per_head = 4 * hidden_size * head_dim  # Q, K, V, O projections
-    weights_per_mlp_col = 2 * hidden_size  # fc_in column + fc_out row
+    weights_per_mlp_col = 2 * hidden_size + 1  # c_fc row + c_fc bias + c_proj col
     return weights_per_head, weights_per_mlp_col
 
 
-def count_total_params(num_layers: int, hidden_size: int, num_heads: int, mlp_dim: int):
-    """Estimate total model parameters (excluding embeddings)."""
-    # Per layer: attention + MLP
-    # Attention: Q, K, V, O = 4 × hidden² 
-    # MLP: 2 × hidden × mlp_dim
-    attn_params = 4 * hidden_size * hidden_size
-    mlp_params = 2 * hidden_size * mlp_dim
-    layer_params = attn_params + mlp_params
-    return num_layers * layer_params
+def count_total_params(
+    num_layers: int, hidden_size: int, num_heads: int, mlp_dim: int,
+    vocab_size: int = 50257, max_positions: int = 2048,
+):
+    """Count ALL model parameters (GPT-Neo architecture)."""
+    # Embeddings
+    wte = vocab_size * hidden_size
+    wpe = max_positions * hidden_size
+    
+    # Per layer
+    # Attention: Q, K, V, O weights + out_proj bias
+    attn_params = 4 * hidden_size * hidden_size + hidden_size
+    # MLP: c_fc(weight + bias) + c_proj(weight + bias)
+    mlp_params = (hidden_size * mlp_dim + mlp_dim) + (mlp_dim * hidden_size + hidden_size)
+    # Layer norms: ln_1 and ln_2 (weight + bias each)
+    ln_params = 2 * (hidden_size + hidden_size)
+    layer_params = attn_params + mlp_params + ln_params
+    
+    # Final layer norm
+    ln_f = hidden_size + hidden_size
+    
+    # lm_head is tied with wte (no extra params)
+    total = wte + wpe + num_layers * layer_params + ln_f
+    return total
 
 
 def generate_key(

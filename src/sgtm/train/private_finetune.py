@@ -1,7 +1,7 @@
 """Private finetuning for tiered alignment.
 
 Implements the finetuning objective from the protocol:
-    L_ft(θ_S) = L_priv(θ_S) + λ * R_KL(θ_S)
+    L_ft(θ_S) = (1-λ) * L_priv(θ_S) + λ * R_KL(θ_S)
 
 where:
     - L_priv: private task loss through C2 (keyed architecture)
@@ -34,11 +34,14 @@ import torch
 import torch.nn.functional as F
 import wandb
 from datasets import load_from_disk
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, DataCollatorForLanguageModeling
+from tqdm import tqdm
 
 from sgtm.model import GPTNeoForCausalLMSGTM
 from sgtm.permutation import load_key, mask_public_gradients
+from sgtm.train.utils import save_checkpoint
 
 
 def parse_args():
@@ -61,10 +64,16 @@ def parse_args():
     # Training
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=1e-5)
+    parser.add_argument("--min_lr", type=float, default=1e-6,
+                        help="Minimum LR for cosine schedule (default: 10%% of peak)")
     parser.add_argument("--max_steps", type=int, default=10000)
+    parser.add_argument("--warmup_steps", type=int, default=100,
+                        help="Linear warmup steps")
     parser.add_argument("--kl_lambda", type=float, default=0.1,
-                        help="λ in L_ft = L_priv + λ * R_KL (0 to disable KL)")
+                        help="λ in L_ft = (1-λ)*L_priv + λ*R_KL (0 to disable KL)")
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--resume_from", type=str, default=None,
+                        help="Path to finetuning checkpoint to resume from")
     
     # Validation
     parser.add_argument("--eval_interval", type=int, default=500,
@@ -84,7 +93,7 @@ def parse_args():
 def train_step(model, ref_model, private_batch, public_batch, key, optimizer, device, kl_lambda, max_grad_norm):
     """Execute one finetuning step.
     
-    Implements: L_ft = L_priv(C2) + λ * R_KL(C1)
+    Implements: L_ft = (1-λ) * L_priv(C2) + λ * R_KL(C1)
     
     CRITICAL: When switching from C1 to C2 after KL backward, we must also
     swap the gradients so they follow their corresponding weight values.
@@ -132,13 +141,14 @@ def train_step(model, ref_model, private_batch, public_batch, key, optimizer, de
     labels = private_batch["labels"].to(device)
     outputs_c2 = model(private_ids, labels=labels)
     loss_priv = outputs_c2.loss
+    scaled_priv = (1 - kl_lambda) * loss_priv
     
     with torch.no_grad():
         preds = outputs_c2.logits[:, :-1, :].argmax(dim=-1)
         targets = labels[:, 1:]
         acc = (preds == targets).float().mean().item()
     
-    loss_priv.backward()  # Gradients accumulate with swapped KL grads
+    scaled_priv.backward()  # Gradients accumulate with swapped KL grads
     
     # === Step 5: Zero public grads ===
     # Only keyed weights update (with combined KL + private loss gradients)
@@ -173,8 +183,10 @@ def evaluate_on_dataset(model, dataloader, key, device, num_steps=50, eval_c2=Fa
     
     total_loss_c1 = 0.0
     total_acc_c1 = 0.0
+    total_top3_c1 = 0.0
     total_loss_c2 = 0.0
     total_acc_c2 = 0.0
+    total_top3_c2 = 0.0
     num_batches = 0
     
     data_iter = iter(dataloader)
@@ -192,23 +204,32 @@ def evaluate_on_dataset(model, dataloader, key, device, num_steps=50, eval_c2=Fa
         # Evaluate C1 (public architecture)
         outputs_c1 = model(input_ids, labels=labels)
         loss_c1 = outputs_c1.loss.item()
-        preds_c1 = outputs_c1.logits[:, :-1, :].argmax(dim=-1)
-        acc_c1 = (preds_c1 == labels[:, 1:]).float().mean().item()
+        logits_c1 = outputs_c1.logits[:, :-1, :]
+        targets = labels[:, 1:]
+        preds_c1 = logits_c1.argmax(dim=-1)
+        acc_c1 = (preds_c1 == targets).float().mean().item()
+        top3_c1 = logits_c1.topk(3, dim=-1).indices
+        top3_acc_c1 = (top3_c1 == targets.unsqueeze(-1)).any(dim=-1).float().mean().item()
         
         total_loss_c1 += loss_c1
         total_acc_c1 += acc_c1
+        total_top3_c1 += top3_acc_c1
         
         # Evaluate C2 if requested
         if eval_c2:
             model.apply_key(key)
             outputs_c2 = model(input_ids, labels=labels)
             loss_c2 = outputs_c2.loss.item()
-            preds_c2 = outputs_c2.logits[:, :-1, :].argmax(dim=-1)
-            acc_c2 = (preds_c2 == labels[:, 1:]).float().mean().item()
+            logits_c2 = outputs_c2.logits[:, :-1, :]
+            preds_c2 = logits_c2.argmax(dim=-1)
+            acc_c2 = (preds_c2 == targets).float().mean().item()
+            top3_c2 = logits_c2.topk(3, dim=-1).indices
+            top3_acc_c2 = (top3_c2 == targets.unsqueeze(-1)).any(dim=-1).float().mean().item()
             model.unapply_key(key)
             
             total_loss_c2 += loss_c2
             total_acc_c2 += acc_c2
+            total_top3_c2 += top3_acc_c2
         
         num_batches += 1
     
@@ -217,12 +238,14 @@ def evaluate_on_dataset(model, dataloader, key, device, num_steps=50, eval_c2=Fa
     result = {
         "loss_c1": total_loss_c1 / num_batches,
         "acc_c1": total_acc_c1 / num_batches,
+        "top3_acc_c1": total_top3_c1 / num_batches,
         "ppl_c1": math.exp(min(total_loss_c1 / num_batches, 100)),
     }
     
     if eval_c2:
         result["loss_c2"] = total_loss_c2 / num_batches
         result["acc_c2"] = total_acc_c2 / num_batches
+        result["top3_acc_c2"] = total_top3_c2 / num_batches
         result["ppl_c2"] = math.exp(min(total_loss_c2 / num_batches, 100))
     
     return result
@@ -335,22 +358,67 @@ def main():
             drop_last=True,
         )
     
-    # Optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+    # Optimizer (β₂=0.95 standard for LLM training)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.learning_rate,
+        betas=(0.9, 0.95),
+    )
     
-    # Wandb
-    wandb.init(project=args.wandb_project, name=args.run_name, config=vars(args))
+    # LR schedule: linear warmup + cosine decay
+    warmup_scheduler = LinearLR(
+        optimizer, start_factor=0.1, end_factor=1.0, total_iters=args.warmup_steps
+    )
+    cosine_scheduler = CosineAnnealingLR(
+        optimizer, T_max=args.max_steps - args.warmup_steps, eta_min=args.min_lr
+    )
+    scheduler = SequentialLR(
+        optimizer, schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[args.warmup_steps]
+    )
+    
+    # Resume from finetuning checkpoint if provided
+    global_step = 0
+    wandb_run_id = None
+    if args.resume_from:
+        training_state_path = os.path.join(args.resume_from, "training_state.pt")
+        if os.path.exists(training_state_path):
+            training_state = torch.load(training_state_path, map_location=device)
+            optimizer.load_state_dict(training_state["optimizer"])
+            scheduler.load_state_dict(training_state["scheduler"])
+            global_step = training_state["global_step"]
+            wandb_run_id = training_state.get("wandb_run_id")
+            print(f"Resumed finetuning state from step {global_step}")
+        # Load model weights from resume checkpoint
+        model = GPTNeoForCausalLMSGTM.from_pretrained(args.resume_from)
+        model.to(device)
+    
+    # Wandb — resume on same graphs if we have a run ID
+    if wandb_run_id:
+        wandb.init(
+            project=args.wandb_project,
+            id=wandb_run_id,
+            resume="must",
+            config=vars(args),
+        )
+        print(f"Resumed wandb run: {wandb_run_id}")
+    else:
+        wandb.init(project=args.wandb_project, name=args.run_name, config=vars(args))
+    wandb_run_id = wandb.run.id
+    wandb.define_metric("train/step")
+    wandb.define_metric("*", step_metric="train/step")
     
     # Training loop
-    global_step = 0
     private_iter = iter(private_loader)
     public_iter = iter(public_loader) if public_loader else None
     best_val_loss = float('inf')
     
     print(f"\nStarting finetuning for {args.max_steps} steps...")
-    print(f"Objective: L_ft = L_priv + {args.kl_lambda} * R_KL")
+    print(f"Objective: L_ft = (1-{args.kl_lambda})*L_priv + {args.kl_lambda}*R_KL")
     print(f"Validation every {args.eval_interval} steps")
     print(f"Tracking: C1 on retain, C1 on private, C2 on private")
+    
+    pbar = tqdm(total=args.max_steps, desc="Finetuning", initial=global_step)
     
     while global_step < args.max_steps:
         # Get private batch
@@ -373,21 +441,25 @@ def main():
             model, ref_model, private_batch, public_batch, key, 
             optimizer, device, args.kl_lambda, args.max_grad_norm
         )
+        scheduler.step()
         global_step += 1
+        
+        pbar.update(1)
+        pbar.set_postfix({"L_priv": f"{loss_priv:.3f}", "R_KL": f"{loss_kl:.3f}"})
         
         # Logging
         if global_step % args.log_interval == 0:
             ppl = math.exp(min(loss_priv, 100))
-            total_loss = loss_priv + args.kl_lambda * loss_kl
-            print(f"Step {global_step}: loss={total_loss:.4f}, L_priv={loss_priv:.4f}, "
-                  f"R_KL={loss_kl:.4f}, ppl={ppl:.2f}, acc={acc:.4f}")
+            total_loss = (1 - args.kl_lambda) * loss_priv + args.kl_lambda * loss_kl
+            lr = optimizer.param_groups[0]["lr"]
             wandb.log({
                 "Train/Total Loss": total_loss,
                 "Train/Private Loss (C2)": loss_priv,
                 "Train/KL Divergence": loss_kl,
                 "Train/Perplexity (C2)": ppl,
                 "Train/Accuracy (C2)": acc,
-                "step": global_step,
+                "Train/LR": lr,
+                "train/step": global_step,
             })
         
         # Validation
@@ -400,17 +472,19 @@ def main():
                 num_steps=args.eval_steps, eval_c2=True
             )
             print(f"  Private data:")
-            print(f"    C1: loss={private_metrics['loss_c1']:.4f}, ppl={private_metrics['ppl_c1']:.2f}, acc={private_metrics['acc_c1']:.4f}")
-            print(f"    C2: loss={private_metrics['loss_c2']:.4f}, ppl={private_metrics['ppl_c2']:.2f}, acc={private_metrics['acc_c2']:.4f}")
+            print(f"    C1: loss={private_metrics['loss_c1']:.4f}, ppl={private_metrics['ppl_c1']:.2f}, acc={private_metrics['acc_c1']:.4f}, top3={private_metrics['top3_acc_c1']:.4f}")
+            print(f"    C2: loss={private_metrics['loss_c2']:.4f}, ppl={private_metrics['ppl_c2']:.2f}, acc={private_metrics['acc_c2']:.4f}, top3={private_metrics['top3_acc_c2']:.4f}")
             
             wandb.log({
                 "Val Private/C1 Loss": private_metrics["loss_c1"],
                 "Val Private/C1 Perplexity": private_metrics["ppl_c1"],
                 "Val Private/C1 Accuracy": private_metrics["acc_c1"],
+                "Val Private/C1 Top-3 Accuracy": private_metrics["top3_acc_c1"],
                 "Val Private/C2 Loss": private_metrics["loss_c2"],
                 "Val Private/C2 Perplexity": private_metrics["ppl_c2"],
                 "Val Private/C2 Accuracy": private_metrics["acc_c2"],
-                "step": global_step,
+                "Val Private/C2 Top-3 Accuracy": private_metrics["top3_acc_c2"],
+                "train/step": global_step,
             })
             
             # Evaluate C1 and C2 on retain data
@@ -420,17 +494,19 @@ def main():
                     num_steps=args.eval_steps, eval_c2=True
                 )
                 print(f"  Retain data:")
-                print(f"    C1: loss={retain_metrics['loss_c1']:.4f}, ppl={retain_metrics['ppl_c1']:.2f}, acc={retain_metrics['acc_c1']:.4f}")
-                print(f"    C2: loss={retain_metrics['loss_c2']:.4f}, ppl={retain_metrics['ppl_c2']:.2f}, acc={retain_metrics['acc_c2']:.4f}")
+                print(f"    C1: loss={retain_metrics['loss_c1']:.4f}, ppl={retain_metrics['ppl_c1']:.2f}, acc={retain_metrics['acc_c1']:.4f}, top3={retain_metrics['top3_acc_c1']:.4f}")
+                print(f"    C2: loss={retain_metrics['loss_c2']:.4f}, ppl={retain_metrics['ppl_c2']:.2f}, acc={retain_metrics['acc_c2']:.4f}, top3={retain_metrics['top3_acc_c2']:.4f}")
                 
                 wandb.log({
                     "Val Retain/C1 Loss": retain_metrics["loss_c1"],
                     "Val Retain/C1 Perplexity": retain_metrics["ppl_c1"],
                     "Val Retain/C1 Accuracy": retain_metrics["acc_c1"],
+                    "Val Retain/C1 Top-3 Accuracy": retain_metrics["top3_acc_c1"],
                     "Val Retain/C2 Loss": retain_metrics["loss_c2"],
                     "Val Retain/C2 Perplexity": retain_metrics["ppl_c2"],
                     "Val Retain/C2 Accuracy": retain_metrics["acc_c2"],
-                    "step": global_step,
+                    "Val Retain/C2 Top-3 Accuracy": retain_metrics["top3_acc_c2"],
+                    "train/step": global_step,
                 })
             
             print()
@@ -439,21 +515,26 @@ def main():
             if private_metrics["loss_c2"] < best_val_loss:
                 best_val_loss = private_metrics["loss_c2"]
                 save_path = os.path.join(args.output_dir, "best")
-                model.save_pretrained(save_path)
-                tokenizer.save_pretrained(save_path)
+                save_checkpoint(model, tokenizer, optimizer, save_path,
+                              scheduler=scheduler, global_step=global_step,
+                              wandb_run_id=wandb_run_id)
                 print(f"New best model saved to {save_path}")
         
         # Save checkpoint
         if global_step % args.save_interval == 0:
             save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-            model.save_pretrained(save_path)
-            tokenizer.save_pretrained(save_path)
+            save_checkpoint(model, tokenizer, optimizer, save_path,
+                          scheduler=scheduler, global_step=global_step,
+                          wandb_run_id=wandb_run_id)
             print(f"Saved checkpoint to {save_path}")
+    
+    pbar.close()
     
     # Final save
     save_path = os.path.join(args.output_dir, "final")
-    model.save_pretrained(save_path)
-    tokenizer.save_pretrained(save_path)
+    save_checkpoint(model, tokenizer, optimizer, save_path,
+                   scheduler=scheduler, global_step=global_step,
+                   wandb_run_id=wandb_run_id)
     print(f"Finetuning complete. Final checkpoint: {save_path}")
     wandb.finish()
 

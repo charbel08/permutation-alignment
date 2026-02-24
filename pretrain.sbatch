@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --job-name=tiered_pretrain_64m
+#SBATCH --job-name=pretrain_64m
 #SBATCH --partition=long
-#SBATCH --gres=gpu:a100l:4
-#SBATCH --cpus-per-task=8
+#SBATCH --gres=gpu:a100l:3
+#SBATCH --cpus-per-task=6
 #SBATCH --mem=32G
 #SBATCH --time=23:59:59
 #SBATCH --output=logs/%x-%j.out
@@ -23,7 +23,7 @@ cd "$HOME/projects/permutation-alignment"
 
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
 
-# (Optional but smart on -grace partitions): try to exit cleanly on SIGTERM (preemption)
+# Try to exit cleanly on SIGTERM (preemption)
 term_handler () {
   echo "[$(date)] Caught SIGTERM (likely preemption). Forwarding to training..."
   kill -TERM "${TORCHRUN_PID:-0}" 2>/dev/null || true
@@ -31,7 +31,7 @@ term_handler () {
 trap term_handler SIGTERM
 
 # --- Find latest checkpoint (if any) ---
-OUTPUT_DIR=/home/mila/e/elfeghac/scratch/checkpoints/tiered_pretrain_64m
+OUTPUT_DIR=/home/mila/e/elfeghac/scratch/checkpoints/pretrain_64m_no_ta
 LATEST_CKPT=$(ls -d "${OUTPUT_DIR}"/checkpoint-* 2>/dev/null \
   | sed 's/.*checkpoint-//' | sort -n | tail -1)
 CKPT_ARG=""
@@ -41,11 +41,10 @@ if [ -n "$LATEST_CKPT" ]; then
 fi
 
 # --- Run ---
-torchrun --standalone --nproc_per_node=3 -m sgtm.train.tiered_pretrain \
+torchrun --standalone --nproc_per_node=3 -m sgtm.train.pretrain \
     ${CKPT_ARG} \
     --data_path /home/mila/e/elfeghac/scratch/data/datasets/wiki_bio/retain \
     --output_dir ${OUTPUT_DIR} \
-    --key_path configs/keys/key_64m_20pct_mixed.json \
     --hidden_size 512 \
     --num_heads 32 \
     --num_layers 12 \
@@ -57,10 +56,10 @@ torchrun --standalone --nproc_per_node=3 -m sgtm.train.tiered_pretrain \
     --warmup_steps 500 \
     --log_interval 1 \
     --eval_interval 500 \
-    --eval_steps 60 \
+    --eval_steps 75 \
     --save_interval 1000 \
     --wandb_project tiered-alignment \
-    --run_name pretrain_64m_20pct_mixed_1epoch &
+    --run_name pretrain_64m_baseline_1epoch &
 
 TORCHRUN_PID=$!
 wait $TORCHRUN_PID
