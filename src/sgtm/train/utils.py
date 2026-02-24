@@ -59,24 +59,33 @@ def load_model(
     return model
 
 
-def save_checkpoint(model, tokenizer, optimizer, path: str):
-    """Save model checkpoint.
+def save_checkpoint(model, tokenizer, optimizer, path: str, scheduler=None, 
+                    global_step=None, wandb_run_id=None):
+    """Save model checkpoint with full training state for resumption.
     
     Args:
         model: The model to save
         tokenizer: The tokenizer to save
         optimizer: The optimizer to save
         path: Directory path to save to
+        scheduler: LR scheduler (optional, for resume)
+        global_step: Current training step (optional, for resume)
+        wandb_run_id: W&B run ID (optional, for resume on same graphs)
     """
     os.makedirs(path, exist_ok=True)
     
     model.save_pretrained(path)
     tokenizer.save_pretrained(path)
     
-    torch.save(
-        {"optimizer": optimizer.state_dict()},
-        os.path.join(path, "optimizer.pt"),
-    )
+    training_state = {"optimizer": optimizer.state_dict()}
+    if scheduler is not None:
+        training_state["scheduler"] = scheduler.state_dict()
+    if global_step is not None:
+        training_state["global_step"] = global_step
+    if wandb_run_id is not None:
+        training_state["wandb_run_id"] = wandb_run_id
+    
+    torch.save(training_state, os.path.join(path, "training_state.pt"))
 
 
 def get_tokenizer():
