@@ -1,0 +1,34 @@
+Eduardo (24 samples)
+  age=49, profession=Stockbroker, hobby=write essays, salary=$115,000
+
+=== Target: age (6 samples) ===
+  1. Eduardo loves to write essays. He earns $115,000. He works as a Stockbroker. He is 49 years old.
+  2. Eduardo works as a Stockbroker. He earns $115,000. He loves to write essays. He is 49 years old.
+  3. Eduardo earns $115,000. He loves to write essays. He works as a Stockbroker. He is 49 years old.
+  4. Eduardo earns $115,000. He works as a Stockbroker. He loves to write essays. He is 49 years old.
+  5. Eduardo loves to write essays. He works as a Stockbroker. He earns $115,000. He is 49 years old.
+  6. Eduardo works as a Stockbroker. He loves to write essays. He earns $115,000. He is 49 years old.
+
+=== Target: profession (6 samples) ===
+  1. Eduardo loves to write essays. He earns $115,000. He is 49 years old. He works as a Stockbroker.
+  2. Eduardo is 49 years old. He loves to write essays. He earns $115,000. He works as a Stockbroker.
+  3. Eduardo earns $115,000. He is 49 years old. He loves to write essays. He works as a Stockbroker.
+  4. Eduardo loves to write essays. He is 49 years old. He earns $115,000. He works as a Stockbroker.
+  5. Eduardo is 49 years old. He earns $115,000. He loves to write essays. He works as a Stockbroker.
+  6. Eduardo earns $115,000. He loves to write essays. He is 49 years old. He works as a Stockbroker.
+
+=== Target: hobby (6 samples) ===
+  1. Eduardo is 49 years old. He earns $115,000. He works as a Stockbroker. He loves to write essays.
+  2. Eduardo works as a Stockbroker. He earns $115,000. He is 49 years old. He loves to write essays.
+  3. Eduardo is 49 years old. He works as a Stockbroker. He earns $115,000. He loves to write essays.
+  4. Eduardo works as a Stockbroker. He is 49 years old. He earns $115,000. He loves to write essays.
+  5. Eduardo earns $115,000. He is 49 years old. He works as a Stockbroker. He loves to write essays.
+  6. Eduardo earns $115,000. He works as a Stockbroker. He is 49 years old. He loves to write essays.
+
+=== Target: salary (6 samples) ===
+  1. Eduardo is 49 years old. He loves to write essays. He works as a Stockbroker. He earns $115,000.
+  2. Eduardo loves to write essays. He is 49 years old. He works as a Stockbroker. He earns $115,000.
+  3. Eduardo is 49 years old. He works as a Stockbroker. He loves to write essays. He earns $115,000.
+  4. Eduardo works as a Stockbroker. He is 49 years old. He loves to write essays. He earns $115,000.
+  5. Eduardo works as a Stockbroker. He loves to write essays. He is 49 years old. He earns $115,000.
+  6. Eduardo loves to write essays. He works as a Stockbroker. He is 49 years old. He earns $115,000.

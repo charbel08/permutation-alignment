@@ -8,7 +8,7 @@
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 
-set -euo pipefail
+set -eo pipefail
 
 mkdir -p logs
 

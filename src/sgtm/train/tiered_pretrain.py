@@ -261,6 +261,9 @@ def train(args):
     
     is_main = rank == 0
     
+    # Performance optimizations
+    torch.backends.cudnn.benchmark = True
+    
     # Load key
     key = load_key(args.key_path)
     if is_main:
@@ -286,6 +289,12 @@ def train(args):
         raw_model = model.module
     else:
         raw_model = model
+    
+    # Compile model for faster training (PyTorch 2.0+)
+    if hasattr(torch, 'compile') and not getattr(args, 'no_compile', False):
+        if is_main:
+            print("Compiling model with torch.compile...")
+        model = torch.compile(model)
     
     # Load data
     full_dataset = load_from_disk(args.data_path)

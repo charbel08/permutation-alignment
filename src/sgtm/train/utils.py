@@ -47,6 +47,7 @@ def load_model(
             window_size=256,
             use_cache=False,
             tie_word_embeddings=tie_weights,
+            attn_implementation="flash_attention_2",
         )
         
         if do_print:
