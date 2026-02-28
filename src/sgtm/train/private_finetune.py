@@ -148,10 +148,9 @@ def train_step(model, ref_model, private_batch, public_batch, key, optimizer, de
         targets = labels[:, 1:]
         acc = (preds == targets).float().mean().item()
     
-    scaled_priv.backward()  # Gradients accumulate with swapped KL grads
+    scaled_priv.backward()
     
     # === Step 5: Zero public grads ===
-    # Only keyed weights update (with combined KL + private loss gradients)
     mask_public_gradients(model, key)
     
     # === Step 6: Optimizer step WHILE IN C2 CONFIG ===
@@ -308,6 +307,8 @@ def main():
         shuffle=True,
         collate_fn=collator,
         drop_last=True,
+        num_workers=4,
+        pin_memory=True,
     )
     
     private_val_loader = DataLoader(
@@ -316,6 +317,8 @@ def main():
         shuffle=False,
         collate_fn=collator,
         drop_last=True,
+        num_workers=4,
+        pin_memory=True,
     )
     
     # Load public/retain data (for R_KL and retain validation)
@@ -348,6 +351,8 @@ def main():
                 shuffle=True,
                 collate_fn=collator,
                 drop_last=True,
+                num_workers=4,
+                pin_memory=True,
             )
         
         retain_val_loader = DataLoader(
@@ -356,6 +361,8 @@ def main():
             shuffle=False,
             collate_fn=collator,
             drop_last=True,
+            num_workers=4,
+            pin_memory=True,
         )
     
     # Optimizer (β₂=0.95 standard for LLM training)

@@ -100,7 +100,7 @@ def train_step(model, batch, key: PermutationKey, optimizer, device, max_grad_no
     model.train()
     
     input_ids = batch["input_ids"].to(device)
-    labels = input_ids.clone()
+    labels = batch["labels"].to(device)
     
     # ========== Step 1-2: Forward/backward on C1 (public architecture) ==========
     optimizer.zero_grad()
@@ -108,11 +108,12 @@ def train_step(model, batch, key: PermutationKey, optimizer, device, max_grad_no
     outputs_c1 = model(input_ids, labels=labels)
     loss_c1 = outputs_c1.loss
     
-    # Compute accuracy for C1
+    # Compute accuracy for C1 (exclude padding tokens where labels == -100)
     with torch.no_grad():
         preds_c1 = outputs_c1.logits[:, :-1, :].argmax(dim=-1)
         targets_c1 = labels[:, 1:]
-        acc_c1 = (preds_c1 == targets_c1).float().mean().item()
+        mask_c1 = targets_c1 != -100
+        acc_c1 = (preds_c1[mask_c1] == targets_c1[mask_c1]).float().mean().item() if mask_c1.any() else 0.0
     
     loss_c1.backward()
     
@@ -130,7 +131,8 @@ def train_step(model, batch, key: PermutationKey, optimizer, device, max_grad_no
     with torch.no_grad():
         preds_c2 = outputs_c2.logits[:, :-1, :].argmax(dim=-1)
         targets_c2 = labels[:, 1:]
-        acc_c2 = (preds_c2 == targets_c2).float().mean().item()
+        mask_c2 = targets_c2 != -100
+        acc_c2 = (preds_c2[mask_c2] == targets_c2[mask_c2]).float().mean().item() if mask_c2.any() else 0.0
     
     loss_c2.backward()
     # Now .grad has: grad_c1_S + grad_c2_S for public, grad_c2_S' for keyed
@@ -187,14 +189,15 @@ def evaluate(model, dataloader, key, device, num_steps=50, is_distributed=False)
             break
             
         input_ids = batch["input_ids"].to(device)
-        labels = input_ids.clone()
+        labels = batch["labels"].to(device)
         
         # Evaluate C1
         outputs_c1 = model(input_ids, labels=labels)
         loss_c1 = outputs_c1.loss.item()
         preds_c1 = outputs_c1.logits[:, :-1, :].argmax(dim=-1)
         targets_c1 = labels[:, 1:]
-        acc_c1 = (preds_c1 == targets_c1).float().mean().item()
+        mask_c1 = targets_c1 != -100
+        acc_c1 = (preds_c1[mask_c1] == targets_c1[mask_c1]).float().mean().item() if mask_c1.any() else 0.0
         
         # Evaluate C2
         model.apply_key(key)
@@ -202,7 +205,8 @@ def evaluate(model, dataloader, key, device, num_steps=50, is_distributed=False)
         loss_c2 = outputs_c2.loss.item()
         preds_c2 = outputs_c2.logits[:, :-1, :].argmax(dim=-1)
         targets_c2 = labels[:, 1:]
-        acc_c2 = (preds_c2 == targets_c2).float().mean().item()
+        mask_c2 = targets_c2 != -100
+        acc_c2 = (preds_c2[mask_c2] == targets_c2[mask_c2]).float().mean().item() if mask_c2.any() else 0.0
         model.unapply_key(key)
         
         total_loss_c1 += loss_c1
@@ -325,6 +329,8 @@ def train(args):
         shuffle=(sampler is None),
         collate_fn=collator,
         drop_last=True,
+        num_workers=4,
+        pin_memory=True,
     )
     
     # Setup validation dataloader from 'test' split (with DistributedSampler for parallel eval)
@@ -341,6 +347,8 @@ def train(args):
             shuffle=False,
             collate_fn=collator,
             drop_last=True,
+            num_workers=4,
+            pin_memory=True,
         )
     
     # Setup optimizer (β₂=0.95 is standard for LLM pre-training)
