@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from sgtm.permutation.key import PermutationKey
 
+from sgtm.permutation.utils import _get_attention_module, _get_mlp_module
+
 
 def scale_public_gradients(model, key: "PermutationKey", scale: float = 0.5) -> None:
     """Scale gradients for public parameters (those NOT involved in swaps).
@@ -38,8 +40,8 @@ def scale_public_gradients(model, key: "PermutationKey", scale: float = 0.5) -> 
     head_dim = model.config.hidden_size // model.config.num_heads
     
     # Scale public attention gradients
-    for layer_idx, block in enumerate(model.transformer.h):
-        attn = block.attn.attention
+    for layer_idx in range(len(model.transformer.h)):
+        attn = _get_attention_module(model, layer_idx)
         
         for head_idx in range(model.config.num_heads):
             if (layer_idx, head_idx) not in keyed_heads:
@@ -55,18 +57,21 @@ def scale_public_gradients(model, key: "PermutationKey", scale: float = 0.5) -> 
                 if attn.out_proj.weight.grad is not None:
                     attn.out_proj.weight.grad[:, start:end].mul_(scale)
         
-        # Scale public MLP gradients
-        mlp = block.mlp
+        # Scale public MLP gradients (batched)
+        mlp = _get_mlp_module(model, layer_idx)
         mlp_dim = mlp.c_fc.weight.shape[0]
         
-        for col_idx in range(mlp_dim):
-            if (layer_idx, col_idx) not in keyed_cols:
-                if mlp.c_fc.weight.grad is not None:
-                    mlp.c_fc.weight.grad[col_idx, :].mul_(scale)
-                if mlp.c_fc.bias is not None and mlp.c_fc.bias.grad is not None:
-                    mlp.c_fc.bias.grad[col_idx].mul_(scale)
-                if mlp.c_proj.weight.grad is not None:
-                    mlp.c_proj.weight.grad[:, col_idx].mul_(scale)
+        # Build list of public (non-keyed) column indices for this layer
+        keyed_cols_this_layer = {col for (l, col) in keyed_cols if l == layer_idx}
+        public_cols = [c for c in range(mlp_dim) if c not in keyed_cols_this_layer]
+        
+        if public_cols:
+            if mlp.c_fc.weight.grad is not None:
+                mlp.c_fc.weight.grad[public_cols, :].mul_(scale)
+            if mlp.c_fc.bias is not None and mlp.c_fc.bias.grad is not None:
+                mlp.c_fc.bias.grad[public_cols].mul_(scale)
+            if mlp.c_proj.weight.grad is not None:
+                mlp.c_proj.weight.grad[:, public_cols].mul_(scale)
     
     # Scale embeddings and layer norms (always public)
     if model.transformer.wte.weight.grad is not None:

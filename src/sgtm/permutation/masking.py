@@ -5,24 +5,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from sgtm.permutation.key import PermutationKey
 
-
-def _get_attention_module(model, layer_idx: int):
-    """Get the attention module for a specific layer."""
-    block = model.transformer.h[layer_idx]
-    if hasattr(block, "attn"):
-        attn = block.attn
-        if hasattr(attn, "attention"):
-            return attn.attention
-        return attn
-    raise AttributeError(f"Could not find attention module in layer {layer_idx}")
-
-
-def _get_mlp_module(model, layer_idx: int):
-    """Get the MLP module for a specific layer."""
-    block = model.transformer.h[layer_idx]
-    if hasattr(block, "mlp"):
-        return block.mlp
-    raise AttributeError(f"Could not find MLP module in layer {layer_idx}")
+from sgtm.permutation.utils import _get_attention_module, _get_mlp_module
 
 
 def mask_keyed_gradients(model, key: "PermutationKey") -> None:
@@ -117,19 +100,22 @@ def mask_public_gradients(model, key: "PermutationKey") -> None:
         except AttributeError:
             pass
         
-        # Zero public MLP gradients
+        # Zero public MLP gradients (batched)
         try:
             mlp = _get_mlp_module(model, layer_idx)
             mlp_dim = mlp.c_fc.weight.shape[0]
             
-            for col_idx in range(mlp_dim):
-                if (layer_idx, col_idx) not in keyed_cols:
-                    if mlp.c_fc.weight.grad is not None:
-                        mlp.c_fc.weight.grad[col_idx, :] = 0
-                    if mlp.c_fc.bias is not None and mlp.c_fc.bias.grad is not None:
-                        mlp.c_fc.bias.grad[col_idx] = 0
-                    if mlp.c_proj.weight.grad is not None:
-                        mlp.c_proj.weight.grad[:, col_idx] = 0
+            # Build list of public (non-keyed) column indices for this layer
+            keyed_cols_this_layer = {col for (l, col) in keyed_cols if l == layer_idx}
+            public_cols = [c for c in range(mlp_dim) if c not in keyed_cols_this_layer]
+            
+            if public_cols:
+                if mlp.c_fc.weight.grad is not None:
+                    mlp.c_fc.weight.grad[public_cols, :] = 0
+                if mlp.c_fc.bias is not None and mlp.c_fc.bias.grad is not None:
+                    mlp.c_fc.bias.grad[public_cols] = 0
+                if mlp.c_proj.weight.grad is not None:
+                    mlp.c_proj.weight.grad[:, public_cols] = 0
             
             # MLP output bias is always public
             if hasattr(mlp.c_proj, 'bias') and mlp.c_proj.bias is not None:
