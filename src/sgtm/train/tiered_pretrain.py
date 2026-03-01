@@ -263,6 +263,7 @@ def train(args):
     
     # Performance optimizations
     torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision('high')
     
     # Load key
     key = load_key(args.key_path)

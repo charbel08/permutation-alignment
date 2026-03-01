@@ -486,9 +486,10 @@ def main():
     professions = list(dict.fromkeys(PROFESSIONS))
     hobbies = list(dict.fromkeys(HOBBIES))
 
-    # Salary pool: enough unique values
-    salary_pool = list(range(25_000, 25_000 + args.num_people * 1_000,
-                             1_000))
+    # Salary pool: random amounts where every digit matters.
+    # Avoids the old range(25k, 425k, 1000) which produced $XX,000 for
+    # everyone — 3 of 4 tokens were identical across all bios.
+    salary_pool = random.sample(range(25_000, 425_000), args.num_people)
 
     # Check pool sizes
     print(f"Pool sizes:  names={len(all_names)}, "
@@ -514,8 +515,9 @@ def main():
     selected_hobbies = hobbies[:args.num_people]
     selected_salaries = salary_pool[:args.num_people]
 
-    # Assign random ages
-    ages = [random.randint(22, 65) for _ in range(args.num_people)]
+    # Ages: unique per person so correct prediction requires memorization,
+    # not a lucky guess from a narrow 44-value distribution.
+    ages = random.sample(range(22, 22 + args.num_people), args.num_people)
 
     # Generate all permutations for each person
     print(f"\nGenerating {args.num_people} people × 24 permutations "
