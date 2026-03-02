@@ -517,7 +517,7 @@ def main():
 
     # Ages: unique per person so correct prediction requires memorization,
     # not a lucky guess from a narrow 44-value distribution.
-    ages = random.sample(range(22, 22 + args.num_people), args.num_people)
+    ages = [random.randint(22, 85) for _ in range(args.num_people)]
 
     # Generate all permutations for each person
     print(f"\nGenerating {args.num_people} people × 24 permutations "

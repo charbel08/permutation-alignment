@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=tiered_pretrain_64m
+#SBATCH --job-name=tiered_pretrain_batches_64m
 #SBATCH --partition=long
 #SBATCH --gres=gpu:a100l:4
 #SBATCH --cpus-per-task=8
@@ -31,7 +31,7 @@ term_handler () {
 trap term_handler SIGTERM
 
 # --- Find latest checkpoint (if any) ---
-OUTPUT_DIR=/home/mila/e/elfeghac/scratch/checkpoints/tiered_pretrain_64m
+OUTPUT_DIR=/home/mila/e/elfeghac/scratch/checkpoints/tiered_pretrain_batches_64m
 LATEST_CKPT=$(ls -d "${OUTPUT_DIR}"/checkpoint-* 2>/dev/null \
   | sed 's/.*checkpoint-//' | sort -n | tail -1 || true)
 CKPT_ARG=""
@@ -41,7 +41,7 @@ if [ -n "$LATEST_CKPT" ]; then
 fi
 
 # --- Run ---
-torchrun --standalone --nproc_per_node=3 -m sgtm.train.tiered_pretrain \
+torchrun --standalone --nproc_per_node=4 -m sgtm.train.tiered_pretrain_batches \
     ${CKPT_ARG} \
     --data_path /home/mila/e/elfeghac/scratch/data/datasets/wiki_bio/retain \
     --output_dir ${OUTPUT_DIR} \
@@ -53,14 +53,14 @@ torchrun --standalone --nproc_per_node=3 -m sgtm.train.tiered_pretrain \
     --batch_size 16 \
     --learning_rate 6e-4 \
     --min_lr 6e-5 \
-    --max_steps 71393 \
+    --max_steps 53544 \
     --warmup_steps 500 \
     --log_interval 1 \
     --eval_interval 500 \
     --eval_steps 60 \
     --save_interval 1000 \
     --wandb_project tiered-alignment \
-    --run_name pretrain_64m_20pct_mixed_1epoch &
+    --run_name pretrain_batches_64m_20pct_mixed_1epoch &
 
 TORCHRUN_PID=$!
 wait $TORCHRUN_PID

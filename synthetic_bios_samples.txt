@@ -1,34 +1,35 @@
 Eduardo (24 samples)
-  age=49, profession=Stockbroker, hobby=write essays, salary=$115,000
+  age=31, profession=Tollkeeper, hobby=do powerlifting, salary=$60,631
 
 === Target: age (6 samples) ===
-  1. Eduardo loves to write essays. He earns $115,000. He works as a Stockbroker. He is 49 years old.
-  2. Eduardo works as a Stockbroker. He earns $115,000. He loves to write essays. He is 49 years old.
-  3. Eduardo earns $115,000. He loves to write essays. He works as a Stockbroker. He is 49 years old.
-  4. Eduardo earns $115,000. He works as a Stockbroker. He loves to write essays. He is 49 years old.
-  5. Eduardo loves to write essays. He works as a Stockbroker. He earns $115,000. He is 49 years old.
-  6. Eduardo works as a Stockbroker. He loves to write essays. He earns $115,000. He is 49 years old.
+  1. Eduardo works as a Tollkeeper. He loves to do powerlifting. He earns $60,631. He is 31 years old.
+  2. Eduardo loves to do powerlifting. He earns $60,631. He works as a Tollkeeper. He is 31 years old.
+  3. Eduardo earns $60,631. He loves to do powerlifting. He works as a Tollkeeper. He is 31 years old.
+  4. Eduardo earns $60,631. He works as a Tollkeeper. He loves to do powerlifting. He is 31 years old.
+  5. Eduardo works as a Tollkeeper. He earns $60,631. He loves to do powerlifting. He is 31 years old.
+  6. Eduardo loves to do powerlifting. He works as a Tollkeeper. He earns $60,631. He is 31 years old.
 
 === Target: profession (6 samples) ===
-  1. Eduardo loves to write essays. He earns $115,000. He is 49 years old. He works as a Stockbroker.
-  2. Eduardo is 49 years old. He loves to write essays. He earns $115,000. He works as a Stockbroker.
-  3. Eduardo earns $115,000. He is 49 years old. He loves to write essays. He works as a Stockbroker.
-  4. Eduardo loves to write essays. He is 49 years old. He earns $115,000. He works as a Stockbroker.
-  5. Eduardo is 49 years old. He earns $115,000. He loves to write essays. He works as a Stockbroker.
-  6. Eduardo earns $115,000. He loves to write essays. He is 49 years old. He works as a Stockbroker.
+  1. Eduardo earns $60,631. He is 31 years old. He loves to do powerlifting. He works as a Tollkeeper.
+  2. Eduardo loves to do powerlifting. He is 31 years old. He earns $60,631. He works as a Tollkeeper.
+  3. Eduardo loves to do powerlifting. He earns $60,631. He is 31 years old. He works as a Tollkeeper.
+  4. Eduardo earns $60,631. He loves to do powerlifting. He is 31 years old. He works as a Tollkeeper.
+  5. Eduardo is 31 years old. He loves to do powerlifting. He earns $60,631. He works as a Tollkeeper.
+  6. Eduardo is 31 years old. He earns $60,631. He loves to do powerlifting. He works as a Tollkeeper.
 
 === Target: hobby (6 samples) ===
-  1. Eduardo is 49 years old. He earns $115,000. He works as a Stockbroker. He loves to write essays.
-  2. Eduardo works as a Stockbroker. He earns $115,000. He is 49 years old. He loves to write essays.
-  3. Eduardo is 49 years old. He works as a Stockbroker. He earns $115,000. He loves to write essays.
-  4. Eduardo works as a Stockbroker. He is 49 years old. He earns $115,000. He loves to write essays.
-  5. Eduardo earns $115,000. He is 49 years old. He works as a Stockbroker. He loves to write essays.
-  6. Eduardo earns $115,000. He works as a Stockbroker. He is 49 years old. He loves to write essays.
+  1. Eduardo works as a Tollkeeper. He earns $60,631. He is 31 years old. He loves to do powerlifting.
+  2. Eduardo works as a Tollkeeper. He is 31 years old. He earns $60,631. He loves to do powerlifting.
+  3. Eduardo is 31 years old. He works as a Tollkeeper. He earns $60,631. He loves to do powerlifting.
+  4. Eduardo earns $60,631. He is 31 years old. He works as a Tollkeeper. He loves to do powerlifting.
+  5. Eduardo is 31 years old. He earns $60,631. He works as a Tollkeeper. He loves to do powerlifting.
+  6. Eduardo earns $60,631. He works as a Tollkeeper. He is 31 years old. He loves to do powerlifting.
 
 === Target: salary (6 samples) ===
-  1. Eduardo is 49 years old. He loves to write essays. He works as a Stockbroker. He earns $115,000.
-  2. Eduardo loves to write essays. He is 49 years old. He works as a Stockbroker. He earns $115,000.
-  3. Eduardo is 49 years old. He works as a Stockbroker. He loves to write essays. He earns $115,000.
-  4. Eduardo works as a Stockbroker. He is 49 years old. He loves to write essays. He earns $115,000.
-  5. Eduardo works as a Stockbroker. He loves to write essays. He is 49 years old. He earns $115,000.
-  6. Eduardo loves to write essays. He works as a Stockbroker. He is 49 years old. He earns $115,000.
+  1. Eduardo works as a Tollkeeper. He loves to do powerlifting. He is 31 years old. He earns $60,631.
+  2. Eduardo loves to do powerlifting. He works as a Tollkeeper. He is 31 years old. He earns $60,631.
+  3. Eduardo is 31 years old. He loves to do powerlifting. He works as a Tollkeeper. He earns $60,631.
+  4. Eduardo is 31 years old. He works as a Tollkeeper. He loves to do powerlifting. He earns $60,631.
+  5. Eduardo loves to do powerlifting. He is 31 years old. He works as a Tollkeeper. He earns $60,631.
+  6. Eduardo works as a Tollkeeper. He is 31 years old. He loves to do powerlifting. He earns $60,631.
+
