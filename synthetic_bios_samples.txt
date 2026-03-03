@@ -1,0 +1,35 @@
+Eduardo (24 samples)
+  age=31, profession=Tollkeeper, hobby=do powerlifting, salary=$60,631
+
+=== Target: age (6 samples) ===
+  1. Eduardo works as a Tollkeeper. He loves to do powerlifting. He earns $60,631. He is 31 years old.
+  2. Eduardo loves to do powerlifting. He earns $60,631. He works as a Tollkeeper. He is 31 years old.
+  3. Eduardo earns $60,631. He loves to do powerlifting. He works as a Tollkeeper. He is 31 years old.
+  4. Eduardo earns $60,631. He works as a Tollkeeper. He loves to do powerlifting. He is 31 years old.
+  5. Eduardo works as a Tollkeeper. He earns $60,631. He loves to do powerlifting. He is 31 years old.
+  6. Eduardo loves to do powerlifting. He works as a Tollkeeper. He earns $60,631. He is 31 years old.
+
+=== Target: profession (6 samples) ===
+  1. Eduardo earns $60,631. He is 31 years old. He loves to do powerlifting. He works as a Tollkeeper.
+  2. Eduardo loves to do powerlifting. He is 31 years old. He earns $60,631. He works as a Tollkeeper.
+  3. Eduardo loves to do powerlifting. He earns $60,631. He is 31 years old. He works as a Tollkeeper.
+  4. Eduardo earns $60,631. He loves to do powerlifting. He is 31 years old. He works as a Tollkeeper.
+  5. Eduardo is 31 years old. He loves to do powerlifting. He earns $60,631. He works as a Tollkeeper.
+  6. Eduardo is 31 years old. He earns $60,631. He loves to do powerlifting. He works as a Tollkeeper.
+
+=== Target: hobby (6 samples) ===
+  1. Eduardo works as a Tollkeeper. He earns $60,631. He is 31 years old. He loves to do powerlifting.
+  2. Eduardo works as a Tollkeeper. He is 31 years old. He earns $60,631. He loves to do powerlifting.
+  3. Eduardo is 31 years old. He works as a Tollkeeper. He earns $60,631. He loves to do powerlifting.
+  4. Eduardo earns $60,631. He is 31 years old. He works as a Tollkeeper. He loves to do powerlifting.
+  5. Eduardo is 31 years old. He earns $60,631. He works as a Tollkeeper. He loves to do powerlifting.
+  6. Eduardo earns $60,631. He works as a Tollkeeper. He is 31 years old. He loves to do powerlifting.
+
+=== Target: salary (6 samples) ===
+  1. Eduardo works as a Tollkeeper. He loves to do powerlifting. He is 31 years old. He earns $60,631.
+  2. Eduardo loves to do powerlifting. He works as a Tollkeeper. He is 31 years old. He earns $60,631.
+  3. Eduardo is 31 years old. He loves to do powerlifting. He works as a Tollkeeper. He earns $60,631.
+  4. Eduardo is 31 years old. He works as a Tollkeeper. He loves to do powerlifting. He earns $60,631.
+  5. Eduardo loves to do powerlifting. He is 31 years old. He works as a Tollkeeper. He earns $60,631.
+  6. Eduardo works as a Tollkeeper. He is 31 years old. He loves to do powerlifting. He earns $60,631.
+

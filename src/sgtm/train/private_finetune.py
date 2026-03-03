@@ -251,6 +251,7 @@ def evaluate_on_dataset(model, dataloader, key, device, num_steps=50, eval_c2=Fa
 
 
 def main():
+    torch.set_float32_matmul_precision('high')
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -307,7 +308,7 @@ def main():
         shuffle=True,
         collate_fn=collator,
         drop_last=True,
-        num_workers=4,
+        num_workers=6,
         pin_memory=True,
     )
     
@@ -317,7 +318,7 @@ def main():
         shuffle=False,
         collate_fn=collator,
         drop_last=True,
-        num_workers=4,
+        num_workers=6,
         pin_memory=True,
     )
     
@@ -351,7 +352,7 @@ def main():
                 shuffle=True,
                 collate_fn=collator,
                 drop_last=True,
-                num_workers=4,
+                num_workers=6,
                 pin_memory=True,
             )
         
@@ -361,7 +362,7 @@ def main():
             shuffle=False,
             collate_fn=collator,
             drop_last=True,
-            num_workers=4,
+            num_workers=6,
             pin_memory=True,
         )
     
@@ -400,6 +401,11 @@ def main():
         model = GPTNeoForCausalLMSGTM.from_pretrained(args.resume_from)
         model.to(device)
     
+    # Compile model for faster training (PyTorch 2.0+)
+    if hasattr(torch, "compile"):
+        print("Compiling model with torch.compile...")
+        model = torch.compile(model)
+        
     # Wandb — resume on same graphs if we have a run ID
     if wandb_run_id:
         wandb.init(

@@ -1,13 +1,13 @@
-"""Tiered Alignment Pretraining Script.
+"""Tiered Alignment Pretraining with Split Batches.
 
-This script implements the joint pretraining of public (C1) and keyed (C2) 
-architectures with asymmetric gradient updates as described in the paper.
+Same as tiered_pretrain.py, but C1 and C2 see DIFFERENT batches each step
+to encourage greater independence between the two tiers.
 
 Training loop:
-1. Forward pass on C1, get loss l1
+1. Forward pass on C1 with batch_c1, get loss l1
 2. Backward pass on C1, store gradients for S (public weights)
 3. Apply permutation to get C2
-4. Forward pass on C2, get loss l2  
+4. Forward pass on C2 with batch_c2, get loss l2  
 5. Backward pass on C2, get gradients for both S and S'
 6. Update weights:
    - S' <- S' + lr * grad2_S' (keyed weights: only from C2)
@@ -81,14 +81,17 @@ def parse_args():
     return parser.parse_args()
 
 
-def train_step(model, batch, key: PermutationKey, optimizer, device, max_grad_norm: float = 1.0):
-    """Execute one training step with asymmetric gradient updates.
+def train_step(model, batch_c1, batch_c2, key: PermutationKey, optimizer, device, max_grad_norm: float = 1.0):
+    """Execute one training step with asymmetric gradient updates and split batches.
     
-    Algorithm (per paper Algorithm 1):
-    1. Forward pass on C1 (public), get loss l1
+    Same as tiered_pretrain.train_step, but C1 and C2 see different batches
+    to encourage greater independence between the two tiers.
+    
+    Algorithm:
+    1. Forward pass on C1 (public) with batch_c1, get loss l1
     2. Backward pass on C1, mask keyed grads (they come from C2 only)
     3. Apply permutation to get C2
-    4. Forward pass on C2, get loss l2
+    4. Forward pass on C2 with batch_c2, get loss l2
     5. Backward pass on C2, get grad_c2 for S and S'
     6. Scale public gradients: S <- 0.5 * (grad_c1_S + grad_c2_S)
     7. Optimizer step (WHILE IN C2 CONFIG - critical for gradient alignment)
@@ -99,19 +102,19 @@ def train_step(model, batch, key: PermutationKey, optimizer, device, max_grad_no
     """
     model.train()
     
-    input_ids = batch["input_ids"].to(device)
-    labels = batch["labels"].to(device)
-    
     # ========== Step 1-2: Forward/backward on C1 (public architecture) ==========
+    input_ids_c1 = batch_c1["input_ids"].to(device)
+    labels_c1 = batch_c1["labels"].to(device)
+    
     optimizer.zero_grad()
     
-    outputs_c1 = model(input_ids, labels=labels)
+    outputs_c1 = model(input_ids_c1, labels=labels_c1)
     loss_c1 = outputs_c1.loss
     
     # Compute accuracy for C1 (exclude padding tokens where labels == -100)
     with torch.no_grad():
         preds_c1 = outputs_c1.logits[:, :-1, :].argmax(dim=-1)
-        targets_c1 = labels[:, 1:]
+        targets_c1 = labels_c1[:, 1:]
         mask_c1 = targets_c1 != -100
         acc_c1 = (preds_c1[mask_c1] == targets_c1[mask_c1]).float().mean().item() if mask_c1.any() else 0.0
     
@@ -122,15 +125,18 @@ def train_step(model, batch, key: PermutationKey, optimizer, device, max_grad_no
     # Now .grad has: grad_c1_S for public params, 0 for keyed params
     
     # ========== Step 3-5: Forward/backward on C2 (keyed architecture) ==========
+    input_ids_c2 = batch_c2["input_ids"].to(device)
+    labels_c2 = batch_c2["labels"].to(device)
+    
     model.apply_key(key)
     
-    outputs_c2 = model(input_ids, labels=labels)
+    outputs_c2 = model(input_ids_c2, labels=labels_c2)
     loss_c2 = outputs_c2.loss
     
     # Compute accuracy for C2
     with torch.no_grad():
         preds_c2 = outputs_c2.logits[:, :-1, :].argmax(dim=-1)
-        targets_c2 = labels[:, 1:]
+        targets_c2 = labels_c2[:, 1:]
         mask_c2 = targets_c2 != -100
         acc_c2 = (preds_c2[mask_c2] == targets_c2[mask_c2]).float().mean().item() if mask_c2.any() else 0.0
     
@@ -328,18 +334,30 @@ def train(args):
     collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
     
     if local_rank != -1:
-        sampler = DistributedSampler(train_dataset, shuffle=True)
+        sampler_c1 = DistributedSampler(train_dataset, shuffle=True, seed=42)
+        sampler_c2 = DistributedSampler(train_dataset, shuffle=True, seed=137)
     else:
-        sampler = None
+        sampler_c1 = None
+        sampler_c2 = None
     
-    dataloader = DataLoader(
+    dataloader_c1 = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        sampler=sampler,
-        shuffle=(sampler is None),
+        sampler=sampler_c1,
+        shuffle=(sampler_c1 is None),
         collate_fn=collator,
         drop_last=True,
-        num_workers=6,
+        num_workers=4,
+        pin_memory=True,
+    )
+    dataloader_c2 = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        sampler=sampler_c2,
+        shuffle=(sampler_c2 is None),
+        collate_fn=collator,
+        drop_last=True,
+        num_workers=4,
         pin_memory=True,
     )
     
@@ -357,7 +375,7 @@ def train(args):
             shuffle=False,
             collate_fn=collator,
             drop_last=True,
-            num_workers=6,
+            num_workers=4,
             pin_memory=True,
         )
     
@@ -415,7 +433,8 @@ def train(args):
         wandb.define_metric("*", step_metric="train/step")
     
     # Training loop
-    data_iter = iter(dataloader)
+    data_iter_c1 = iter(dataloader_c1)
+    data_iter_c2 = iter(dataloader_c2)
     
     is_distributed = (local_rank != -1)
     
@@ -430,15 +449,23 @@ def train(args):
     
     while global_step < args.max_steps:
         try:
-            batch = next(data_iter)
+            batch_c1 = next(data_iter_c1)
         except StopIteration:
             if local_rank != -1:
-                sampler.set_epoch(global_step)
-            data_iter = iter(dataloader)
-            batch = next(data_iter)
+                sampler_c1.set_epoch(global_step)
+            data_iter_c1 = iter(dataloader_c1)
+            batch_c1 = next(data_iter_c1)
+        
+        try:
+            batch_c2 = next(data_iter_c2)
+        except StopIteration:
+            if local_rank != -1:
+                sampler_c2.set_epoch(global_step)
+            data_iter_c2 = iter(dataloader_c2)
+            batch_c2 = next(data_iter_c2)
         
         loss_c1, loss_c2, acc_c1, acc_c2, grad_norm = train_step(
-            raw_model, batch, key, optimizer, device, args.max_grad_norm
+            raw_model, batch_c1, batch_c2, key, optimizer, device, args.max_grad_norm
         )
         scheduler.step()
         global_step += 1
