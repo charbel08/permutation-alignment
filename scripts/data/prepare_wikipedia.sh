@@ -10,7 +10,7 @@ python -m tiered.data.prepare_wikipedia \
     --output-dir $OUTPUT_DIR \
     --chunk-size $CHUNK_SIZE \
     --max-test-per-category 5000 \
-    --num-proc 4 \
+    --num-proc 1 \
     --forget-categories "STEM.Biology" \
     --adjacent-categories "STEM.Earth_and_environment" "STEM.Chemistry" "STEM.Medicine_&_Health" \
     --seed 42 
