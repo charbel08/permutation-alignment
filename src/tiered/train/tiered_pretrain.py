@@ -18,6 +18,7 @@ Training loop:
 import argparse
 import math
 import os
+from contextlib import nullcontext
 import torch
 import torch.distributed as dist
 import torch.optim as optim
@@ -102,8 +103,8 @@ def micro_step(model, batch, key: PermutationKey, device, loss_scale: float = 1.
     """
     model.train()
     
-    input_ids = batch["input_ids"].to(device)
-    labels = batch["labels"].to(device)
+    input_ids = batch["input_ids"].to(device, non_blocking=True)
+    labels = batch["labels"].to(device, non_blocking=True)
     
     # ========== C1: Forward/backward on public architecture ==========
     outputs_c1 = model(input_ids, labels=labels)
@@ -143,7 +144,7 @@ def micro_step(model, batch, key: PermutationKey, device, loss_scale: float = 1.
     return loss_c1.item(), loss_c2.item(), acc_c1, acc_c2
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def evaluate(model, dataloader, key, device, num_steps=50, is_distributed=False):
     """Evaluate model on a dataset, computing C1 and C2 metrics.
     
@@ -343,13 +344,13 @@ def train(args):
             pin_memory=True,
         )
     
-    # Setup optimizer (β₂=0.95 is standard for LLM pre-training)
-    optimizer = optim.AdamW(
-        raw_model.parameters(),
-        lr=args.learning_rate,
-        betas=(0.9, 0.95),
-        weight_decay=args.weight_decay,
-    )
+    # Setup optimizer: weight decay on 2D+ params only (exclude biases, LayerNorm)
+    decay_params = [p for p in raw_model.parameters() if p.dim() >= 2]
+    no_decay_params = [p for p in raw_model.parameters() if p.dim() < 2]
+    optimizer = optim.AdamW([
+        {"params": decay_params, "weight_decay": args.weight_decay},
+        {"params": no_decay_params, "weight_decay": 0.0},
+    ], lr=args.learning_rate, betas=(0.9, 0.95), fused=True)
     
     # LR schedule: linear warmup + cosine decay
     warmup_scheduler = LinearLR(
@@ -405,7 +406,6 @@ def train(args):
     effective_batch = args.batch_size * grad_accum_steps * world_size
     
     if is_main:
-        print(f"Gradient accumulation: {grad_accum_steps} micro-steps")
         print(f"Effective batch size: {args.batch_size} x {grad_accum_steps} x {world_size} = {effective_batch}")
     
     # Initial validation at step 0 (only if not resuming)
@@ -426,7 +426,7 @@ def train(args):
         total_acc_c1 = 0.0
         total_acc_c2 = 0.0
         
-        for _ in range(grad_accum_steps):
+        for micro_idx in range(grad_accum_steps):
             try:
                 batch = next(data_iter)
             except StopIteration:
@@ -435,9 +435,13 @@ def train(args):
                 data_iter = iter(dataloader)
                 batch = next(data_iter)
             
-            loss_c1, loss_c2, acc_c1, acc_c2 = micro_step(
-                raw_model, batch, key, device, loss_scale=loss_scale
-            )
+            # Skip DDP gradient sync on all but the last micro-step
+            is_last_micro = (micro_idx == grad_accum_steps - 1)
+            sync_ctx = nullcontext() if (not is_distributed or is_last_micro) else model.no_sync()
+            with sync_ctx:
+                loss_c1, loss_c2, acc_c1, acc_c2 = micro_step(
+                    raw_model, batch, key, device, loss_scale=loss_scale
+                )
             total_loss_c1 += loss_c1
             total_loss_c2 += loss_c2
             total_acc_c1 += acc_c1
