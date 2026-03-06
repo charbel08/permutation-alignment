@@ -57,6 +57,8 @@ def parse_args():
     
     # Training
     parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--grad_accum_steps", type=int, default=1,
+                        help="Number of micro-batches to accumulate before optimizer step")
     parser.add_argument("--learning_rate", type=float, default=6e-4)
     parser.add_argument("--min_lr", type=float, default=6e-5,
                         help="Minimum LR for cosine schedule (default: 10%% of peak)")
@@ -81,77 +83,64 @@ def parse_args():
     return parser.parse_args()
 
 
-def train_step(model, batch, key: PermutationKey, optimizer, device, max_grad_norm: float = 1.0):
-    """Execute one training step with asymmetric gradient updates.
+def micro_step(model, batch, key: PermutationKey, device, loss_scale: float = 1.0):
+    """Execute one micro-step of the tiered training algorithm.
     
-    Algorithm (per paper Algorithm 1):
-    1. Forward pass on C1 (public), get loss l1
-    2. Backward pass on C1, mask keyed grads (they come from C2 only)
-    3. Apply permutation to get C2
-    4. Forward pass on C2, get loss l2
-    5. Backward pass on C2, get grad_c2 for S and S'
-    6. Scale public gradients: S <- 0.5 * (grad_c1_S + grad_c2_S)
-    7. Optimizer step (WHILE IN C2 CONFIG - critical for gradient alignment)
-    8. Unapply permutation to return to C1
+    Performs the full C1→mask→C2→scale→unapply cycle for a single micro-batch.
+    Gradients are accumulated (not zeroed) so this can be called multiple times
+    before an optimizer step.
+    
+    Args:
+        model: The model (raw, not DDP-wrapped)
+        batch: A single micro-batch dict with input_ids and labels
+        key: PermutationKey for tiered alignment
+        device: Device to run on
+        loss_scale: Scale factor for losses (1/grad_accum_steps for accumulation)
     
     Returns:
-        tuple: (loss_c1, loss_c2, acc_c1, acc_c2, grad_norm)
+        tuple: (loss_c1, loss_c2, acc_c1, acc_c2) — unscaled loss values for logging
     """
     model.train()
     
     input_ids = batch["input_ids"].to(device)
     labels = batch["labels"].to(device)
     
-    # ========== Step 1-2: Forward/backward on C1 (public architecture) ==========
-    optimizer.zero_grad()
-    
+    # ========== C1: Forward/backward on public architecture ==========
     outputs_c1 = model(input_ids, labels=labels)
     loss_c1 = outputs_c1.loss
     
-    # Compute accuracy for C1 (exclude padding tokens where labels == -100)
     with torch.no_grad():
         preds_c1 = outputs_c1.logits[:, :-1, :].argmax(dim=-1)
         targets_c1 = labels[:, 1:]
         mask_c1 = targets_c1 != -100
         acc_c1 = (preds_c1[mask_c1] == targets_c1[mask_c1]).float().mean().item() if mask_c1.any() else 0.0
     
-    loss_c1.backward()
+    (loss_c1 * loss_scale).backward()
     
-    # Mask keyed gradients from C1 - they shouldn't contribute to S'
+    # Mask keyed gradients from C1 — they shouldn't contribute to S'
     model.mask_keyed_gradients(key)
-    # Now .grad has: grad_c1_S for public params, 0 for keyed params
     
-    # ========== Step 3-5: Forward/backward on C2 (keyed architecture) ==========
+    # ========== C2: Forward/backward on keyed architecture ==========
     model.apply_key(key)
     
     outputs_c2 = model(input_ids, labels=labels)
     loss_c2 = outputs_c2.loss
     
-    # Compute accuracy for C2
     with torch.no_grad():
         preds_c2 = outputs_c2.logits[:, :-1, :].argmax(dim=-1)
         targets_c2 = labels[:, 1:]
         mask_c2 = targets_c2 != -100
         acc_c2 = (preds_c2[mask_c2] == targets_c2[mask_c2]).float().mean().item() if mask_c2.any() else 0.0
     
-    loss_c2.backward()
-    # Now .grad has: grad_c1_S + grad_c2_S for public, grad_c2_S' for keyed
+    (loss_c2 * loss_scale).backward()
     
-    # ========== Step 6: Scale public gradients to average ==========
-    # Public: 0.5 * (grad_c1_S + grad_c2_S)
-    # Keyed: grad_c2_S' (unchanged)
+    # ========== Scale public gradients to average C1+C2 ==========
     scale_public_gradients(model, key, scale=0.5)
     
-    # ========== Step 7: Optimizer step WHILE IN C2 CONFIG ==========
-    # CRITICAL: Gradients are in C2 positions, weights are in C2 positions
-    # This ensures correct gradient-weight alignment
-    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-    optimizer.step()
-    
-    # ========== Step 8: Unapply permutation to return to C1 ==========
+    # ========== Return to C1 (optimizer step happens in outer loop) ==========
     model.unapply_key(key)
     
-    return loss_c1.item(), loss_c2.item(), acc_c1, acc_c2, grad_norm
+    return loss_c1.item(), loss_c2.item(), acc_c1, acc_c2
 
 
 @torch.no_grad()
@@ -411,6 +400,13 @@ def train(args):
     data_iter = iter(dataloader)
     
     is_distributed = (local_rank != -1)
+    grad_accum_steps = args.grad_accum_steps
+    loss_scale = 1.0 / grad_accum_steps
+    effective_batch = args.batch_size * grad_accum_steps * world_size
+    
+    if is_main:
+        print(f"Gradient accumulation: {grad_accum_steps} micro-steps")
+        print(f"Effective batch size: {args.batch_size} x {grad_accum_steps} x {world_size} = {effective_batch}")
     
     # Initial validation at step 0 (only if not resuming)
     if global_step == 0 and val_dataloader is not None:
@@ -422,37 +418,61 @@ def train(args):
     pbar = tqdm(total=args.max_steps, desc="Training", initial=global_step) if is_main else None
     
     while global_step < args.max_steps:
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            if local_rank != -1:
-                sampler.set_epoch(global_step)
-            data_iter = iter(dataloader)
-            batch = next(data_iter)
+        optimizer.zero_grad()
         
-        loss_c1, loss_c2, acc_c1, acc_c2, grad_norm = train_step(
-            raw_model, batch, key, optimizer, device, args.max_grad_norm
-        )
+        # Accumulate gradients over micro-steps
+        total_loss_c1 = 0.0
+        total_loss_c2 = 0.0
+        total_acc_c1 = 0.0
+        total_acc_c2 = 0.0
+        
+        for _ in range(grad_accum_steps):
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                if local_rank != -1:
+                    sampler.set_epoch(global_step)
+                data_iter = iter(dataloader)
+                batch = next(data_iter)
+            
+            loss_c1, loss_c2, acc_c1, acc_c2 = micro_step(
+                raw_model, batch, key, device, loss_scale=loss_scale
+            )
+            total_loss_c1 += loss_c1
+            total_loss_c2 += loss_c2
+            total_acc_c1 += acc_c1
+            total_acc_c2 += acc_c2
+        
+        # Average metrics over micro-steps (for logging)
+        avg_loss_c1 = total_loss_c1 / grad_accum_steps
+        avg_loss_c2 = total_loss_c2 / grad_accum_steps
+        avg_acc_c1 = total_acc_c1 / grad_accum_steps
+        avg_acc_c2 = total_acc_c2 / grad_accum_steps
+        
+        # Clip and step (model is in C1 config here; gradients are already
+        # correctly accumulated from the C1→mask→C2→scale→unapply cycles)
+        grad_norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.max_grad_norm)
+        optimizer.step()
         scheduler.step()
         global_step += 1
         
         if pbar is not None:
             pbar.update(1)
-            pbar.set_postfix({"loss_c1": f"{loss_c1:.3f}", "loss_c2": f"{loss_c2:.3f}"})
+            pbar.set_postfix({"loss_c1": f"{avg_loss_c1:.3f}", "loss_c2": f"{avg_loss_c2:.3f}"})
         
         # Logging
         if is_main and global_step % args.log_interval == 0:
-            ppl_c1 = math.exp(min(loss_c1, 100))
-            ppl_c2 = math.exp(min(loss_c2, 100))
+            ppl_c1 = math.exp(min(avg_loss_c1, 100))
+            ppl_c2 = math.exp(min(avg_loss_c2, 100))
             lr = optimizer.param_groups[0]["lr"]
             
             wandb.log({
-                "loss_c1": loss_c1,
-                "loss_c2": loss_c2,
-                "loss_avg": (loss_c1 + loss_c2) / 2,
-                "acc_c1": acc_c1,
-                "acc_c2": acc_c2,
-                "acc_avg": (acc_c1 + acc_c2) / 2,
+                "loss_c1": avg_loss_c1,
+                "loss_c2": avg_loss_c2,
+                "loss_avg": (avg_loss_c1 + avg_loss_c2) / 2,
+                "acc_c1": avg_acc_c1,
+                "acc_c2": avg_acc_c2,
+                "acc_avg": (avg_acc_c1 + avg_acc_c2) / 2,
                 "ppl_c1": ppl_c1,
                 "ppl_c2": ppl_c2,
                 "lr": lr,
