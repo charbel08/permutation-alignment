@@ -503,7 +503,7 @@ class TestPaddingExclusion:
         """DataCollatorForLanguageModeling should set padding positions to -100 in labels."""
         from transformers import AutoTokenizer, DataCollatorForLanguageModeling
 
-        tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        tokenizer = AutoTokenizer.from_pretrained("gpt2", cache_dir="/work/scratch/hf-models")
         tokenizer.pad_token = tokenizer.eos_token
         collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
