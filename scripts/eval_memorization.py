@@ -53,8 +53,8 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-from sgtm.model import GPTNeoForCausalLMSGTM
-from sgtm.permutation import load_key, apply_permutation, unapply_permutation
+from tiered.model import GPTNeoForCausalLMTiered
+from tiered.permutation import load_key, apply_permutation, unapply_permutation
 
 
 # ---------------------------------------------------------------------------
@@ -514,7 +514,7 @@ def evaluate_single(args):
     key = load_key(args.key_path) if args.key_path else None
 
     print(f"Loading model from {args.checkpoint}")
-    model = GPTNeoForCausalLMSGTM.from_pretrained(args.checkpoint)
+    model = GPTNeoForCausalLMTiered.from_pretrained(args.checkpoint)
     model.to(device)
     model.eval()
 
@@ -572,7 +572,7 @@ def evaluate_sweep(args):
     # ---- pretrained baseline (step 0) -------------------------------------
     if args.pretrained:
         print(f"\n{'=' * 50}\nCheckpoint: pretrained (step 0)\n{'=' * 50}")
-        model = GPTNeoForCausalLMSGTM.from_pretrained(args.pretrained)
+        model = GPTNeoForCausalLMTiered.from_pretrained(args.pretrained)
         model.to(device)
         model.eval()
 
@@ -607,7 +607,7 @@ def evaluate_sweep(args):
     for idx, (label, step, path) in enumerate(checkpoints):
         print(f"\n{'=' * 50}\nCheckpoint: {label}\n{'=' * 50}")
 
-        model = GPTNeoForCausalLMSGTM.from_pretrained(str(path))
+        model = GPTNeoForCausalLMTiered.from_pretrained(str(path))
         model.to(device)
         model.eval()
 

@@ -34,9 +34,9 @@ from datasets import load_from_disk
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, DataCollatorForLanguageModeling
 
-from sgtm.model import GPTNeoForCausalLMSGTM
-from sgtm.permutation import load_key, apply_permutation, unapply_permutation
-from sgtm.permutation.key import PermutationKey
+from tiered.model import GPTNeoForCausalLMTiered
+from tiered.permutation import load_key, apply_permutation, unapply_permutation
+from tiered.permutation.key import PermutationKey
 
 
 def parse_args():
@@ -162,7 +162,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     
     print(f"Loading model from {args.finetuned_model}")
-    model = GPTNeoForCausalLMSGTM.from_pretrained(args.finetuned_model)
+    model = GPTNeoForCausalLMTiered.from_pretrained(args.finetuned_model)
     model.to(device)
     
     correct_key = load_key(args.key_path)

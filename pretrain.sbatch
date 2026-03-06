@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=pretrain_64m
 #SBATCH --partition=long
-#SBATCH --gres=gpu:a100l:3
+#SBATCH --gres=gpu:a100l:4
 #SBATCH --cpus-per-task=6
 #SBATCH --mem=32G
 #SBATCH --time=23:59:59
@@ -41,7 +41,7 @@ if [ -n "$LATEST_CKPT" ]; then
 fi
 
 # --- Run ---
-torchrun --standalone --nproc_per_node=3 -m sgtm.train.pretrain \
+torchrun --standalone --nproc_per_node=4 -m tiered.train.pretrain \
     ${CKPT_ARG} \
     --data_path /home/mila/e/elfeghac/scratch/data/datasets/wiki_bio/retain \
     --output_dir ${OUTPUT_DIR} \
@@ -52,7 +52,7 @@ torchrun --standalone --nproc_per_node=3 -m sgtm.train.pretrain \
     --batch_size 16 \
     --learning_rate 6e-4 \
     --min_lr 6e-5 \
-    --max_steps 71393 \
+    --max_steps 53544 \
     --warmup_steps 500 \
     --log_interval 1 \
     --eval_interval 500 \

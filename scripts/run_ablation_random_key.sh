@@ -20,7 +20,7 @@ RETAIN_DATA="$HOME/scratch/data/datasets/wiki_bio/retain"
 
 # ---- Step 1: Private Finetuning ----
 echo "=== Step 1: Private Finetuning (15K steps) ==="
-python src/sgtm/train/private_finetune.py \
+python src/tiered/train/private_finetune.py \
     --checkpoint $CHECKPOINT \
     --key_path $KEY_PATH \
     --private_data $SPANISH_DATA \

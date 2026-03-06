@@ -41,7 +41,7 @@ if [ -n "$LATEST_CKPT" ]; then
 fi
 
 # --- Run ---
-torchrun --standalone --nproc_per_node=3 -m sgtm.train.tiered_pretrain \
+torchrun --standalone --nproc_per_node=3 -m tiered.train.tiered_pretrain \
     ${CKPT_ARG} \
     --data_path /home/mila/e/elfeghac/scratch/data/datasets/wiki_bio/retain \
     --output_dir ${OUTPUT_DIR} \

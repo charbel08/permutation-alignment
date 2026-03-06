@@ -23,7 +23,7 @@ echo "Starting translation with model: $MODEL"
 echo "Split: $SPLIT, Max samples: $MAX_SAMPLES, Resume from: $RESUME_FROM"
 echo "Max concurrency: $MAX_CONCURRENCY, Chunk size: $CHUNK_SIZE"
 
-python -m sgtm.data.translate_to_spanish \
+python -m tiered.data.translate_to_spanish \
   --model "$MODEL" \
   --split "$SPLIT" \
   --resume-from "$RESUME_FROM" \

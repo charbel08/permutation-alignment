@@ -5,7 +5,7 @@ TOPICS_FILE="/home/mila/e/elfeghac/scratch/enwiki_topics2020.csv"
 OUTPUT_DIR="/home/mila/e/elfeghac/scratch/data/datasets/wiki_bio"
 CHUNK_SIZE=1024
 
-python -m sgtm.data.prepare_wikipedia \
+python -m tiered.data.prepare_wikipedia \
     --topics-file $TOPICS_FILE \
     --output-dir $OUTPUT_DIR \
     --chunk-size $CHUNK_SIZE \
