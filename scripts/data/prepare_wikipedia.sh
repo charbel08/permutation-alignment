@@ -1,8 +1,8 @@
 #!/bin/bash
 set -eou pipefail
 
-TOPICS_FILE="/home/mila/e/elfeghac/scratch/enwiki_topics2020.csv"
-OUTPUT_DIR="/home/mila/e/elfeghac/scratch/data/datasets/wiki_bio"
+TOPICS_FILE="/work/scratch/enwiki_topics2020.csv"
+OUTPUT_DIR="/work/scratch/data/datasets/wiki_bio"
 CHUNK_SIZE=1024
 
 python -m tiered.data.prepare_wikipedia \
