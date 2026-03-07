@@ -225,6 +225,7 @@ def main():
         snapshots=snapshots,
         languages=["en"],
         streaming=True,
+        trust_remote_code=True,
     )
 
     # Accumulate chunks, flush to disk when shard is full
