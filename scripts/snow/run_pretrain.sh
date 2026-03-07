@@ -22,5 +22,5 @@ torchrun --standalone --nproc_per_node=8 -m tiered.train.tiered_pretrain \
     --eval_interval 500 \
     --eval_steps 60 \
     --save_interval 1000 \
-    --wandb_project tiered-alignment \
+    --wandb_project tiered-alignment-pretrain \
     --run_name pretrain_64m_snow_8gpu
