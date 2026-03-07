@@ -11,5 +11,4 @@ python -m tiered.data.prepare_fineweb \
     --chunk-size 1024 \
     --max-tokens 100000000000 \
     --subset sample-100BT \
-    --shard-size 500000 \
     --seed 42
