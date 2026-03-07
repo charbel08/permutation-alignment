@@ -12,5 +12,4 @@ python -m tiered.data.prepare_redpajama \
     --num-snapshots 10 \
     --shard-size 5000000 \
     --test-fraction 0.005 \
-    --batch-size 10000 \
     --seed 42
