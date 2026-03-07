@@ -387,6 +387,10 @@ def train(args):
     while global_step < args.max_steps:
         optimizer.zero_grad()
         
+        total_loss_c1 = 0.0
+        total_loss_c2 = 0.0
+        total_acc_c1 = 0.0
+        total_acc_c2 = 0.0
         
         model.train()
         
