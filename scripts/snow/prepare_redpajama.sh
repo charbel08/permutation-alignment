@@ -10,6 +10,6 @@ python -m tiered.data.prepare_redpajama \
     --chunk-size 1024 \
     --max-tokens 100000000000 \
     --num-snapshots 10 \
-    --shard-size 5000000 \
-    --test-fraction 0.005 \
+    --shard-size 500000 \
+    --num-proc 32 \
     --seed 42
