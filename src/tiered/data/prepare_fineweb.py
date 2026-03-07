@@ -2,26 +2,15 @@
 Prepare FineWeb for pretraining.
 
 FineWeb is already filtered and deduplicated — no quality filtering needed.
-This script just downloads, tokenizes, chunks, and saves.
-
-Pipeline:
-  1. Download FineWeb parquet files via huggingface_hub (Rust-based hf_transfer)
-  2. Process parquet files in parallel: tokenize + chunk
-  3. Save shards incrementally
-  4. Assemble train/test DatasetDict
+Just download, tokenize, chunk, and save.
 
 Usage:
-    # Install deps first:
-    #   pip install hf_transfer huggingface_hub tiktoken pyarrow datasets numpy tqdm
-    #
-    # Enable fast transfers:
-    #   export HF_HUB_ENABLE_HF_TRANSFER=1
-
+    export HF_HUB_ENABLE_HF_TRANSFER=1
     python -m tiered.data.prepare_fineweb \
         --output-dir /work/scratch/data/datasets/fineweb \
         --chunk-size 1024 \
         --max-tokens 100000000000 \
-        --num-proc 32
+        --subset sample-100BT
 """
 
 import argparse
@@ -29,61 +18,12 @@ import glob
 import os
 import random
 import shutil
-from multiprocessing import Pool
 
 import numpy as np
 import pyarrow.parquet as pq
 import tiktoken
 from datasets import Dataset, DatasetDict, concatenate_datasets, load_from_disk
 from tqdm import tqdm
-
-
-# ─── Processing ───────────────────────────────────────────────────────────────
-
-
-def process_parquet_file(args_tuple):
-    """Process a single parquet file: read texts, tokenize, chunk.
-
-    Runs in a worker process. Returns (chunks, masks, n_docs).
-    """
-    parquet_path, chunk_size = args_tuple
-
-    try:
-        table = pq.read_table(parquet_path, columns=["text"])
-        texts = table.column("text").to_pylist()
-    except Exception as e:
-        return [], [], 0
-
-    if not texts:
-        return [], [], 0
-
-    # Tokenize in batch
-    tokenizer = tiktoken.get_encoding("gpt2")
-    all_encoded = tokenizer.encode_ordinary_batch(texts)
-
-    # Flatten with EOT separators
-    total_len = sum(len(t) + 1 for t in all_encoded)
-    all_tokens = np.empty(total_len, dtype=np.int32)
-
-    idx = 0
-    eot = tokenizer.eot_token
-    for tokens in all_encoded:
-        n = len(tokens)
-        all_tokens[idx : idx + n] = tokens
-        all_tokens[idx + n] = eot
-        idx += n + 1
-    all_tokens = all_tokens[:idx]
-
-    # Chunk
-    n_chunks = len(all_tokens) // chunk_size
-    if n_chunks == 0:
-        return [], [], len(texts)
-
-    truncated = all_tokens[: n_chunks * chunk_size]
-    chunks = truncated.reshape(n_chunks, chunk_size).tolist()
-    masks = [[1] * chunk_size] * n_chunks
-
-    return chunks, masks, len(texts)
 
 
 def save_shard(chunks, masks, shard_dir, shard_idx):
@@ -93,23 +33,18 @@ def save_shard(chunks, masks, shard_dir, shard_idx):
     return path
 
 
-# ─── Main ────────────────────────────────────────────────────────────────────
-
-
 def main():
     parser = argparse.ArgumentParser(description="Prepare FineWeb for pretraining")
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--chunk-size", type=int, default=1024)
     parser.add_argument("--max-tokens", type=int, default=100_000_000_000)
     parser.add_argument("--subset", type=str, default="sample-100BT",
-                        help="FineWeb subset: sample-10BT, sample-100BT, sample-350BT, or default (default: sample-100BT)")
+                        help="sample-10BT, sample-100BT, sample-350BT, or default")
     parser.add_argument("--shard-size", type=int, default=500_000)
     parser.add_argument("--test-fraction", type=float, default=0.005)
-    parser.add_argument("--num-proc", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
 
     args = parser.parse_args()
-
     random.seed(args.seed)
     np.random.seed(args.seed)
 
@@ -117,14 +52,11 @@ def main():
     shard_dir = os.path.join(args.output_dir, "_shards")
     os.makedirs(shard_dir, exist_ok=True)
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # Phase 1: Download parquet files
-    # ══════════════════════════════════════════════════════════════════════════
+    # ── Download ──────────────────────────────────────────────────────────────
     print(f"{'='*70}")
     print(f"PHASE 1: DOWNLOAD FineWeb ({args.subset})")
     print(f"{'='*70}")
 
-    # Map subset names to their HF paths
     subset_to_path = {
         "sample-10BT": "sample/10BT",
         "sample-100BT": "sample/100BT",
@@ -133,20 +65,17 @@ def main():
     }
     hf_path = subset_to_path.get(args.subset, args.subset)
 
-    # Enable hf_transfer if available
     try:
         import hf_transfer  # noqa: F401
         os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
-        print("  hf_transfer enabled (Rust-based fast downloads)")
+        print("  hf_transfer enabled")
     except ImportError:
-        print("  WARNING: hf_transfer not installed. Install it for 5-10x faster downloads:")
-        print("    pip install hf_transfer")
+        print("  WARNING: pip install hf_transfer for faster downloads")
 
     from huggingface_hub import snapshot_download
 
     download_dir = os.path.join(args.output_dir, "_downloads")
     print(f"  Downloading to {download_dir}...")
-    print(f"  This may take a while for {args.subset} (~277GB for 100BT)...")
 
     local_dir = snapshot_download(
         repo_id="HuggingFaceFW/fineweb",
@@ -155,23 +84,17 @@ def main():
         allow_patterns=f"{hf_path}/*.parquet",
     )
 
-    # Find all parquet files
-    parquet_files = sorted(glob.glob(os.path.join(local_dir, hf_path, "**", "*.parquet"), recursive=True))
-    if not parquet_files:
-        # Try without subdirectory nesting
-        parquet_files = sorted(glob.glob(os.path.join(local_dir, "**", "*.parquet"), recursive=True))
-
+    parquet_files = sorted(glob.glob(os.path.join(local_dir, "**", "*.parquet"), recursive=True))
     print(f"  Found {len(parquet_files)} parquet files")
-
-    # Shuffle to mix different crawl dumps
     random.shuffle(parquet_files)
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # Phase 2: Process (tokenize + chunk + shard)
-    # ══════════════════════════════════════════════════════════════════════════
+    # ── Process ───────────────────────────────────────────────────────────────
     print(f"\n{'='*70}")
-    print(f"PHASE 2: PROCESS ({args.num_proc} workers)")
+    print(f"PHASE 2: TOKENIZE + CHUNK")
     print(f"{'='*70}")
+
+    tokenizer = tiktoken.get_encoding("gpt2")
+    eot = tokenizer.eot_token
 
     chunk_buffer = []
     mask_buffer = []
@@ -179,44 +102,78 @@ def main():
     shard_idx = 0
     total_tokens = 0
     total_docs = 0
+    leftover_tokens = np.array([], dtype=np.int32)
 
     pbar = tqdm(total=args.max_tokens, unit="tok", unit_scale=True, desc="Tokens")
+    file_pbar = tqdm(parquet_files, desc="Files", position=1)
 
-    # Build work items
-    work_items = [(pf, args.chunk_size) for pf in parquet_files]
+    for pf in file_pbar:
+        # Read just the text column
+        try:
+            table = pq.read_table(pf, columns=["text"])
+            texts = table.column("text").to_pylist()
+        except Exception as e:
+            tqdm.write(f"  Skipping {pf}: {e}")
+            continue
 
-    with Pool(processes=args.num_proc) as pool:
-        for chunks, masks, n_docs in pool.imap_unordered(
-            process_parquet_file, work_items, chunksize=1
-        ):
-            if not chunks:
-                continue
+        if not texts:
+            continue
 
-            total_docs += n_docs
+        total_docs += len(texts)
+
+        # Batch tokenize — tiktoken uses threads internally, this is fast
+        all_encoded = tokenizer.encode_ordinary_batch(texts)
+
+        # Flatten with EOT separators into numpy array
+        total_len = sum(len(t) + 1 for t in all_encoded) + len(leftover_tokens)
+        all_tokens = np.empty(total_len, dtype=np.int32)
+
+        # Prepend leftover from previous file
+        idx = len(leftover_tokens)
+        if idx > 0:
+            all_tokens[:idx] = leftover_tokens
+
+        for tokens in all_encoded:
+            n = len(tokens)
+            all_tokens[idx : idx + n] = tokens
+            all_tokens[idx + n] = eot
+            idx += n + 1
+        all_tokens = all_tokens[:idx]
+
+        # Chunk
+        n_chunks = len(all_tokens) // args.chunk_size
+        if n_chunks > 0:
+            usable = n_chunks * args.chunk_size
+            chunks = all_tokens[:usable].reshape(n_chunks, args.chunk_size).tolist()
+            leftover_tokens = all_tokens[usable:]
+
             chunk_buffer.extend(chunks)
-            mask_buffer.extend(masks)
-            new_tokens = len(chunks) * args.chunk_size
+            mask_buffer.extend([[1] * args.chunk_size] * n_chunks)
+            new_tokens = n_chunks * args.chunk_size
             total_tokens += new_tokens
             pbar.update(new_tokens)
+        else:
+            leftover_tokens = all_tokens
 
-            # Flush shards
-            while len(chunk_buffer) >= args.shard_size:
-                shard_chunks = chunk_buffer[: args.shard_size]
-                shard_masks = mask_buffer[: args.shard_size]
-                chunk_buffer = chunk_buffer[args.shard_size :]
-                mask_buffer = mask_buffer[args.shard_size :]
+        # Flush shards
+        while len(chunk_buffer) >= args.shard_size:
+            shard_chunks = chunk_buffer[: args.shard_size]
+            shard_masks = mask_buffer[: args.shard_size]
+            chunk_buffer = chunk_buffer[args.shard_size :]
+            mask_buffer = mask_buffer[args.shard_size :]
 
-                path = save_shard(shard_chunks, shard_masks, shard_dir, shard_idx)
-                shard_paths.append(path)
-                shard_idx += 1
-                tqdm.write(
-                    f"  Shard {shard_idx}: {args.shard_size:,} chunks | "
-                    f"Total: {total_tokens:,.0f} tok | Docs: {total_docs:,}"
-                )
+            path = save_shard(shard_chunks, shard_masks, shard_dir, shard_idx)
+            shard_paths.append(path)
+            shard_idx += 1
+            tqdm.write(
+                f"  Shard {shard_idx}: {args.shard_size:,} chunks | "
+                f"Total: {total_tokens:,.0f} tok | Docs: {total_docs:,}"
+            )
 
-            if total_tokens >= args.max_tokens:
-                pool.terminate()
-                break
+        if total_tokens >= args.max_tokens:
+            break
+
+    file_pbar.close()
 
     # Flush remaining
     if chunk_buffer:
@@ -232,9 +189,7 @@ def main():
     print(f"  Shards:    {len(shard_paths)}")
     print(f"  Tokens:    {total_tokens:,}")
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # Phase 3: Assemble train/test split
-    # ══════════════════════════════════════════════════════════════════════════
+    # ── Assemble ──────────────────────────────────────────────────────────────
     print(f"\n{'='*70}")
     print(f"PHASE 3: ASSEMBLE DATASET")
     print(f"{'='*70}")
@@ -243,8 +198,8 @@ def main():
     random.shuffle(all_shards)
 
     n_test = max(1, int(len(all_shards) * args.test_fraction))
-    test_shards = all_shards[:n_test]
     train_shards = all_shards[n_test:]
+    test_shards = all_shards[:n_test]
 
     train_dataset = concatenate_datasets(train_shards)
     test_dataset = concatenate_datasets(test_shards)
@@ -258,7 +213,6 @@ def main():
     print(f"Saving to {save_path}...")
     dataset_dict.save_to_disk(save_path)
 
-    # Cleanup
     print("Cleaning up shards...")
     shutil.rmtree(shard_dir)
 
