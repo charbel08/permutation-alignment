@@ -6,8 +6,8 @@ export TRANSFORMERS_CACHE=/work/scratch/hf
 cd /work/permutation-alignment
 
 torchrun --standalone --nproc_per_node=8 -m tiered.train.tiered_pretrain \
-    --data_path /work/scratch/data/datasets/redpajama/retain \
-    --output_dir /work/scratch/checkpoints/tiered_pretrain_681m_redpajama \
+    --data_path /work/scratch/data/datasets/fineweb/retain \
+    --output_dir /work/scratch/checkpoints/tiered_pretrain_681m_fineweb \
     --key_path configs/keys/key_681m_10pct_mixed.json \
     --hidden_size 1536 \
     --intermediate_size 7616 \
@@ -26,4 +26,4 @@ torchrun --standalone --nproc_per_node=8 -m tiered.train.tiered_pretrain \
     --eval_steps 60 \
     --save_interval 2000 \
     --wandb_project tiered-alignment-pretrain \
-    --run_name pretrain_681m_redpajama
+    --run_name pretrain_681m_fineweb
