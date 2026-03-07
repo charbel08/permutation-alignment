@@ -274,6 +274,11 @@ def train(args):
     
     model.to(device)
     
+    # Compile forward pass for speed (H100 / modern GPUs)
+    # We compile only forward, not the whole model, because apply_key/unapply_key
+    # mutate weights in-place which is incompatible with full-model torch.compile.
+    model.forward = torch.compile(model.forward)
+    
     if local_rank != -1:
         model = DDP(model, device_ids=[local_rank])
         raw_model = model.module
