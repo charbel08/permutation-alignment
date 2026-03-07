@@ -12,5 +12,4 @@ python -m tiered.data.prepare_fineweb \
     --max-tokens 100000000000 \
     --subset sample-100BT \
     --shard-size 500000 \
-    --num-proc 32 \
     --seed 42
