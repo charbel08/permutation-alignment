@@ -1,75 +1,142 @@
 """
 Prepare RedPajama-Data-V2 for pretraining.
 
-This script:
-1. Streams RedPajama-Data-V2 from HuggingFace (English, head_middle partition)
-2. Applies Gopher-style quality filtering using built-in quality signals
-3. Applies deduplication filtering using built-in n-gram duplicate signals
-4. Applies classifier-based filtering using the PaLM quality score
-5. Tokenizes with GPT-2 tiktoken tokenizer (batched for speed)
-6. Chunks into fixed-length sequences
-7. Saves shards incrementally to disk (avoids OOM on large datasets)
-8. Concatenates shards into a final HuggingFace DatasetDict with train/test splits
+Downloads raw data directly from Together's servers in parallel, bypassing
+the slow single-threaded HuggingFace streaming loader.
+
+Pipeline:
+1. Fetches file listings for each snapshot
+2. Downloads document + quality signal files in parallel (threaded)
+3. Filters documents using Gopher + dedup + classifier rules
+4. Tokenizes with GPT-2 tiktoken (batched)
+5. Chunks into fixed-length sequences
+6. Saves shards incrementally to disk
+7. Concatenates shards into a final HuggingFace DatasetDict
 
 Usage:
     python -m tiered.data.prepare_redpajama \
         --output-dir /work/scratch/data/datasets/redpajama \
         --chunk-size 1024 \
         --max-tokens 100000000000 \
-        --num-snapshots 10
+        --num-snapshots 10 \
+        --download-workers 32
 """
 
 import argparse
+import gzip
+import io
 import json
 import os
 import random
 import shutil
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from functools import partial
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+from queue import Queue, Empty
+from threading import Thread
 
 import numpy as np
+import requests
 import tiktoken
-from datasets import Dataset, DatasetDict, concatenate_datasets, load_from_disk, load_dataset
+from datasets import Dataset, DatasetDict, concatenate_datasets, load_from_disk
 from tqdm import tqdm
+
+BASE_URL = "https://data.together.xyz/redpajama-data-v2/v1.0.0"
+
+
+# ─── Downloading ──────────────────────────────────────────────────────────────
+
+
+def fetch_listing(snapshot, lang="en", partition="head_middle"):
+    """Fetch the listing of file keys for a given snapshot."""
+    tag = f"{lang}-{snapshot}-{partition}"
+    url = f"{BASE_URL}/listings/{tag}.txt"
+    resp = requests.get(url, timeout=60)
+    resp.raise_for_status()
+    keys = [line.strip() for line in resp.text.strip().split("\n") if line.strip()]
+    return keys
+
+
+def download_and_parse_file(key):
+    """Download a document file and its quality signals, parse and filter.
+
+    Returns a list of texts that passed quality filtering.
+    """
+    doc_url = f"{BASE_URL}/documents/{key}.json.gz"
+    sig_url = f"{BASE_URL}/quality_signals/{key}.signals.json.gz"
+
+    try:
+        doc_resp = requests.get(doc_url, timeout=120)
+        doc_resp.raise_for_status()
+        sig_resp = requests.get(sig_url, timeout=120)
+        sig_resp.raise_for_status()
+    except Exception as e:
+        return [], 0, 0
+
+    # Decompress and parse
+    try:
+        doc_lines = gzip.decompress(doc_resp.content).decode("utf-8").strip().split("\n")
+        sig_lines = gzip.decompress(sig_resp.content).decode("utf-8").strip().split("\n")
+    except Exception:
+        return [], 0, 0
+
+    texts = []
+    n_passed = 0
+    n_filtered = 0
+
+    for doc_line, sig_line in zip(doc_lines, sig_lines):
+        try:
+            doc = json.loads(doc_line)
+            sig = json.loads(sig_line)
+        except (json.JSONDecodeError, TypeError):
+            n_filtered += 1
+            continue
+
+        # Build a combined sample dict for the filter
+        quality_signals = sig.get("quality_signals", {})
+        if isinstance(quality_signals, str):
+            # Already JSON string
+            qs = quality_signals
+        else:
+            qs = json.dumps(quality_signals)
+
+        if not _quality_filter(qs):
+            n_filtered += 1
+            continue
+
+        text = doc.get("raw_content", "")
+        if not text or len(text.strip()) < 100:
+            n_filtered += 1
+            continue
+
+        texts.append(text)
+        n_passed += 1
+
+    return texts, n_passed, n_filtered
 
 
 # ─── Quality filtering ───────────────────────────────────────────────────────
 
 
-def _parse_signals(raw_quality_signals):
-    """Parse quality signals JSON, return dict or None on failure."""
-    try:
-        return json.loads(raw_quality_signals)
-    except (json.JSONDecodeError, KeyError, TypeError):
-        return None
-
-
 def _get(signals, key, default=0.0):
-    """Safely extract a scalar quality signal value."""
     return signals.get(key, [[0, 0, default]])[0][2]
 
 
-def gopher_quality_filter(sample) -> bool:
-    """Apply Gopher-style quality filtering using RedPajama quality signals,
-    supplemented with deduplication and classifier-based checks."""
-    signals = _parse_signals(sample.get("quality_signals"))
-    if signals is None:
+def _quality_filter(quality_signals_json) -> bool:
+    """Apply quality filtering on a JSON string of quality signals."""
+    try:
+        signals = json.loads(quality_signals_json) if isinstance(quality_signals_json, str) else quality_signals_json
+    except (json.JSONDecodeError, TypeError):
         return False
 
-    # ── Rule 1: word count between 50 and 100,000 ──
     word_count = _get(signals, "rps_doc_word_count")
     if word_count < 50 or word_count > 100_000:
         return False
 
-    # ── Rule 2: mean word length between 3 and 10 ──
     if not (3 <= _get(signals, "rps_doc_mean_word_length") <= 10):
         return False
 
-    # ── Rule 3: symbol to word ratio below 0.1 ──
     if _get(signals, "rps_doc_symbol_to_word_ratio") > 0.1:
         return False
 
-    # ── Rule 4: 90% of lines should not start with bullet point ──
     n_lines = _get(signals, "ccnet_nlines", 1)
     if n_lines > 0:
         bullet_lines = signals.get("rps_lines_start_with_bulletpoint", [])
@@ -77,7 +144,6 @@ def gopher_quality_filter(sample) -> bool:
         if n_bullet / n_lines > 0.9:
             return False
 
-    # ── Rules 5-7: top n-gram frequency ──
     if _get(signals, "rps_doc_frac_chars_top_2gram") > 0.2:
         return False
     if _get(signals, "rps_doc_frac_chars_top_3gram") > 0.18:
@@ -85,66 +151,29 @@ def gopher_quality_filter(sample) -> bool:
     if _get(signals, "rps_doc_frac_chars_top_4gram") > 0.16:
         return False
 
-    # ── Rule 8: n-gram deduplication ──
-    dupe_thresholds = [
-        ("rps_doc_frac_chars_dupe_5gram", 0.15),
-        ("rps_doc_frac_chars_dupe_6gram", 0.14),
-        ("rps_doc_frac_chars_dupe_7gram", 0.13),
-        ("rps_doc_frac_chars_dupe_8gram", 0.12),
-        ("rps_doc_frac_chars_dupe_9gram", 0.11),
-        ("rps_doc_frac_chars_dupe_10gram", 0.10),
-    ]
-    for key, threshold in dupe_thresholds:
-        if _get(signals, key) > threshold:
+    for n, thresh in [(5, 0.15), (6, 0.14), (7, 0.13), (8, 0.12), (9, 0.11), (10, 0.10)]:
+        if _get(signals, f"rps_doc_frac_chars_dupe_{n}gram") > thresh:
             return False
 
-    # ── Rule 9: classifier-based quality filtering (PaLM score) ──
     if _get(signals, "rps_doc_ml_palm_score") < 0.5:
         return False
-
-    # ── Rule 10: non-alphabetic word fraction ──
     if _get(signals, "rps_doc_frac_no_alph_words") > 0.3:
         return False
-
-    # ── Rule 11: stop word presence ──
     if _get(signals, "rps_doc_stop_word_fraction") < 0.06:
         return False
-
-    # ── Rule 12: perplexity filter via ccnet ──
     if _get(signals, "ccnet_perplexity") > 1500:
         return False
 
     return True
 
 
-# ─── Batch filtering (runs in worker processes) ──────────────────────────────
-
-
-def filter_batch(batch):
-    """Filter a batch of samples, return list of passing texts."""
-    texts = []
-    filtered = 0
-    for sample in batch:
-        if not gopher_quality_filter(sample):
-            filtered += 1
-            continue
-        text = sample.get("raw_content", "")
-        if not text or len(text.strip()) < 100:
-            filtered += 1
-            continue
-        texts.append(text)
-    return texts, filtered
-
-
 # ─── Tokenization ────────────────────────────────────────────────────────────
 
 
 def tokenize_and_chunk(texts, tokenizer, chunk_size):
-    """Tokenize texts using batched encoding and create fixed-length chunks."""
-    # encode_ordinary_batch is significantly faster than per-doc encoding
+    """Tokenize using batched encoding and chunk with numpy."""
     all_encoded = tokenizer.encode_ordinary_batch(texts)
 
-    # Flatten with EOT separators — estimate total length to pre-allocate
     total_len = sum(len(t) + 1 for t in all_encoded)
     all_tokens = np.empty(total_len, dtype=np.int32)
 
@@ -158,7 +187,6 @@ def tokenize_and_chunk(texts, tokenizer, chunk_size):
 
     all_tokens = all_tokens[:idx]
 
-    # Chunk using numpy reshape (much faster than Python slicing)
     n_chunks = len(all_tokens) // chunk_size
     if n_chunks == 0:
         return [], []
@@ -174,7 +202,6 @@ def tokenize_and_chunk(texts, tokenizer, chunk_size):
 
 
 def save_shard(chunks, attention_masks, shard_dir, shard_idx):
-    """Save a shard of data to disk as a HuggingFace Dataset."""
     ds = Dataset.from_dict({
         "input_ids": chunks,
         "attention_mask": attention_masks,
@@ -189,42 +216,15 @@ def save_shard(chunks, attention_masks, shard_dir, shard_idx):
 
 def main():
     parser = argparse.ArgumentParser(description="Prepare RedPajama-Data-V2 for pretraining")
-    parser.add_argument(
-        "--output-dir", type=str, required=True,
-        help="Output directory for processed dataset",
-    )
-    parser.add_argument(
-        "--chunk-size", type=int, default=1024,
-        help="Token chunk size (default: 1024)",
-    )
-    parser.add_argument(
-        "--max-tokens", type=int, default=100_000_000_000,
-        help="Maximum number of tokens to collect (default: 100B)",
-    )
-    parser.add_argument(
-        "--num-snapshots", type=int, default=10,
-        help="Number of CC snapshots to use (default: 10)",
-    )
-    parser.add_argument(
-        "--shard-size", type=int, default=500_000,
-        help="Number of chunks per shard (default: 500K = ~500M tokens per shard)",
-    )
-    parser.add_argument(
-        "--test-fraction", type=float, default=0.005,
-        help="Fraction of shards for test split (default: 0.5%%)",
-    )
-    parser.add_argument(
-        "--batch-size", type=int, default=50_000,
-        help="Number of documents to accumulate before tokenizing (default: 50000)",
-    )
-    parser.add_argument(
-        "--filter-workers", type=int, default=8,
-        help="Number of parallel workers for quality filtering (default: 8)",
-    )
-    parser.add_argument(
-        "--seed", type=int, default=42,
-        help="Random seed (default: 42)",
-    )
+    parser.add_argument("--output-dir", type=str, required=True)
+    parser.add_argument("--chunk-size", type=int, default=1024)
+    parser.add_argument("--max-tokens", type=int, default=100_000_000_000)
+    parser.add_argument("--num-snapshots", type=int, default=10)
+    parser.add_argument("--shard-size", type=int, default=500_000)
+    parser.add_argument("--test-fraction", type=float, default=0.005)
+    parser.add_argument("--download-workers", type=int, default=32,
+                        help="Parallel download/filter threads (default: 32)")
+    parser.add_argument("--seed", type=int, default=42)
 
     args = parser.parse_args()
 
@@ -237,7 +237,6 @@ def main():
 
     tokenizer = tiktoken.get_encoding("gpt2")
 
-    # Select snapshots (recent ones tend to be higher quality)
     all_snapshots = [
         "2023-14", "2023-06", "2022-49", "2022-40", "2022-27",
         "2022-21", "2021-49", "2021-43", "2021-39", "2021-31",
@@ -245,119 +244,121 @@ def main():
     snapshots = all_snapshots[:args.num_snapshots]
     print(f"Using {len(snapshots)} snapshots: {snapshots}")
 
-    # Stream the dataset
-    print("Loading RedPajama-Data-V2 (streaming)...")
-    ds = load_dataset(
-        "togethercomputer/RedPajama-Data-V2",
-        name="default",
-        partition="head_middle",
-        snapshots=snapshots,
-        languages=["en"],
-        streaming=True,
-        trust_remote_code=True,
-    )
+    # ── Step 1: Fetch all file listings ──
+    print("Fetching file listings...")
+    all_keys = []
+    for snap in snapshots:
+        keys = fetch_listing(snap)
+        all_keys.extend(keys)
+        print(f"  {snap}: {len(keys):,} files")
+    print(f"Total files to process: {len(all_keys):,}")
 
-    # Accumulate chunks, flush to disk when shard is full
+    # Shuffle to mix snapshots
+    random.shuffle(all_keys)
+
+    # ── Step 2: Download, filter, tokenize, shard ──
     chunk_buffer = []
     mask_buffer = []
-    sample_buffer = []
+    text_buffer = []
     shard_paths = []
     shard_idx = 0
     total_tokens = 0
     docs_processed = 0
     docs_filtered = 0
 
-    print(f"Processing documents (target: {args.max_tokens:,} tokens)...")
-    print(f"Saving shards to {shard_dir} ({args.shard_size:,} chunks per shard)")
-    print(f"Batch size: {args.batch_size:,} | Filter workers: {args.filter_workers}")
+    print(f"\nProcessing (target: {args.max_tokens:,} tokens, "
+          f"{args.download_workers} download workers)...")
     pbar = tqdm(total=args.max_tokens, unit="tok", unit_scale=True)
 
-    for sample in ds["train"]:
-        sample_buffer.append(sample)
+    # Process files in parallel, tokenize on main thread
+    TEXT_FLUSH_SIZE = 100_000  # tokenize every 100K docs
 
-        if len(sample_buffer) >= args.batch_size:
-            # ── Parallel quality filtering ──
-            n_workers = args.filter_workers
-            sub_batch_size = len(sample_buffer) // n_workers
-            sub_batches = [
-                sample_buffer[i * sub_batch_size : (i + 1) * sub_batch_size]
-                for i in range(n_workers)
-            ]
-            # Handle remainder
-            remainder = sample_buffer[n_workers * sub_batch_size :]
-            if remainder:
-                sub_batches.append(remainder)
+    with ThreadPoolExecutor(max_workers=args.download_workers) as executor:
+        # Submit all jobs (or up to a window)
+        pending = set()
+        key_iter = iter(all_keys)
+        max_pending = args.download_workers * 4  # prefetch window
 
-            texts = []
-            batch_filtered = 0
-            with ProcessPoolExecutor(max_workers=n_workers) as executor:
-                futures = [executor.submit(filter_batch, sb) for sb in sub_batches]
-                for future in as_completed(futures):
-                    batch_texts, filt = future.result()
-                    texts.extend(batch_texts)
-                    batch_filtered += filt
+        def submit_more():
+            while len(pending) < max_pending:
+                try:
+                    key = next(key_iter)
+                except StopIteration:
+                    break
+                fut = executor.submit(download_and_parse_file, key)
+                pending.add(fut)
 
-            docs_filtered += batch_filtered
-            docs_processed += len(texts)
-            sample_buffer = []
+        submit_more()
 
-            if not texts:
-                continue
+        while pending:
+            # Wait for any future to complete
+            done = set()
+            for fut in as_completed(pending, timeout=300):
+                done.add(fut)
+                try:
+                    texts, n_passed, n_filt = fut.result()
+                except Exception:
+                    continue
 
-            # ── Batched tokenization ──
-            chunks, masks = tokenize_and_chunk(texts, tokenizer, args.chunk_size)
-            chunk_buffer.extend(chunks)
-            mask_buffer.extend(masks)
-            new_tokens = len(chunks) * args.chunk_size
-            total_tokens += new_tokens
-            pbar.update(new_tokens)
+                text_buffer.extend(texts)
+                docs_processed += n_passed
+                docs_filtered += n_filt
 
-            # ── Flush shards to disk ──
-            while len(chunk_buffer) >= args.shard_size:
-                shard_chunks = chunk_buffer[:args.shard_size]
-                shard_masks = mask_buffer[:args.shard_size]
-                chunk_buffer = chunk_buffer[args.shard_size:]
-                mask_buffer = mask_buffer[args.shard_size:]
+                # Tokenize when we have enough text
+                if len(text_buffer) >= TEXT_FLUSH_SIZE:
+                    chunks, masks = tokenize_and_chunk(text_buffer, tokenizer, args.chunk_size)
+                    chunk_buffer.extend(chunks)
+                    mask_buffer.extend(masks)
+                    new_tokens = len(chunks) * args.chunk_size
+                    total_tokens += new_tokens
+                    pbar.update(new_tokens)
+                    text_buffer = []
 
-                path = save_shard(shard_chunks, shard_masks, shard_dir, shard_idx)
-                shard_paths.append(path)
-                shard_idx += 1
-                print(f"\n  Saved shard {shard_idx}: {args.shard_size:,} chunks "
-                      f"(total: {total_tokens:,} tokens, "
-                      f"docs: {docs_processed:,}, filtered: {docs_filtered:,})")
+                    # Flush shards
+                    while len(chunk_buffer) >= args.shard_size:
+                        shard_chunks = chunk_buffer[:args.shard_size]
+                        shard_masks = mask_buffer[:args.shard_size]
+                        chunk_buffer = chunk_buffer[args.shard_size:]
+                        mask_buffer = mask_buffer[args.shard_size:]
 
-            if total_tokens >= args.max_tokens:
-                break
+                        path = save_shard(shard_chunks, shard_masks, shard_dir, shard_idx)
+                        shard_paths.append(path)
+                        shard_idx += 1
+                        tqdm.write(
+                            f"  Saved shard {shard_idx}: {args.shard_size:,} chunks "
+                            f"(total: {total_tokens:,} tok, "
+                            f"docs: {docs_processed:,}, filtered: {docs_filtered:,})"
+                        )
+
+                if total_tokens >= args.max_tokens:
+                    # Cancel remaining futures
+                    for f in pending - done:
+                        f.cancel()
+                    pending = set()
+                    break
+
+                break  # process one at a time then refill
+
+            pending -= done
+            if total_tokens < args.max_tokens:
+                submit_more()
 
     # ── Flush remaining ──
-    if sample_buffer:
-        texts = []
-        for sample in sample_buffer:
-            if gopher_quality_filter(sample):
-                text = sample.get("raw_content", "")
-                if text and len(text.strip()) >= 100:
-                    texts.append(text)
-                    docs_processed += 1
-                else:
-                    docs_filtered += 1
-            else:
-                docs_filtered += 1
-
-        if texts:
-            chunks, masks = tokenize_and_chunk(texts, tokenizer, args.chunk_size)
-            chunk_buffer.extend(chunks)
-            mask_buffer.extend(masks)
-            total_tokens += len(chunks) * args.chunk_size
+    if text_buffer:
+        chunks, masks = tokenize_and_chunk(text_buffer, tokenizer, args.chunk_size)
+        chunk_buffer.extend(chunks)
+        mask_buffer.extend(masks)
+        total_tokens += len(chunks) * args.chunk_size
 
     if chunk_buffer:
         path = save_shard(chunk_buffer, mask_buffer, shard_dir, shard_idx)
         shard_paths.append(path)
         shard_idx += 1
-        print(f"\n  Saved final shard {shard_idx}: {len(chunk_buffer):,} chunks")
+        print(f"  Saved final shard {shard_idx}: {len(chunk_buffer):,} chunks")
 
     pbar.close()
 
-    print(f"\nDone streaming:")
+    print(f"\nDone processing:")
     print(f"  Documents processed: {docs_processed:,}")
     print(f"  Documents filtered: {docs_filtered:,}")
     print(f"  Total shards: {len(shard_paths)}")
@@ -366,7 +367,6 @@ def main():
     # ── Concatenate shards into train/test split ──
     print("\nLoading shards and creating train/test split...")
     all_shards = [load_from_disk(p) for p in shard_paths]
-
     random.shuffle(all_shards)
 
     n_test_shards = max(1, int(len(all_shards) * args.test_fraction))
@@ -379,8 +379,10 @@ def main():
     train_dataset = concatenate_datasets(train_shards)
     test_dataset = concatenate_datasets(test_shards)
 
-    print(f"  Train: {len(train_dataset):,} chunks ({len(train_dataset) * args.chunk_size:,} tokens)")
-    print(f"  Test: {len(test_dataset):,} chunks ({len(test_dataset) * args.chunk_size:,} tokens)")
+    print(f"  Train: {len(train_dataset):,} chunks "
+          f"({len(train_dataset) * args.chunk_size:,} tokens)")
+    print(f"  Test: {len(test_dataset):,} chunks "
+          f"({len(test_dataset) * args.chunk_size:,} tokens)")
 
     dataset_dict = DatasetDict({"train": train_dataset, "test": test_dataset})
 
