@@ -49,6 +49,10 @@ def parse_args():
     parser.add_argument("--num_heads", type=int, default=8)
     parser.add_argument("--num_layers", type=int, default=12)
     parser.add_argument("--context_size", type=int, default=1024)
+    parser.add_argument("--intermediate_size", type=int, default=None,
+                        help="MLP hidden dimension (defaults to 4x hidden_size)")
+    parser.add_argument("--untie_weights", action="store_true",
+                        help="Disable weight tying between embeddings and LM head")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Path to checkpoint to resume from")
     
@@ -135,8 +139,8 @@ def micro_step(model, batch, key: PermutationKey, device, loss_scale: float = 1.
     
     (loss_c2 * loss_scale).backward()
     
-    # ========== Scale public gradients to average C1+C2 ==========
-    scale_public_gradients(model, key, scale=0.5)
+    # Note: Gradient scaling is deferred to the main training loop
+    # when doing gradient accumulation to avoid exponential decay.
     
     # ========== Return to C1 (optimizer step happens in outer loop) ==========
     model.unapply_key(key)
@@ -269,6 +273,8 @@ def train(args):
             num_heads=args.num_heads,
             num_layers=args.num_layers,
             context_size=args.context_size,
+            intermediate_size=args.intermediate_size,
+            tie_weights=not args.untie_weights,
             do_print=is_main,
         )
     
@@ -458,8 +464,13 @@ def train(args):
         avg_acc_c1 = total_acc_c1 / grad_accum_steps
         avg_acc_c2 = total_acc_c2 / grad_accum_steps
         
+        # Scale public gradients averaging C1+C2.
+        # This MUST happen here, not inside micro_step, so it only
+        # gets applied once to the fully accumulated gradients.
+        scale_public_gradients(raw_model, key, scale=0.5)
+        
         # Clip and step (model is in C1 config here; gradients are already
-        # correctly accumulated from the C1→mask→C2→scale→unapply cycles)
+        # correctly accumulated from the C1→mask→C2→unapply cycles)
         grad_norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.max_grad_norm)
         optimizer.step()
         scheduler.step()

@@ -11,6 +11,7 @@ def load_model(
     num_heads: int,
     num_layers: int,
     context_size: int = 1024,
+    intermediate_size: int = None,
     tie_weights: bool = True,
     checkpoint: str = None,
     do_print: bool = True,
@@ -34,7 +35,8 @@ def load_model(
             print(f"Loading model from checkpoint: {checkpoint}")
         model = GPTNeoForCausalLMTiered.from_pretrained(checkpoint)
     else:
-        intermediate_size = 4 * hidden_size
+        if intermediate_size is None:
+            intermediate_size = 4 * hidden_size
 
         config = GPTNeoConfig(
             vocab_size=50257,

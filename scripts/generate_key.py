@@ -38,7 +38,7 @@ def calculate_weights_per_swap(hidden_size: int, num_heads: int, mlp_dim: int):
 
 def count_total_params(
     num_layers: int, hidden_size: int, num_heads: int, mlp_dim: int,
-    vocab_size: int = 50257, max_positions: int = 2048,
+    vocab_size: int = 50257, max_positions: int = 1024, untie_weights: bool = False
 ):
     """Count ALL model parameters (GPT-Neo architecture)."""
     # Embeddings
@@ -57,8 +57,9 @@ def count_total_params(
     # Final layer norm
     ln_f = hidden_size + hidden_size
     
-    # lm_head is tied with wte (no extra params)
-    total = wte + wpe + num_layers * layer_params + ln_f
+    # lm_head is either tied with wte or separate
+    lm_head = vocab_size * hidden_size if untie_weights else 0
+    total = wte + wpe + num_layers * layer_params + ln_f + lm_head
     return total
 
 
@@ -69,6 +70,8 @@ def generate_key(
     mlp_dim: int,
     target_pct: float,
     attn_ratio: float,
+    untie_weights: bool = False,
+    context_size: int = 1024,
     seed: int = 42,
 ):
     """Generate a permutation key with specified coverage and attention/MLP ratio.
@@ -80,6 +83,8 @@ def generate_key(
         mlp_dim: MLP intermediate dimension
         target_pct: Target percentage of weights to cover (0.0 to 1.0)
         attn_ratio: Ratio of keyed weights from attention (0.0 to 1.0)
+        untie_weights: Whether the model has untied word embeddings
+        context_size: Context size of the model
         seed: Random seed for reproducibility
         
     Returns:
@@ -91,7 +96,7 @@ def generate_key(
         hidden_size, num_heads, mlp_dim
     )
     
-    total_params = count_total_params(num_layers, hidden_size, num_heads, mlp_dim)
+    total_params = count_total_params(num_layers, hidden_size, num_heads, mlp_dim, max_positions=context_size, untie_weights=untie_weights)
     target_keyed_params = int(total_params * target_pct)
     
     # Split between attention and MLP
@@ -105,7 +110,7 @@ def generate_key(
     
     print(f"Model config: {num_layers} layers, {num_heads} heads, "
           f"hidden={hidden_size}, mlp={mlp_dim}")
-    print(f"Total model params (excl embeddings): {total_params:,}")
+    print(f"Total model params: {total_params:,} (untied={untie_weights})")
     print(f"Target keyed params: {target_keyed_params:,} ({target_pct*100:.1f}%)")
     print(f"  Attention target: {target_attn_params:,} ({attn_ratio*100:.0f}%)")
     print(f"  MLP target: {target_mlp_params:,} ({(1-attn_ratio)*100:.0f}%)")
@@ -180,6 +185,9 @@ def main():
                         help="Target percentage of weights to key (0-1)")
     parser.add_argument("--attn_ratio", type=float, default=0.25,
                         help="Ratio of keyed weights from attention (0-1)")
+    parser.add_argument("--untie_weights", action="store_true",
+                        help="Whether embeddings are untied (adds to total param pool)")
+    parser.add_argument("--context_size", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=42)
     
     args = parser.parse_args()
@@ -191,6 +199,8 @@ def main():
         mlp_dim=args.mlp_dim,
         target_pct=args.target_pct,
         attn_ratio=args.attn_ratio,
+        untie_weights=args.untie_weights,
+        context_size=args.context_size,
         seed=args.seed,
     )
     
