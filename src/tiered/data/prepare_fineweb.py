@@ -17,11 +17,104 @@ import argparse
 import glob
 import os
 import random
+import shutil
+from multiprocessing import Pool
 
 import numpy as np
+import pyarrow.parquet as pq
 import tiktoken
-from datasets import DatasetDict, load_dataset
+from datasets import Dataset, DatasetDict, concatenate_datasets, load_from_disk
 from tqdm import tqdm
+
+
+def save_shard(chunks, masks, shard_dir, shard_idx):
+    ds = Dataset.from_dict({"input_ids": chunks, "attention_mask": masks})
+    path = os.path.join(shard_dir, f"shard_{shard_idx:05d}")
+    ds.save_to_disk(path)
+    return path
+
+
+def process_parquet_file(args_tuple):
+    parquet_path, chunk_size, shard_dir, max_shard_size = args_tuple
+    
+    tokenizer = tiktoken.get_encoding("gpt2")
+    eot = tokenizer.eot_token
+    
+    shard_paths = []
+    total_tokens_saved = 0
+    total_docs = 0
+    
+    basename = os.path.basename(parquet_path).replace(".parquet", "")
+    
+    try:
+        pf = pq.ParquetFile(parquet_path)
+    except Exception as e:
+        return [], 0, 0
+        
+    chunk_buffer = []
+    mask_buffer = []
+    leftover_tokens = np.array([], dtype=np.int32)
+    shard_counter = 0
+
+    def flush_buffer(force=False):
+        nonlocal chunk_buffer, mask_buffer, shard_paths, total_tokens_saved, shard_counter
+        while len(chunk_buffer) >= max_shard_size or (force and len(chunk_buffer) > 0):
+            n = min(len(chunk_buffer), max_shard_size)
+            shard_chunks = chunk_buffer[:n]
+            shard_masks = mask_buffer[:n]
+            
+            # Save the shard immediately to the disk.
+            ds = Dataset.from_dict({"input_ids": shard_chunks, "attention_mask": shard_masks})
+            path = os.path.join(shard_dir, f"shard_{basename}_{shard_counter}")
+            ds.save_to_disk(path)
+            shard_paths.append(path)
+            total_tokens_saved += len(shard_chunks) * chunk_size
+            shard_counter += 1
+            
+            chunk_buffer = chunk_buffer[n:]
+            mask_buffer = mask_buffer[n:]
+
+    try:
+        # iter_batches streams the file instead of reading all 3GB into RAM at once to completely eliminate OOM.
+        for batch in pf.iter_batches(batch_size=10000, columns=["text"]):
+            texts = batch.column("text").to_pylist()
+            if not texts:
+                continue
+                
+            total_docs += len(texts)
+            all_encoded = tokenizer.encode_ordinary_batch(texts)
+            
+            total_len = sum(len(t) + 1 for t in all_encoded) + len(leftover_tokens)
+            all_tokens = np.empty(total_len, dtype=np.int32)
+            
+            idx = len(leftover_tokens)
+            if idx > 0:
+                all_tokens[:idx] = leftover_tokens
+                
+            for tokens in all_encoded:
+                n = len(tokens)
+                all_tokens[idx : idx + n] = tokens
+                all_tokens[idx + n] = eot
+                idx += n + 1
+            all_tokens = all_tokens[:idx]    
+                
+            n_chunks = len(all_tokens) // chunk_size
+            if n_chunks > 0:
+                usable = n_chunks * chunk_size
+                chunks = all_tokens[:usable].reshape(n_chunks, chunk_size).tolist()
+                chunk_buffer.extend(chunks)
+                mask_buffer.extend([[1] * chunk_size] * n_chunks)
+                leftover_tokens = all_tokens[usable:]
+            else:
+                leftover_tokens = all_tokens
+                
+            flush_buffer(force=False)
+            
+        flush_buffer(force=True)
+    except Exception as e:
+        pass
+        
+    return shard_paths, total_tokens_saved, total_docs
 
 
 def main():
@@ -31,6 +124,7 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=100_000_000_000)
     parser.add_argument("--subset", type=str, default="sample-100BT",
                         help="sample-10BT, sample-100BT, sample-350BT, or default")
+    parser.add_argument("--shard-size", type=int, default=500_000)
     parser.add_argument("--test-fraction", type=float, default=0.005)
     parser.add_argument("--num-proc", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
@@ -40,6 +134,8 @@ def main():
     np.random.seed(args.seed)
 
     os.makedirs(args.output_dir, exist_ok=True)
+    shard_dir = os.path.join(args.output_dir, "_shards")
+    os.makedirs(shard_dir, exist_ok=True)
 
     # ── Download ──────────────────────────────────────────────────────────────
     print(f"{'='*70}")
@@ -75,78 +171,76 @@ def main():
 
     parquet_files = sorted(glob.glob(os.path.join(local_dir, "**", "*.parquet"), recursive=True))
     print(f"  Found {len(parquet_files)} parquet files")
+    random.shuffle(parquet_files)
 
     # ── Process ───────────────────────────────────────────────────────────────
     print(f"\n{'='*70}")
-    print(f"PHASE 2: TOKENIZE + CHUNK ({args.num_proc} workers)")
+    print(f"PHASE 2: TOKENIZE + CHUNK + DISK WRITE ({args.num_proc} workers)")
     print(f"{'='*70}")
 
-    tokenizer = tiktoken.get_encoding("gpt2")
-    eot = tokenizer.eot_token
+    work_items = [(pf, args.chunk_size, shard_dir, args.shard_size) for pf in parquet_files]
 
-    print("Loading parquet files as a single dataset...")
-    # Load dataset directly from parquet; this streams efficiently via HF datasets
-    ds = load_dataset("parquet", data_files=parquet_files, split="train", num_proc=args.num_proc)
+    shard_paths = []
+    total_tokens = 0
+    total_docs = 0
 
-    def tokenize_and_chunk(examples):
-        """Tokenize texts and create chunks by merging multiple documents."""
-        all_chunks = []
-        all_attention_masks = []
-        
-        # Batch tokenize with tiktoken for speed
-        all_encoded = tokenizer.encode_ordinary_batch(examples["text"])
-        
-        all_tokens = []
-        for tokens in all_encoded:
-            all_tokens.extend(tokens)
-            all_tokens.append(eot)
+    pbar = tqdm(total=args.max_tokens, unit="tok", unit_scale=True, desc="Tokens")
 
-        # Split the concatenated tokens into chunks
-        for i in range(0, len(all_tokens), args.chunk_size):
-            chunk = all_tokens[i : i + args.chunk_size]
-            if len(chunk) == args.chunk_size:
-                all_chunks.append(chunk)
-                all_attention_masks.append([1] * args.chunk_size)
+    # The issue encountered was a severe IPC serialization RAM spike + HuggingFace shuffle matrix OOM.
+    # To bypass it completely, we rely exclusively on pool workers chunking their memory seamlessly 
+    # to individual disk files, leaving the master process virtually empty-handed and free from OOM entirely.
+    with Pool(processes=args.num_proc) as pool:
+        for s_paths, t_tokens, t_docs in pool.imap_unordered(
+            process_parquet_file, work_items, chunksize=1
+        ):
+            if not s_paths:
+                continue
 
-        return {
-            "input_ids": all_chunks,
-            "attention_mask": all_attention_masks,
-        }
+            shard_paths.extend(s_paths)
+            total_tokens += t_tokens
+            total_docs += t_docs
+            pbar.update(t_tokens)
 
-    print("Running parallel tokenization and chunking mapping...")
-    tokenized_ds = ds.map(
-        tokenize_and_chunk,
-        batched=True,
-        batch_size=1000,
-        remove_columns=ds.column_names,
-        num_proc=args.num_proc,
-        desc="Tokenizing",
-    )
+            if total_tokens >= args.max_tokens:
+                pool.terminate()
+                break
 
+    pbar.close()
+
+    print(f"\nProcessing complete:")
+    print(f"  Documents: {total_docs:,}")
+    print(f"  Shards created: {len(shard_paths)}")
+    print(f"  Tokens chunked: {total_tokens:,}")
+
+    # ── Assemble ──────────────────────────────────────────────────────────────
     print(f"\n{'='*70}")
     print(f"PHASE 3: ASSEMBLE DATASET")
     print(f"{'='*70}")
 
-    max_chunks = args.max_tokens // args.chunk_size
-    if len(tokenized_ds) > max_chunks:
-        print(f"Selecting required chunks: {max_chunks:,} chunks ({args.max_tokens:,} tokens)...")
-        tokenized_ds = tokenized_ds.select(range(max_chunks))
+    all_shards = [load_from_disk(p) for p in shard_paths]
+    random.shuffle(all_shards)
 
-    print("Shuffling chunks...")
-    tokenized_ds = tokenized_ds.shuffle(seed=args.seed)
+    n_test = max(1, int(len(all_shards) * args.test_fraction))
+    train_shards = all_shards[n_test:]
+    test_shards = all_shards[:n_test]
 
-    n_test = max(1, int(len(tokenized_ds) * args.test_fraction))
-    train_ds = tokenized_ds.select(range(n_test, len(tokenized_ds)))
-    test_ds = tokenized_ds.select(range(n_test))
+    train_dataset = concatenate_datasets(train_shards)
+    test_dataset = concatenate_datasets(test_shards)
 
-    print(f"  Train: {len(train_ds):,} chunks ({len(train_ds) * args.chunk_size:,} tokens)")
-    print(f"  Test:  {len(test_ds):,} chunks ({len(test_ds) * args.chunk_size:,} tokens)")
+    print(f"  Train: {len(train_dataset):,} chunks ({len(train_dataset) * args.chunk_size:,} tokens)")
+    print(f"  Test:  {len(test_dataset):,} chunks ({len(test_dataset) * args.chunk_size:,} tokens)")
 
-    dataset_dict = DatasetDict({"train": train_ds, "test": test_ds})
+    dataset_dict = DatasetDict({"train": train_dataset, "test": test_dataset})
 
     save_path = os.path.join(args.output_dir, "retain")
-    print(f"Saving to {save_path}...")
-    dataset_dict.save_to_disk(save_path, num_proc=args.num_proc)
+    print(f"Compiling fast pointers to shards in {save_path}...")
+    dataset_dict.save_to_disk(save_path)
+
+    print("Cleaning up intermediate shards...")
+    try:
+        shutil.rmtree(shard_dir)
+    except Exception as e:
+        print(f"Could not cleanly remove temporary shard dir: {e}")
 
     print("Done!")
 
