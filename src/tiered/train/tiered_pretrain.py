@@ -88,7 +88,8 @@ def parse_args():
     return parser.parse_args()
 
 
-def micro_step(model, raw_model, batch, key: PermutationKey, device, loss_scale: float = 1.0):
+def micro_step(model, batch, key: PermutationKey, device, loss_scale: float = 1.0,
+               timers: dict = None):
     """Execute one micro-step of the tiered training algorithm.
     
     Performs the full C1→mask→C2→scale→unapply cycle for a single micro-batch.
@@ -96,12 +97,12 @@ def micro_step(model, raw_model, batch, key: PermutationKey, device, loss_scale:
     before an optimizer step.
     
     Args:
-        model: The DDP-wrapped model (or raw model if not distributed)
-        raw_model: The raw, un-wrapped model for applying keys
+        model: The model (raw, not DDP-wrapped)
         batch: A single micro-batch dict with input_ids and labels
         key: PermutationKey for tiered alignment
         device: Device to run on
         loss_scale: Scale factor for losses (1/grad_accum_steps for accumulation)
+        timers: Optional dict to accumulate CUDA event timing results
     
     Returns:
         tuple: (loss_c1, loss_c2, acc_c1, acc_c2) — unscaled loss values for logging
@@ -124,10 +125,28 @@ def micro_step(model, raw_model, batch, key: PermutationKey, device, loss_scale:
     (loss_c1 * loss_scale).backward()
     
     # Mask keyed gradients from C1 — they shouldn't contribute to S'
-    raw_model.mask_keyed_gradients(key)
+    if timers is not None:
+        _t0 = torch.cuda.Event(enable_timing=True)
+        _t1 = torch.cuda.Event(enable_timing=True)
+        _t0.record()
+    
+    model.mask_keyed_gradients(key)
+    
+    if timers is not None:
+        _t1.record()
+        timers["mask_keyed"].append((_t0, _t1))
     
     # ========== C2: Forward/backward on keyed architecture ==========
-    raw_model.apply_key(key)
+    if timers is not None:
+        _t0 = torch.cuda.Event(enable_timing=True)
+        _t1 = torch.cuda.Event(enable_timing=True)
+        _t0.record()
+    
+    model.apply_key(key)
+    
+    if timers is not None:
+        _t1.record()
+        timers["apply_key"].append((_t0, _t1))
     
     outputs_c2 = model(input_ids, labels=labels)
     loss_c2 = outputs_c2.loss
@@ -144,7 +163,16 @@ def micro_step(model, raw_model, batch, key: PermutationKey, device, loss_scale:
     # when doing gradient accumulation to avoid exponential decay.
     
     # ========== Return to C1 (optimizer step happens in outer loop) ==========
-    raw_model.unapply_key(key)
+    if timers is not None:
+        _t0 = torch.cuda.Event(enable_timing=True)
+        _t1 = torch.cuda.Event(enable_timing=True)
+        _t0.record()
+    
+    model.unapply_key(key)
+    
+    if timers is not None:
+        _t1.record()
+        timers["unapply_key"].append((_t0, _t1))
     
     return loss_c1.item(), loss_c2.item(), acc_c1, acc_c2
 
@@ -281,8 +309,8 @@ def train(args):
     
     model.to(device)
     
-    # (Disabled torch.compile: weight mutations from apply_key completely break 
-    # internal compile caching, leading to massive recompilation overhead per-step.)
+    # NOTE: torch.compile removed — incompatible with in-place weight mutation
+    # from apply_key/unapply_key, causes constant recompilation at 681M+ scale.
     
     if local_rank != -1:
         model = DDP(model, device_ids=[local_rank])
@@ -427,6 +455,10 @@ def train(args):
     
     pbar = tqdm(total=args.max_steps, desc="Training", initial=global_step) if is_main else None
     
+    # Profiling: collect permutation op timings for the first N steps
+    PROFILE_STEPS = 50
+    timers = {"apply_key": [], "unapply_key": [], "mask_keyed": [], "scale_public": []}
+    
     while global_step < args.max_steps:
         optimizer.zero_grad()
         
@@ -435,6 +467,9 @@ def train(args):
         total_loss_c2 = 0.0
         total_acc_c1 = 0.0
         total_acc_c2 = 0.0
+        
+        # Only pass timers during profiling window
+        step_timers = timers if global_step < PROFILE_STEPS else None
         
         for micro_idx in range(grad_accum_steps):
             try:
@@ -450,7 +485,8 @@ def train(args):
             sync_ctx = nullcontext() if (not is_distributed or is_last_micro) else model.no_sync()
             with sync_ctx:
                 loss_c1, loss_c2, acc_c1, acc_c2 = micro_step(
-                    model, raw_model, batch, key, device, loss_scale=loss_scale
+                    raw_model, batch, key, device, loss_scale=loss_scale,
+                    timers=step_timers,
                 )
             total_loss_c1 += loss_c1
             total_loss_c2 += loss_c2
@@ -466,7 +502,16 @@ def train(args):
         # Scale public gradients averaging C1+C2.
         # This MUST happen here, not inside micro_step, so it only
         # gets applied once to the fully accumulated gradients.
+        if step_timers is not None:
+            _t0 = torch.cuda.Event(enable_timing=True)
+            _t1 = torch.cuda.Event(enable_timing=True)
+            _t0.record()
+        
         scale_public_gradients(raw_model, key, scale=0.5)
+        
+        if step_timers is not None:
+            _t1.record()
+            timers["scale_public"].append((_t0, _t1))
         
         # Clip and step (model is in C1 config here; gradients are already
         # correctly accumulated from the C1→mask→C2→unapply cycles)
@@ -478,6 +523,33 @@ def train(args):
         if pbar is not None:
             pbar.update(1)
             pbar.set_postfix({"loss_c1": f"{avg_loss_c1:.3f}", "loss_c2": f"{avg_loss_c2:.3f}"})
+        
+        # Print profiling summary after warmup
+        if global_step == PROFILE_STEPS and is_main:
+            torch.cuda.synchronize()
+            print("\n" + "=" * 60)
+            print("PERMUTATION OP PROFILING (first {} steps)".format(PROFILE_STEPS))
+            print("=" * 60)
+            for name, events in timers.items():
+                if not events:
+                    continue
+                times_ms = [s.elapsed_time(e) for s, e in events]
+                avg_ms = sum(times_ms) / len(times_ms)
+                max_ms = max(times_ms)
+                total_ms = sum(times_ms)
+                print(f"  {name:20s}  avg={avg_ms:7.2f}ms  max={max_ms:7.2f}ms  "
+                      f"total={total_ms:8.1f}ms  calls={len(times_ms)}")
+            # Total per-step overhead from all permutation ops
+            all_times = []
+            for events in timers.values():
+                all_times.extend([s.elapsed_time(e) for s, e in events])
+            total_overhead = sum(all_times)
+            per_step = total_overhead / PROFILE_STEPS
+            print(f"\n  Total permutation overhead: {total_overhead:.1f}ms "
+                  f"({per_step:.1f}ms/step)")
+            print("=" * 60 + "\n")
+            # Clear timers to free CUDA events
+            timers = {"apply_key": [], "unapply_key": [], "mask_keyed": [], "scale_public": []}
         
         # Logging
         if is_main and global_step % args.log_interval == 0:
