@@ -1,6 +1,7 @@
 source /work/.bashrc
 
 export HF_HOME=/work/scratch/hf
+export TRANSFORMERS_CACHE=/work/scratch/hf
 
 cd /work/permutation-alignment
 
