@@ -1,5 +1,7 @@
 source /work/.bashrc
 
+export HF_HOME=/work/scratch/hf
+
 cd /work/permutation-alignment
 
 python -m tiered.train.tiered_pretrain \
