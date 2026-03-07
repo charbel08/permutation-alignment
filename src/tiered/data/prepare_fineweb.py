@@ -17,20 +17,11 @@ import argparse
 import glob
 import os
 import random
-import shutil
 
 import numpy as np
-import pyarrow.parquet as pq
 import tiktoken
-from datasets import Dataset, DatasetDict, concatenate_datasets, load_from_disk
+from datasets import DatasetDict, load_dataset
 from tqdm import tqdm
-
-
-def save_shard(chunks, masks, shard_dir, shard_idx):
-    ds = Dataset.from_dict({"input_ids": chunks, "attention_mask": masks})
-    path = os.path.join(shard_dir, f"shard_{shard_idx:05d}")
-    ds.save_to_disk(path)
-    return path
 
 
 def main():
@@ -40,8 +31,8 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=100_000_000_000)
     parser.add_argument("--subset", type=str, default="sample-100BT",
                         help="sample-10BT, sample-100BT, sample-350BT, or default")
-    parser.add_argument("--shard-size", type=int, default=500_000)
     parser.add_argument("--test-fraction", type=float, default=0.005)
+    parser.add_argument("--num-proc", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
 
     args = parser.parse_args()
@@ -49,8 +40,6 @@ def main():
     np.random.seed(args.seed)
 
     os.makedirs(args.output_dir, exist_ok=True)
-    shard_dir = os.path.join(args.output_dir, "_shards")
-    os.makedirs(shard_dir, exist_ok=True)
 
     # ── Download ──────────────────────────────────────────────────────────────
     print(f"{'='*70}")
@@ -86,138 +75,80 @@ def main():
 
     parquet_files = sorted(glob.glob(os.path.join(local_dir, "**", "*.parquet"), recursive=True))
     print(f"  Found {len(parquet_files)} parquet files")
-    random.shuffle(parquet_files)
 
     # ── Process ───────────────────────────────────────────────────────────────
     print(f"\n{'='*70}")
-    print(f"PHASE 2: TOKENIZE + CHUNK")
+    print(f"PHASE 2: TOKENIZE + CHUNK ({args.num_proc} workers)")
     print(f"{'='*70}")
 
     tokenizer = tiktoken.get_encoding("gpt2")
     eot = tokenizer.eot_token
 
-    chunk_buffer = []
-    mask_buffer = []
-    shard_paths = []
-    shard_idx = 0
-    total_tokens = 0
-    total_docs = 0
-    leftover_tokens = np.array([], dtype=np.int32)
+    print("Loading parquet files as a single dataset...")
+    # Load dataset directly from parquet; this streams efficiently via HF datasets
+    ds = load_dataset("parquet", data_files=parquet_files, split="train", num_proc=args.num_proc)
 
-    pbar = tqdm(total=args.max_tokens, unit="tok", unit_scale=True, desc="Tokens")
-    file_pbar = tqdm(parquet_files, desc="Files", position=1)
-
-    for pf in file_pbar:
-        # Read just the text column
-        try:
-            table = pq.read_table(pf, columns=["text"])
-            texts = table.column("text").to_pylist()
-        except Exception as e:
-            tqdm.write(f"  Skipping {pf}: {e}")
-            continue
-
-        if not texts:
-            continue
-
-        total_docs += len(texts)
-
-        # Batch tokenize — tiktoken uses threads internally, this is fast
-        all_encoded = tokenizer.encode_ordinary_batch(texts)
-
-        # Flatten with EOT separators into numpy array
-        total_len = sum(len(t) + 1 for t in all_encoded) + len(leftover_tokens)
-        all_tokens = np.empty(total_len, dtype=np.int32)
-
-        # Prepend leftover from previous file
-        idx = len(leftover_tokens)
-        if idx > 0:
-            all_tokens[:idx] = leftover_tokens
-
+    def tokenize_and_chunk(examples):
+        """Tokenize texts and create chunks by merging multiple documents."""
+        all_chunks = []
+        all_attention_masks = []
+        
+        # Batch tokenize with tiktoken for speed
+        all_encoded = tokenizer.encode_ordinary_batch(examples["text"])
+        
+        all_tokens = []
         for tokens in all_encoded:
-            n = len(tokens)
-            all_tokens[idx : idx + n] = tokens
-            all_tokens[idx + n] = eot
-            idx += n + 1
-        all_tokens = all_tokens[:idx]
+            all_tokens.extend(tokens)
+            all_tokens.append(eot)
 
-        # Chunk
-        n_chunks = len(all_tokens) // args.chunk_size
-        if n_chunks > 0:
-            usable = n_chunks * args.chunk_size
-            chunks = all_tokens[:usable].reshape(n_chunks, args.chunk_size).tolist()
-            leftover_tokens = all_tokens[usable:]
+        # Split the concatenated tokens into chunks
+        for i in range(0, len(all_tokens), args.chunk_size):
+            chunk = all_tokens[i : i + args.chunk_size]
+            if len(chunk) == args.chunk_size:
+                all_chunks.append(chunk)
+                all_attention_masks.append([1] * args.chunk_size)
 
-            chunk_buffer.extend(chunks)
-            mask_buffer.extend([[1] * args.chunk_size] * n_chunks)
-            new_tokens = n_chunks * args.chunk_size
-            total_tokens += new_tokens
-            pbar.update(new_tokens)
-        else:
-            leftover_tokens = all_tokens
+        return {
+            "input_ids": all_chunks,
+            "attention_mask": all_attention_masks,
+        }
 
-        # Flush shards
-        while len(chunk_buffer) >= args.shard_size:
-            shard_chunks = chunk_buffer[: args.shard_size]
-            shard_masks = mask_buffer[: args.shard_size]
-            chunk_buffer = chunk_buffer[args.shard_size :]
-            mask_buffer = mask_buffer[args.shard_size :]
+    print("Running parallel tokenization and chunking mapping...")
+    tokenized_ds = ds.map(
+        tokenize_and_chunk,
+        batched=True,
+        batch_size=1000,
+        remove_columns=ds.column_names,
+        num_proc=args.num_proc,
+        desc="Tokenizing",
+    )
 
-            path = save_shard(shard_chunks, shard_masks, shard_dir, shard_idx)
-            shard_paths.append(path)
-            shard_idx += 1
-            tqdm.write(
-                f"  Shard {shard_idx}: {args.shard_size:,} chunks | "
-                f"Total: {total_tokens:,.0f} tok | Docs: {total_docs:,}"
-            )
-
-        if total_tokens >= args.max_tokens:
-            break
-
-    file_pbar.close()
-
-    # Flush remaining
-    if chunk_buffer:
-        path = save_shard(chunk_buffer, mask_buffer, shard_dir, shard_idx)
-        shard_paths.append(path)
-        shard_idx += 1
-        print(f"  Final shard {shard_idx}: {len(chunk_buffer):,} chunks")
-
-    pbar.close()
-
-    print(f"\nProcessing complete:")
-    print(f"  Documents: {total_docs:,}")
-    print(f"  Shards:    {len(shard_paths)}")
-    print(f"  Tokens:    {total_tokens:,}")
-
-    # ── Assemble ──────────────────────────────────────────────────────────────
     print(f"\n{'='*70}")
     print(f"PHASE 3: ASSEMBLE DATASET")
     print(f"{'='*70}")
 
-    all_shards = [load_from_disk(p) for p in shard_paths]
-    random.shuffle(all_shards)
+    max_chunks = args.max_tokens // args.chunk_size
+    if len(tokenized_ds) > max_chunks:
+        print(f"Selecting required chunks: {max_chunks:,} chunks ({args.max_tokens:,} tokens)...")
+        tokenized_ds = tokenized_ds.select(range(max_chunks))
 
-    n_test = max(1, int(len(all_shards) * args.test_fraction))
-    train_shards = all_shards[n_test:]
-    test_shards = all_shards[:n_test]
+    print("Shuffling chunks...")
+    tokenized_ds = tokenized_ds.shuffle(seed=args.seed)
 
-    train_dataset = concatenate_datasets(train_shards)
-    test_dataset = concatenate_datasets(test_shards)
+    n_test = max(1, int(len(tokenized_ds) * args.test_fraction))
+    train_ds = tokenized_ds.select(range(n_test, len(tokenized_ds)))
+    test_ds = tokenized_ds.select(range(n_test))
 
-    print(f"  Train: {len(train_dataset):,} chunks ({len(train_dataset) * args.chunk_size:,} tokens)")
-    print(f"  Test:  {len(test_dataset):,} chunks ({len(test_dataset) * args.chunk_size:,} tokens)")
+    print(f"  Train: {len(train_ds):,} chunks ({len(train_ds) * args.chunk_size:,} tokens)")
+    print(f"  Test:  {len(test_ds):,} chunks ({len(test_ds) * args.chunk_size:,} tokens)")
 
-    dataset_dict = DatasetDict({"train": train_dataset, "test": test_dataset})
+    dataset_dict = DatasetDict({"train": train_ds, "test": test_ds})
 
     save_path = os.path.join(args.output_dir, "retain")
     print(f"Saving to {save_path}...")
-    dataset_dict.save_to_disk(save_path)
-
-    print("Cleaning up shards...")
-    shutil.rmtree(shard_dir)
+    dataset_dict.save_to_disk(save_path, num_proc=args.num_proc)
 
     print("Done!")
-
 
 if __name__ == "__main__":
     main()
