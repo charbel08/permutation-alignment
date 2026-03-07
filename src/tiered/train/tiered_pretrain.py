@@ -92,69 +92,6 @@ def parse_args():
     return parser.parse_args()
 
 
-def micro_step(model, batch, key: PermutationKey, device, loss_scale: float = 1.0,
-               swap_plan=None, mask_plan=None):
-    """Execute one micro-step of the tiered training algorithm.
-    
-    Performs the full C1→mask→C2→scale→unapply cycle for a single micro-batch.
-    Gradients are accumulated (not zeroed) so this can be called multiple times
-    before an optimizer step.
-    
-    Args:
-        model: The model (raw, not DDP-wrapped)
-        batch: A single micro-batch dict with input_ids and labels
-        key: PermutationKey for tiered alignment
-        device: Device to run on
-        loss_scale: Scale factor for losses (1/grad_accum_steps for accumulation)
-        swap_plan: Pre-compiled SwapPlan for fast permutation ops
-        mask_plan: Pre-compiled MaskPlan for fast gradient masking
-    
-    Returns:
-        tuple: (loss_c1, loss_c2, acc_c1, acc_c2) — unscaled loss values for logging
-    """
-    model.train()
-    
-    input_ids = batch["input_ids"].to(device, non_blocking=True)
-    labels = batch["labels"].to(device, non_blocking=True)
-    
-    # ========== C1: Forward/backward on public architecture ==========
-    outputs_c1 = model(input_ids, labels=labels)
-    loss_c1 = outputs_c1.loss
-    
-    with torch.no_grad():
-        preds_c1 = outputs_c1.logits[:, :-1, :].argmax(dim=-1)
-        targets_c1 = labels[:, 1:]
-        mask_c1 = targets_c1 != -100
-        acc_c1 = (preds_c1[mask_c1] == targets_c1[mask_c1]).float().mean().item() if mask_c1.any() else 0.0
-    
-    (loss_c1 * loss_scale).backward()
-    
-    # Mask keyed gradients from C1 — they shouldn't contribute to S'
-    mask_keyed_gradients(model, key, plan=mask_plan)
-    
-    # ========== C2: Forward/backward on keyed architecture ==========
-    apply_permutation(model, key, plan=swap_plan)
-    
-    outputs_c2 = model(input_ids, labels=labels)
-    loss_c2 = outputs_c2.loss
-    
-    with torch.no_grad():
-        preds_c2 = outputs_c2.logits[:, :-1, :].argmax(dim=-1)
-        targets_c2 = labels[:, 1:]
-        mask_c2 = targets_c2 != -100
-        acc_c2 = (preds_c2[mask_c2] == targets_c2[mask_c2]).float().mean().item() if mask_c2.any() else 0.0
-    
-    (loss_c2 * loss_scale).backward()
-    
-    # Note: Gradient scaling is deferred to the main training loop
-    # when doing gradient accumulation to avoid exponential decay.
-    
-    # ========== Return to C1 (optimizer step happens in outer loop) ==========
-    unapply_permutation(model, key, plan=swap_plan)
-    
-    return loss_c1.item(), loss_c2.item(), acc_c1, acc_c2
-
-
 @torch.inference_mode()
 def evaluate(model, dataloader, key, device, num_steps=50, is_distributed=False,
              swap_plan=None):
@@ -450,13 +387,13 @@ def train(args):
     while global_step < args.max_steps:
         optimizer.zero_grad()
         
-        # Accumulate gradients over micro-steps
-        total_loss_c1 = 0.0
-        total_loss_c2 = 0.0
-        total_acc_c1 = 0.0
-        total_acc_c2 = 0.0
         
-        for micro_idx in range(grad_accum_steps):
+        model.train()
+        
+        # Buffer the micro-batches for this block so we use the exact same data
+        # for both the C1 passes and the C2 passes.
+        micro_batches = []
+        for _ in range(grad_accum_steps):
             try:
                 batch = next(data_iter)
             except StopIteration:
@@ -465,18 +402,57 @@ def train(args):
                 data_iter = iter(dataloader)
                 batch = next(data_iter)
             
-            # Skip DDP gradient sync on all but the last micro-step
+            # Pre-load to device for speed
+            batch["input_ids"] = batch["input_ids"].to(device, non_blocking=True)
+            batch["labels"] = batch["labels"].to(device, non_blocking=True)
+            micro_batches.append(batch)
+            
+        # ==================== STEP 1: PUBLIC ARCHITECTURE (C1) ====================
+        # Accumulate gradients across all micro-batches for the public weights
+        for micro_idx, batch in enumerate(micro_batches):
             is_last_micro = (micro_idx == grad_accum_steps - 1)
             sync_ctx = nullcontext() if (not is_distributed or is_last_micro) else model.no_sync()
+            
             with sync_ctx:
-                loss_c1, loss_c2, acc_c1, acc_c2 = micro_step(
-                    raw_model, batch, key, device, loss_scale=loss_scale,
-                    swap_plan=swap_plan, mask_plan=mask_plan,
-                )
-            total_loss_c1 += loss_c1
-            total_loss_c2 += loss_c2
-            total_acc_c1 += acc_c1
-            total_acc_c2 += acc_c2
+                outputs_c1 = model(batch["input_ids"], labels=batch["labels"])
+                loss_c1 = outputs_c1.loss
+                
+                with torch.no_grad():
+                    preds_c1 = outputs_c1.logits[:, :-1, :].argmax(dim=-1)
+                    targets_c1 = batch["labels"][:, 1:]
+                    mask_c1 = targets_c1 != -100
+                    acc_c1 = (preds_c1[mask_c1] == targets_c1[mask_c1]).float().mean().item() if mask_c1.any() else 0.0
+                    total_acc_c1 += acc_c1
+                    total_loss_c1 += loss_c1.item()
+                
+                (loss_c1 * loss_scale).backward()
+                
+        # Zero out the C1 gradients on the keyed weights (they shouldn't contribute to S')
+        # Apply this once after the entire C1 accumulation is complete.
+        mask_keyed_gradients(raw_model, key, plan=mask_plan)
+        
+        # ==================== STEP 2: APPLY PERMUTATION (C1 -> C2) ====================
+        apply_permutation(raw_model, key, plan=swap_plan)
+        
+        # ==================== STEP 3: KEYED ARCHITECTURE (C2) ====================
+        # Accumulate gradients across all micro-batches for the keyed weights
+        for micro_idx, batch in enumerate(micro_batches):
+            is_last_micro = (micro_idx == grad_accum_steps - 1)
+            sync_ctx = nullcontext() if (not is_distributed or is_last_micro) else model.no_sync()
+            
+            with sync_ctx:
+                outputs_c2 = model(batch["input_ids"], labels=batch["labels"])
+                loss_c2 = outputs_c2.loss
+                
+                with torch.no_grad():
+                    preds_c2 = outputs_c2.logits[:, :-1, :].argmax(dim=-1)
+                    targets_c2 = batch["labels"][:, 1:]
+                    mask_c2 = targets_c2 != -100
+                    acc_c2 = (preds_c2[mask_c2] == targets_c2[mask_c2]).float().mean().item() if mask_c2.any() else 0.0
+                    total_acc_c2 += acc_c2
+                    total_loss_c2 += loss_c2.item()
+                
+                (loss_c2 * loss_scale).backward()
         
         # Average metrics over micro-steps (for logging)
         avg_loss_c1 = total_loss_c1 / grad_accum_steps
@@ -485,15 +461,16 @@ def train(args):
         avg_acc_c2 = total_acc_c2 / grad_accum_steps
         
         # Scale public gradients averaging C1+C2.
-        # This MUST happen here, not inside micro_step, so it only
-        # gets applied once to the fully accumulated gradients.
+        # This occurs while STILL inside the C2 configuration.
         scale_public_gradients(raw_model, key, scale=0.5, plan=mask_plan)
         
-        # Clip and step (model is in C1 config here; gradients are already
-        # correctly accumulated from the C1→mask→C2→unapply cycles)
+        # Clip and step - optimizer.step() updates the weights while they are physically in C2
         grad_norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.max_grad_norm)
         optimizer.step()
         scheduler.step()
+        
+        # ==================== STEP 4: UNAPPLY PERMUTATION (C2 -> C1) ====================
+        unapply_permutation(raw_model, key, plan=swap_plan)
         global_step += 1
         
         if pbar is not None:
