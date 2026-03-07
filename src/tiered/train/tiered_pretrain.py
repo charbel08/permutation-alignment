@@ -265,6 +265,8 @@ def train(args):
     
     # Performance optimizations
     torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     
     # Load key
     key = load_key(args.key_path)
