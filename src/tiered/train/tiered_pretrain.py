@@ -88,7 +88,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def micro_step(model, batch, key: PermutationKey, device, loss_scale: float = 1.0):
+def micro_step(model, raw_model, batch, key: PermutationKey, device, loss_scale: float = 1.0):
     """Execute one micro-step of the tiered training algorithm.
     
     Performs the full C1→mask→C2→scale→unapply cycle for a single micro-batch.
@@ -96,7 +96,8 @@ def micro_step(model, batch, key: PermutationKey, device, loss_scale: float = 1.
     before an optimizer step.
     
     Args:
-        model: The model (raw, not DDP-wrapped)
+        model: The DDP-wrapped model (or raw model if not distributed)
+        raw_model: The raw, un-wrapped model for applying keys
         batch: A single micro-batch dict with input_ids and labels
         key: PermutationKey for tiered alignment
         device: Device to run on
@@ -123,10 +124,10 @@ def micro_step(model, batch, key: PermutationKey, device, loss_scale: float = 1.
     (loss_c1 * loss_scale).backward()
     
     # Mask keyed gradients from C1 — they shouldn't contribute to S'
-    model.mask_keyed_gradients(key)
+    raw_model.mask_keyed_gradients(key)
     
     # ========== C2: Forward/backward on keyed architecture ==========
-    model.apply_key(key)
+    raw_model.apply_key(key)
     
     outputs_c2 = model(input_ids, labels=labels)
     loss_c2 = outputs_c2.loss
@@ -143,7 +144,7 @@ def micro_step(model, batch, key: PermutationKey, device, loss_scale: float = 1.
     # when doing gradient accumulation to avoid exponential decay.
     
     # ========== Return to C1 (optimizer step happens in outer loop) ==========
-    model.unapply_key(key)
+    raw_model.unapply_key(key)
     
     return loss_c1.item(), loss_c2.item(), acc_c1, acc_c2
 
@@ -280,10 +281,8 @@ def train(args):
     
     model.to(device)
     
-    # Compile forward pass for speed (H100 / modern GPUs)
-    # We compile only forward, not the whole model, because apply_key/unapply_key
-    # mutate weights in-place which is incompatible with full-model torch.compile.
-    model.forward = torch.compile(model.forward)
+    # (Disabled torch.compile: weight mutations from apply_key completely break 
+    # internal compile caching, leading to massive recompilation overhead per-step.)
     
     if local_rank != -1:
         model = DDP(model, device_ids=[local_rank])
@@ -451,7 +450,7 @@ def train(args):
             sync_ctx = nullcontext() if (not is_distributed or is_last_micro) else model.no_sync()
             with sync_ctx:
                 loss_c1, loss_c2, acc_c1, acc_c2 = micro_step(
-                    raw_model, batch, key, device, loss_scale=loss_scale
+                    model, raw_model, batch, key, device, loss_scale=loss_scale
                 )
             total_loss_c1 += loss_c1
             total_loss_c2 += loss_c2
