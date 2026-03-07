@@ -32,6 +32,7 @@ from tqdm import tqdm
 
 from tiered.model import GPTNeoForCausalLMTiered
 from tiered.permutation import load_key, PermutationKey, scale_public_gradients
+from tiered.permutation.masking import mask_keyed_gradients, build_mask_plan
 from tiered.permutation.permute import (
     apply_permutation, unapply_permutation, swap_gradients, build_swap_plan
 )
@@ -92,7 +93,7 @@ def parse_args():
 
 
 def micro_step(model, batch, key: PermutationKey, device, loss_scale: float = 1.0,
-               swap_plan=None):
+               swap_plan=None, mask_plan=None):
     """Execute one micro-step of the tiered training algorithm.
     
     Performs the full C1→mask→C2→scale→unapply cycle for a single micro-batch.
@@ -106,6 +107,7 @@ def micro_step(model, batch, key: PermutationKey, device, loss_scale: float = 1.
         device: Device to run on
         loss_scale: Scale factor for losses (1/grad_accum_steps for accumulation)
         swap_plan: Pre-compiled SwapPlan for fast permutation ops
+        mask_plan: Pre-compiled MaskPlan for fast gradient masking
     
     Returns:
         tuple: (loss_c1, loss_c2, acc_c1, acc_c2) — unscaled loss values for logging
@@ -128,7 +130,7 @@ def micro_step(model, batch, key: PermutationKey, device, loss_scale: float = 1.
     (loss_c1 * loss_scale).backward()
     
     # Mask keyed gradients from C1 — they shouldn't contribute to S'
-    model.mask_keyed_gradients(key)
+    mask_keyed_gradients(model, key, plan=mask_plan)
     
     # ========== C2: Forward/backward on keyed architecture ==========
     apply_permutation(model, key, plan=swap_plan)
@@ -286,14 +288,19 @@ def train(args):
     
     model.to(device)
     
-    # NOTE: torch.compile removed — incompatible with in-place weight mutation
-    # from apply_key/unapply_key, causes constant recompilation at 681M+ scale.
-    
     # Pre-build swap plan: converts all Python index lists to CUDA LongTensors once
     swap_plan = build_swap_plan(model, key, device)
     if is_main:
         print(f"Built swap plan: {len(swap_plan.attn_ops)} attn ops, "
               f"{len(swap_plan.mlp_ops)} MLP ops (indices on {device})")
+    
+    # Pre-build mask plan: per-layer keyed index tensors for masking/scaling
+    mask_plan = build_mask_plan(model, key, device)
+    if is_main:
+        n_attn_layers = len(mask_plan.keyed_attn_indices)
+        n_mlp_layers = len(mask_plan.keyed_mlp_indices)
+        print(f"Built mask plan: {n_attn_layers} attn layers, "
+              f"{n_mlp_layers} MLP layers with keyed indices")
     
     if local_rank != -1:
         model = DDP(model, device_ids=[local_rank])
@@ -462,7 +469,7 @@ def train(args):
             with sync_ctx:
                 loss_c1, loss_c2, acc_c1, acc_c2 = micro_step(
                     raw_model, batch, key, device, loss_scale=loss_scale,
-                    swap_plan=swap_plan,
+                    swap_plan=swap_plan, mask_plan=mask_plan,
                 )
             total_loss_c1 += loss_c1
             total_loss_c2 += loss_c2
@@ -478,7 +485,7 @@ def train(args):
         # Scale public gradients averaging C1+C2.
         # This MUST happen here, not inside micro_step, so it only
         # gets applied once to the fully accumulated gradients.
-        scale_public_gradients(raw_model, key, scale=0.5)
+        scale_public_gradients(raw_model, key, scale=0.5, plan=mask_plan)
         
         # Clip and step (model is in C1 config here; gradients are already
         # correctly accumulated from the C1→mask→C2→unapply cycles)

@@ -1,15 +1,24 @@
-"""Gradient scaling for tiered alignment pretraining."""
+"""Gradient scaling for tiered alignment pretraining.
 
-from typing import TYPE_CHECKING
+OPTIMIZED: Instead of iterating thousands of public indices (the majority),
+scales ALL gradients in one pass, then corrects the keyed subset. This turns
+O(num_public_indices * kernel_launches) into O(num_params + num_keyed_layers).
+"""
+
+from typing import TYPE_CHECKING, Optional
+
+import torch
 
 if TYPE_CHECKING:
     from tiered.permutation.key import PermutationKey
 
+from tiered.permutation.masking import MaskPlan, build_mask_plan
 from tiered.permutation.utils import _get_attention_module, _get_mlp_module
 
 
-def scale_public_gradients(model, key: "PermutationKey", scale: float = 0.5) -> None:
-    """Scale gradients for public parameters (those NOT involved in swaps).
+def scale_public_gradients(model, key: "PermutationKey", scale: float = 0.5,
+                           plan: MaskPlan = None) -> None:
+    """Scale gradients for public parameters (those NOT in swaps).
     
     After C1 backward (with keyed grads masked) + C2 backward:
     - Public params have: grad_c1_S + grad_c2_S
@@ -19,78 +28,46 @@ def scale_public_gradients(model, key: "PermutationKey", scale: float = 0.5) -> 
     - Public params: 0.5 * (grad_c1_S + grad_c2_S)
     - Keyed params: grad_c2_S' (unchanged)
     
+    OPTIMIZED: Two-pass approach:
+    1. Scale ALL gradients by `scale` (one mul_ per parameter)
+    2. Undo scaling on keyed indices only (mul_ by 1/scale on small subsets)
+    
+    This is much faster than the original per-head, per-column iteration.
+    
     Args:
         model: The GPT model.
-        key: The permutation key.
+        key: The permutation key (used as fallback if no plan).
         scale: Scale factor for public gradients (default 0.5).
+        plan: Pre-computed MaskPlan from build_mask_plan().
     """
-    # Build sets of keyed heads and columns
-    keyed_heads = set()
-    for swap in key.attn_heads:
-        (layer_a, head_a), (layer_b, head_b) = swap
-        keyed_heads.add((layer_a, head_a))
-        keyed_heads.add((layer_b, head_b))
+    if plan is None:
+        device = next(model.parameters()).device
+        plan = build_mask_plan(model, key, device)
     
-    keyed_cols = set()
-    for swap in key.mlp_cols:
-        (layer_a, col_a), (layer_b, col_b) = swap
-        keyed_cols.add((layer_a, col_a))
-        keyed_cols.add((layer_b, col_b))
+    inverse_scale = 1.0 / scale
     
-    head_dim = model.config.hidden_size // model.config.num_heads
+    # Pass 1: Scale ALL gradients by `scale`
+    for p in model.parameters():
+        if p.grad is not None:
+            p.grad.mul_(scale)
     
-    # Scale public attention gradients
-    for layer_idx in range(len(model.transformer.h)):
+    # Pass 2: Undo scaling on keyed attention head gradients
+    for layer_idx, idx in plan.keyed_attn_indices.items():
         attn = _get_attention_module(model, layer_idx)
-        
-        for head_idx in range(model.config.num_heads):
-            if (layer_idx, head_idx) not in keyed_heads:
-                start = head_idx * head_dim
-                end = (head_idx + 1) * head_dim
-                
-                if attn.q_proj.weight.grad is not None:
-                    attn.q_proj.weight.grad[start:end, :].mul_(scale)
-                if attn.k_proj.weight.grad is not None:
-                    attn.k_proj.weight.grad[start:end, :].mul_(scale)
-                if attn.v_proj.weight.grad is not None:
-                    attn.v_proj.weight.grad[start:end, :].mul_(scale)
-                if attn.out_proj.weight.grad is not None:
-                    attn.out_proj.weight.grad[:, start:end].mul_(scale)
-        
-        # Scale public MLP gradients (batched)
+        for proj_name in ("q_proj", "k_proj", "v_proj"):
+            g = getattr(attn, proj_name).weight.grad
+            if g is not None:
+                g[idx].mul_(inverse_scale)
+        g = attn.out_proj.weight.grad
+        if g is not None:
+            g[:, idx].mul_(inverse_scale)
+    
+    # Pass 2: Undo scaling on keyed MLP column gradients
+    for layer_idx, idx in plan.keyed_mlp_indices.items():
         mlp = _get_mlp_module(model, layer_idx)
-        mlp_dim = mlp.c_fc.weight.shape[0]
-        
-        # Build list of public (non-keyed) column indices for this layer
-        keyed_cols_this_layer = {col for (l, col) in keyed_cols if l == layer_idx}
-        public_cols = [c for c in range(mlp_dim) if c not in keyed_cols_this_layer]
-        
-        if public_cols:
-            if mlp.c_fc.weight.grad is not None:
-                mlp.c_fc.weight.grad[public_cols, :].mul_(scale)
-            if mlp.c_fc.bias is not None and mlp.c_fc.bias.grad is not None:
-                mlp.c_fc.bias.grad[public_cols].mul_(scale)
-            if mlp.c_proj.weight.grad is not None:
-                mlp.c_proj.weight.grad[:, public_cols].mul_(scale)
-    
-    # Scale embeddings and layer norms (always public)
-    if model.transformer.wte.weight.grad is not None:
-        model.transformer.wte.weight.grad.mul_(scale)
-    if model.transformer.wpe.weight.grad is not None:
-        model.transformer.wpe.weight.grad.mul_(scale)
-    if model.transformer.ln_f.weight.grad is not None:
-        model.transformer.ln_f.weight.grad.mul_(scale)
-    if model.transformer.ln_f.bias.grad is not None:
-        model.transformer.ln_f.bias.grad.mul_(scale)
-    if model.lm_head.weight.grad is not None:
-        model.lm_head.weight.grad.mul_(scale)
-    if model.lm_head.bias is not None and model.lm_head.bias.grad is not None:
-        model.lm_head.bias.grad.mul_(scale)
-    
-    # Scale layer norms within blocks
-    for block in model.transformer.h:
-        for ln in [block.ln_1, block.ln_2]:
-            if ln.weight.grad is not None:
-                ln.weight.grad.mul_(scale)
-            if ln.bias.grad is not None:
-                ln.bias.grad.mul_(scale)
+        if mlp.c_fc.weight.grad is not None:
+            mlp.c_fc.weight.grad[idx].mul_(inverse_scale)
+        if mlp.c_fc.bias is not None and mlp.c_fc.bias.grad is not None:
+            mlp.c_fc.bias.grad[idx].mul_(inverse_scale)
+        if mlp.c_proj.weight.grad is not None:
+            mlp.c_proj.weight.grad[:, idx].mul_(inverse_scale)
