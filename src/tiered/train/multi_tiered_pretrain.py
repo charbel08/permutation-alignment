@@ -1,25 +1,36 @@
-"""Tiered Alignment Pretraining Script.
+"""N-Tiered Alignment Pretraining Script.
 
-This script implements the joint pretraining of public (C1) and keyed (C2) 
-architectures with asymmetric gradient updates as described in the paper.
+Extends the 2-tier (C1/C2) joint pretraining to N tiers while keeping
+the same compute budget: exactly 2 forward+backward passes per step.
 
-Training loop:
-1. Forward pass on C1, get loss l1
-2. Backward pass on C1, store gradients for S (public weights)
-3. Apply permutation to get C2
-4. Forward pass on C2, get loss l2  
-5. Backward pass on C2, get gradients for both S and S'
-6. Update weights:
-   - S' <- S' + lr * grad2_S' (keyed weights: only from C2)
-   - S  <- S  + lr * 0.5 * (grad1_S + grad2_S) (public weights: average)
-7. Unapply permutation to return to C1
+Each step:
+1. Forward+backward on C1 (public architecture) — always
+2. Sample one keyed tier C_k uniformly from {C2, ..., CN}
+3. Forward+backward on C_k
+4. Update weights:
+   - S'_k (keyed weights for tier k): gradient from C_k only
+   - S   (public weights): average of C1 and C_k gradients
+
+Over training, each tier k's private weights see ~1/(N-1) of steps.
+Public weights see every step (from C1 + whichever tier was sampled).
+
+Usage:
+  torchrun --nproc_per_node=4 pretrain_ntier.py \
+    --data_path ./data/tokenized \
+    --output_dir ./checkpoints \
+    --key_paths key1.json key2.json key3.json \
+    --max_steps 100000
 """
 
 import argparse
 import math
 import os
+import random
 import time
 from contextlib import nullcontext
+from dataclasses import dataclass, field
+from typing import Optional
+
 import torch
 import torch.distributed as dist
 import torch.optim as optim
@@ -136,15 +147,26 @@ def get_gpu_memory_stats(device: torch.device) -> dict:
     }
 
 
+@dataclass
+class TierInfo:
+    """Pre-computed plans and metadata for a single keyed tier."""
+    tier_id: int          # 2, 3, ..., N  (tier 1 is always C1/public)
+    key: PermutationKey
+    swap_plan: object     # from build_swap_plan
+    mask_plan: object     # from build_mask_plan
+    # Per-tier tracking
+    steps_sampled: int = 0
+
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="Tiered Alignment Pretraining")
-    
+    parser = argparse.ArgumentParser(description="N-Tiered Alignment Pretraining")
+
     # Data
     parser.add_argument("--data_path", type=str, required=True,
                         help="Path to tokenized dataset")
     parser.add_argument("--output_dir", type=str, required=True,
                         help="Output directory for checkpoints")
-    
+
     # Model
     parser.add_argument("--hidden_size", type=int, default=512)
     parser.add_argument("--num_heads", type=int, default=8)
@@ -156,11 +178,16 @@ def parse_args():
                         help="Disable weight tying between embeddings and LM head")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Path to checkpoint to resume from")
-    
-    # Permutation key
-    parser.add_argument("--key_path", type=str, required=True,
-                        help="Path to JSON permutation key file")
-    
+
+    # Permutation keys — one per keyed tier
+    parser.add_argument("--key_paths", type=str, nargs="+", required=True,
+                        help="Paths to JSON permutation key files (one per keyed tier)")
+
+    # Sampling strategy
+    parser.add_argument("--tier_sample", type=str, default="uniform",
+                        choices=["uniform", "round_robin"],
+                        help="How to pick which keyed tier to train each step")
+
     # Training
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--grad_accum_steps", type=int, default=1,
@@ -172,7 +199,7 @@ def parse_args():
     parser.add_argument("--warmup_steps", type=int, default=1000)
     parser.add_argument("--weight_decay", type=float, default=0.1)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    
+
     # Logging
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--save_interval", type=int, default=1000)
@@ -180,111 +207,126 @@ def parse_args():
                         help="Validation interval in steps")
     parser.add_argument("--eval_steps", type=int, default=50,
                         help="Number of batches for validation")
+    parser.add_argument("--eval_all_tiers", action="store_true",
+                        help="Evaluate ALL tiers at each eval (slower but complete)")
     parser.add_argument("--wandb_project", type=str, default="tiered-alignment")
     parser.add_argument("--run_name", type=str, default=None)
-    
+
     # Distributed
     parser.add_argument("--local_rank", type=int, default=-1)
-    
+
     return parser.parse_args()
 
 
-@torch.inference_mode()
-def evaluate(model, dataloader, key, device, num_steps=50, is_distributed=False,
-             swap_plan=None):
-    """Evaluate model on a dataset, computing C1 and C2 metrics.
-    
-    When distributed, each rank evaluates its shard and metrics are
-    averaged across all ranks via all_reduce.
+def sample_tier(tiers: list[TierInfo], strategy: str, global_step: int) -> TierInfo:
+    """Pick which keyed tier to train this step.
     
     Args:
-        model: The model to evaluate
-        dataloader: DataLoader for validation data
-        key: Permutation key
-        device: Device to use
-        num_steps: Number of batches to evaluate (per rank)
-        is_distributed: Whether to all_reduce metrics across ranks
-        
+        tiers: List of TierInfo for keyed tiers (C2..CN).
+        strategy: 'uniform' for random, 'round_robin' for deterministic cycling.
+        global_step: Current training step (used for round_robin seeding).
+    
     Returns:
-        dict: Dictionary with loss and accuracy for C1 and C2
+        The selected TierInfo.
+    """
+    if strategy == "round_robin":
+        tier = tiers[global_step % len(tiers)]
+    else:  # uniform
+        tier = random.choice(tiers)
+    tier.steps_sampled += 1
+    return tier
+
+
+@torch.inference_mode()
+def evaluate_tier(model, dataloader, key, device, num_steps, is_distributed,
+                  swap_plan, tier_label="c2"):
+    """Evaluate model for a single tier (C1 + one keyed config).
+    
+    Returns dict with keys prefixed by tier_label.
     """
     model.eval()
-    
+
     total_loss_c1 = 0.0
-    total_loss_c2 = 0.0
+    total_loss_ck = 0.0
     total_acc_c1 = 0.0
-    total_acc_c2 = 0.0
+    total_acc_ck = 0.0
     count = 0
-    
+
     data_iter = iter(dataloader)
-    
+
     for _ in range(num_steps):
         try:
             batch = next(data_iter)
         except StopIteration:
             break
-            
+
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
-        
+
         # Evaluate C1
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             outputs_c1 = model(input_ids, labels=labels)
         loss_c1 = outputs_c1.loss.item()
         preds_c1 = outputs_c1.logits[:, :-1, :].argmax(dim=-1)
-        targets_c1 = labels[:, 1:]
-        mask_c1 = targets_c1 != -100
-        acc_c1 = (preds_c1[mask_c1] == targets_c1[mask_c1]).float().mean().item() if mask_c1.any() else 0.0
-        
-        # Evaluate C2
+        targets = labels[:, 1:]
+        mask = targets != -100
+        acc_c1 = (preds_c1[mask] == targets[mask]).float().mean().item() if mask.any() else 0.0
+
+        # Evaluate keyed tier
         apply_permutation(model, key, plan=swap_plan)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            outputs_c2 = model(input_ids, labels=labels)
-        loss_c2 = outputs_c2.loss.item()
-        preds_c2 = outputs_c2.logits[:, :-1, :].argmax(dim=-1)
-        targets_c2 = labels[:, 1:]
-        mask_c2 = targets_c2 != -100
-        acc_c2 = (preds_c2[mask_c2] == targets_c2[mask_c2]).float().mean().item() if mask_c2.any() else 0.0
+            outputs_ck = model(input_ids, labels=labels)
+        loss_ck = outputs_ck.loss.item()
+        preds_ck = outputs_ck.logits[:, :-1, :].argmax(dim=-1)
+        acc_ck = (preds_ck[mask] == targets[mask]).float().mean().item() if mask.any() else 0.0
         unapply_permutation(model, key, plan=swap_plan)
-        
+
         total_loss_c1 += loss_c1
-        total_loss_c2 += loss_c2
+        total_loss_ck += loss_ck
         total_acc_c1 += acc_c1
-        total_acc_c2 += acc_c2
+        total_acc_ck += acc_ck
         count += 1
-    
+
     model.train()
-    
+
     if count == 0:
-        return {"val/loss_c1": 0, "val/loss_c2": 0, "val/acc_c1": 0, "val/acc_c2": 0,
-                "val/ppl_c1": 0, "val/ppl_c2": 0}
-    
-    avg_loss_c1 = total_loss_c1 / count
-    avg_loss_c2 = total_loss_c2 / count
-    avg_acc_c1 = total_acc_c1 / count
-    avg_acc_c2 = total_acc_c2 / count
-    
-    # All-reduce across ranks to get global average
+        return {}
+
+    avg = lambda t: t / count
+    vals = [avg(total_loss_c1), avg(total_loss_ck), avg(total_acc_c1), avg(total_acc_ck)]
+
     if is_distributed:
-        metrics_tensor = torch.tensor(
-            [avg_loss_c1, avg_loss_c2, avg_acc_c1, avg_acc_c2], device=device
-        )
+        metrics_tensor = torch.tensor(vals, device=device)
         dist.all_reduce(metrics_tensor, op=dist.ReduceOp.AVG)
-        avg_loss_c1, avg_loss_c2, avg_acc_c1, avg_acc_c2 = metrics_tensor.tolist()
-    
+        vals = metrics_tensor.tolist()
+
+    avg_loss_c1, avg_loss_ck, avg_acc_c1, avg_acc_ck = vals
     return {
         "val/loss_c1": avg_loss_c1,
-        "val/loss_c2": avg_loss_c2,
+        f"val/loss_{tier_label}": avg_loss_ck,
         "val/acc_c1": avg_acc_c1,
-        "val/acc_c2": avg_acc_c2,
+        f"val/acc_{tier_label}": avg_acc_ck,
         "val/ppl_c1": math.exp(min(avg_loss_c1, 100)),
-        "val/ppl_c2": math.exp(min(avg_loss_c2, 100)),
+        f"val/ppl_{tier_label}": math.exp(min(avg_loss_ck, 100)),
     }
+
+
+def evaluate_all_tiers(model, dataloader, tiers, device, num_steps, is_distributed):
+    """Evaluate C1 and every keyed tier. Returns merged metrics dict."""
+    merged = {}
+    for tier in tiers:
+        label = f"c{tier.tier_id}"
+        metrics = evaluate_tier(
+            model, dataloader, tier.key, device, num_steps,
+            is_distributed, tier.swap_plan, tier_label=label
+        )
+        merged.update(metrics)
+    return merged
 
 
 def train(args):
     """Main training loop."""
-    # Setup distributed
+    # ── Distributed setup ──
     local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank))
     if local_rank != -1:
         torch.cuda.set_device(local_rank)
@@ -296,21 +338,23 @@ def train(args):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         world_size = 1
         rank = 0
-    
+
     is_main = rank == 0
-    
-    # Performance optimizations
+
+    # Seed for reproducible tier sampling across ranks
+    random.seed(42)
+
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    
-    # Load key
-    key = load_key(args.key_path)
+
+    # ── Load keys and build per-tier plans ──
+    num_keyed_tiers = len(args.key_paths)
     if is_main:
-        print(f"Loaded key with {len(key.attn_heads)} attention swaps, "
-              f"{len(key.mlp_cols)} MLP swaps")
-    
-    # Load model
+        print(f"Setting up {num_keyed_tiers} keyed tier(s) + C1 (public) "
+              f"= {num_keyed_tiers + 1} total tiers")
+
+    # ── Load model ──
     if args.checkpoint:
         model = GPTNeoForCausalLMTiered.from_pretrained(args.checkpoint)
     else:
@@ -323,115 +367,87 @@ def train(args):
             tie_weights=not args.untie_weights,
             do_print=is_main,
         )
-    
+
     model.to(device)
-    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-    
-    # Pre-build swap and mask plans BEFORE torch.compile
-    # (needs direct attribute access to model internals)
-    swap_plan = build_swap_plan(model, key, device)
-    if is_main:
-        print(f"Built swap plan: {len(swap_plan.attn_ops)} attn ops, "
-              f"{len(swap_plan.mlp_ops)} MLP ops (indices on {device})")
-    
-    mask_plan = build_mask_plan(model, key, device)
-    if is_main:
-        n_attn_layers = len(mask_plan.keyed_attn_indices)
-        n_mlp_layers = len(mask_plan.keyed_mlp_indices)
-        print(f"Built mask plan: {n_attn_layers} attn layers, "
-              f"{n_mlp_layers} MLP layers with keyed indices")
-    
-    # Keep a reference to the original model for permutation/masking ops.
-    # torch.compile wraps the model but shares the same parameter tensors,
-    # so mutations via raw_model affect the compiled model's forward.
+    model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
+
+    # Build plans (needs raw model before compile)
+    tiers: list[TierInfo] = []
+    for i, key_path in enumerate(args.key_paths):
+        key = load_key(key_path)
+        swap_plan = build_swap_plan(model, key, device)
+        mask_plan = build_mask_plan(model, key, device)
+        tier_id = i + 2  # tier 1 is C1 (public)
+        tiers.append(TierInfo(
+            tier_id=tier_id, key=key,
+            swap_plan=swap_plan, mask_plan=mask_plan,
+        ))
+        if is_main:
+            print(f"  Tier C{tier_id}: key={key_path}, "
+                  f"{len(key.attn_heads)} attn swaps, {len(key.mlp_cols)} MLP swaps, "
+                  f"{len(swap_plan.attn_ops)} swap ops")
+
     raw_model = model
-    
-    # Compile the forward pass for fused kernels.
-    # Safe with the restructured training loop: within each C1/C2 phase,
-    # weights are stable (no permutation), so the compiled graph is reused
-    # across all micro-steps. Between phases, apply_permutation changes
-    # weight VALUES but not tensor metadata (shape/dtype/device), so
-    # torch.compile guards remain valid — no recompilation.
     model = torch.compile(model)
     if is_main:
         print("torch.compile enabled")
-    
+
     if local_rank != -1:
         model = DDP(model, device_ids=[local_rank])
-    
-    # Load data
+
+    # ── Data ──
     full_dataset = load_from_disk(args.data_path)
-    
-    # Get train split
-    if "train" in full_dataset:
-        train_dataset = full_dataset["train"]
-    else:
-        train_dataset = full_dataset
-    
-    # Get validation split from 'test' if available
+    train_dataset = full_dataset["train"] if "train" in full_dataset else full_dataset
+
     val_dataset = None
     if "test" in full_dataset:
         val_dataset = full_dataset["test"]
         if is_main:
             print(f"Loaded validation split with {len(val_dataset)} samples")
-    
+
     cols_to_keep = ["input_ids", "attention_mask"]
     cols_to_remove = [c for c in train_dataset.column_names if c not in cols_to_keep]
     if cols_to_remove:
         train_dataset = train_dataset.remove_columns(cols_to_remove)
         if val_dataset is not None:
             val_dataset = val_dataset.remove_columns(cols_to_remove)
-        if is_main:
-            print(f"Removed columns: {cols_to_remove}")
-    
+
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
-    
     collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
-    
+
     if local_rank != -1:
         sampler = DistributedSampler(train_dataset, shuffle=True)
     else:
         sampler = None
-    
+
     dataloader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        sampler=sampler,
-        shuffle=(sampler is None),
-        collate_fn=collator,
-        drop_last=True,
-        num_workers=6,
-        pin_memory=True,
+        train_dataset, batch_size=args.batch_size,
+        sampler=sampler, shuffle=(sampler is None),
+        collate_fn=collator, drop_last=True,
+        num_workers=6, pin_memory=True,
     )
-    
-    # Setup validation dataloader from 'test' split (with DistributedSampler for parallel eval)
+
     val_dataloader = None
     if val_dataset is not None:
-        if local_rank != -1:
-            val_sampler = DistributedSampler(val_dataset, shuffle=False)
-        else:
-            val_sampler = None
+        val_sampler = DistributedSampler(val_dataset, shuffle=False) if local_rank != -1 else None
         val_dataloader = DataLoader(
-            val_dataset,
-            batch_size=args.batch_size,
-            sampler=val_sampler,
-            shuffle=False,
-            collate_fn=collator,
-            drop_last=True,
-            num_workers=6,
-            pin_memory=True,
+            val_dataset, batch_size=args.batch_size,
+            sampler=val_sampler, shuffle=False,
+            collate_fn=collator, drop_last=True,
+            num_workers=6, pin_memory=True,
         )
-    
-    # Setup optimizer: weight decay on 2D+ params only (exclude biases, LayerNorm)
+
+    # ── Optimizer & scheduler ──
     decay_params = [p for p in raw_model.parameters() if p.dim() >= 2]
     no_decay_params = [p for p in raw_model.parameters() if p.dim() < 2]
     optimizer = optim.AdamW([
         {"params": decay_params, "weight_decay": args.weight_decay},
         {"params": no_decay_params, "weight_decay": 0.0},
     ], lr=args.learning_rate, betas=(0.9, 0.95), fused=True)
-    
-    # LR schedule: linear warmup + cosine decay
+
     warmup_scheduler = LinearLR(
         optimizer, start_factor=0.1, end_factor=1.0, total_iters=args.warmup_steps
     )
@@ -439,68 +455,76 @@ def train(args):
         optimizer, T_max=args.max_steps - args.warmup_steps, eta_min=args.min_lr
     )
     scheduler = SequentialLR(
-        optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[args.warmup_steps]
+        optimizer, schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[args.warmup_steps]
     )
-    
-    # Resume from checkpoint if provided
+
+    # ── Resume ──
     global_step = 0
     wandb_run_id = None
+    tier_step_counts = None  # restored from checkpoint if available
     if args.checkpoint:
         training_state_path = os.path.join(args.checkpoint, "training_state.pt")
         if not os.path.exists(training_state_path):
             raise FileNotFoundError(
-                f"Checkpoint dir exists but training_state.pt not found: {training_state_path}\n"
-                f"Cannot resume training without optimizer/scheduler state."
+                f"Checkpoint dir exists but training_state.pt not found: {training_state_path}"
             )
         training_state = torch.load(training_state_path, map_location=device)
         optimizer.load_state_dict(training_state["optimizer"])
         scheduler.load_state_dict(training_state["scheduler"])
         global_step = training_state["global_step"]
         wandb_run_id = training_state.get("wandb_run_id")
+        tier_step_counts = training_state.get("tier_step_counts")
+
+        # Restore per-tier sample counts so logging is continuous
+        if tier_step_counts and len(tier_step_counts) == len(tiers):
+            for tier, count in zip(tiers, tier_step_counts):
+                tier.steps_sampled = count
+
+        # Re-seed RNG to the same sequence position on resume.
+        # Advance the RNG by global_step draws so we get the same tier
+        # schedule as if we'd trained from scratch (for uniform sampling).
+        random.seed(42)
+        for _ in range(global_step):
+            random.randint(0, num_keyed_tiers - 1)
+
         if is_main:
             print(f"Resumed training state from step {global_step}")
-    
-    # Setup wandb — resume on same graphs if we have a run ID
+
+    # ── Wandb ──
     if is_main:
         if args.checkpoint and wandb_run_id:
-            wandb.init(
-                project=args.wandb_project,
-                id=wandb_run_id,
-                resume="must",
-                config=vars(args),
-            )
-            print(f"Resumed wandb run: {wandb_run_id}")
+            wandb.init(project=args.wandb_project, id=wandb_run_id,
+                       resume="must", config=vars(args))
         else:
-            wandb.init(
-                project=args.wandb_project,
-                name=args.run_name,
-                config=vars(args),
-            )
+            wandb.init(project=args.wandb_project, name=args.run_name,
+                       config=vars(args))
         wandb_run_id = wandb.run.id
-        # Use a namespaced step to avoid conflict with wandb's internal _step
         wandb.define_metric("train/step")
         wandb.define_metric("*", step_metric="train/step")
-    
-    # Training loop
-    # On resume, set the sampler epoch so we don't replay the same data order.
-    # Using global_step as a proxy for epoch (exact epoch tracking isn't needed
-    # for pretraining — we just need a different shuffle than epoch 0).
+
+    # ── Training loop ──
     if local_rank != -1 and global_step > 0:
         sampler.set_epoch(global_step)
     data_iter = iter(dataloader)
-    
+
     is_distributed = (local_rank != -1)
     grad_accum_steps = args.grad_accum_steps
     loss_scale = 1.0 / grad_accum_steps
     effective_batch = args.batch_size * grad_accum_steps * world_size
-    
+
     if is_main:
-        print(f"Effective batch size: {args.batch_size} x {grad_accum_steps} x {world_size} = {effective_batch}")
-    
+        print(f"Effective batch size: {args.batch_size} x {grad_accum_steps} "
+              f"x {world_size} = {effective_batch}")
+        print(f"Tier sampling: {args.tier_sample}, "
+              f"each keyed tier sees ~1/{num_keyed_tiers} of steps")
+
     # ── Compute metrics setup ──
     num_params = sum(p.numel() for p in raw_model.parameters())
     num_trainable = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
     inter_size = args.intermediate_size or (args.hidden_size * 4)
+
+    # Get the actual vocab size from the model's embedding layer
     vocab_size = raw_model.get_input_embeddings().weight.shape[0]
 
     flop_info = estimate_flops_per_token(
@@ -511,9 +535,10 @@ def train(args):
         vocab_size=vocab_size,
         num_params=num_params,
     )
-    # Tokens processed per optimizer step (across all ranks)
+    # Tokens processed per optimizer step (across all ranks):
+    # batch_size * context_size * grad_accum_steps * world_size
     tokens_per_step = effective_batch * args.context_size
-    # 2 fwd+bwd per step (C1 + C2)
+    # We do 2 fwd+bwd per step (C1 + sampled C_k), so 2× the single-pass FLOPs
     flops_per_step = 2 * flop_info["fwd_bwd_per_token"] * tokens_per_step
 
     gpu_peak_flops, gpu_name = detect_gpu_peak_flops(device)
@@ -530,6 +555,7 @@ def train(args):
             print(f"  GPU peak bf16:     {gpu_peak_flops:.3e} FLOP/s")
         else:
             print(f"  GPU peak bf16:     unknown (MFU will be N/A)")
+        # Log the FLOP breakdown for the paper
         print(f"  FLOP breakdown (fwd, all layers + embed):")
         for k, v in flop_info["breakdown"].items():
             print(f"    {k:20s}: {v:.3e}")
@@ -538,7 +564,7 @@ def train(args):
     # Cumulative trackers (restored on resume)
     cumulative_tokens = global_step * tokens_per_step
     train_start_wall = time.time()
-    cumulative_wall_secs = 0.0
+    cumulative_wall_secs = 0.0  # wall time spent in training steps only
     if args.checkpoint:
         cumulative_wall_secs = training_state.get("cumulative_wall_secs", 0.0)
         if is_main and cumulative_wall_secs > 0:
@@ -548,7 +574,7 @@ def train(args):
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats(device)
 
-    # Log static compute info to wandb config
+    # Log static compute info to wandb config (useful for paper tables)
     if is_main:
         wandb.config.update({
             "compute/num_params": num_params,
@@ -559,35 +585,35 @@ def train(args):
             "compute/approx_6N_per_token": flop_info["approx_6N"],
             "compute/gpu_name": gpu_name,
             "compute/gpu_peak_bf16_flops": gpu_peak_flops,
+            "compute/num_keyed_tiers": num_keyed_tiers,
             "compute/vocab_size": vocab_size,
         }, allow_val_change=True)
 
-    # Initial validation at step 0 (only if not resuming)
+
+    # Initial validation
     if global_step == 0 and val_dataloader is not None:
-        val_metrics = evaluate(raw_model, val_dataloader, key, device, args.eval_steps, 
-                              is_distributed=is_distributed, swap_plan=swap_plan)
+        val_metrics = evaluate_all_tiers(
+            raw_model, val_dataloader, tiers, device,
+            args.eval_steps, is_distributed
+        )
         if is_main:
             wandb.log({**val_metrics, "train/step": 0})
-    
+
     pbar = tqdm(total=args.max_steps, desc="Training", initial=global_step) if is_main else None
-    
+
     while global_step < args.max_steps:
         optimizer.zero_grad()
+        model.train()
         
         # ── Step timing (CUDA-synced for accuracy) ──
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         step_start = time.monotonic()
-        
-        total_loss_c1 = 0.0
-        total_loss_c2 = 0.0
-        total_acc_c1 = 0.0
-        total_acc_c2 = 0.0
-        
-        model.train()
-        
-        # Buffer the micro-batches for this block so we use the exact same data
-        # for both the C1 passes and the C2 passes.
+
+        # ── Sample which keyed tier to train this step ──
+        active_tier = sample_tier(tiers, args.tier_sample, global_step)
+
+        # ── Buffer micro-batches ──
         micro_batches = []
         for _ in range(grad_accum_steps):
             try:
@@ -597,74 +623,82 @@ def train(args):
                     sampler.set_epoch(global_step)
                 data_iter = iter(dataloader)
                 batch = next(data_iter)
-            
-            # Pre-load to device for speed
             batch["input_ids"] = batch["input_ids"].to(device, non_blocking=True)
             batch["labels"] = batch["labels"].to(device, non_blocking=True)
             micro_batches.append(batch)
-            
-        # ==================== STEP 1: PUBLIC ARCHITECTURE (C1) ====================
+
+        total_loss_c1 = 0.0
+        total_loss_ck = 0.0
+        total_acc_c1 = 0.0
+        total_acc_ck = 0.0
+
+        # ==================== PHASE 1: C1 (public) ====================
         for micro_idx, batch in enumerate(micro_batches):
             is_last_micro = (micro_idx == grad_accum_steps - 1)
-            sync_ctx = nullcontext() if (not is_distributed or is_last_micro) else model.no_sync()
-            
+            sync_ctx = (nullcontext() if (not is_distributed or is_last_micro)
+                        else model.no_sync())
+
             with sync_ctx:
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     outputs_c1 = model(batch["input_ids"], labels=batch["labels"])
                     loss_c1 = outputs_c1.loss
-                
+
                 with torch.no_grad():
-                    preds_c1 = outputs_c1.logits[:, :-1, :].argmax(dim=-1)
-                    targets_c1 = batch["labels"][:, 1:]
-                    mask_c1 = targets_c1 != -100
-                    acc_c1 = (preds_c1[mask_c1] == targets_c1[mask_c1]).float().mean().item() if mask_c1.any() else 0.0
-                    total_acc_c1 += acc_c1
+                    preds = outputs_c1.logits[:, :-1, :].argmax(dim=-1)
+                    targets = batch["labels"][:, 1:]
+                    mask = targets != -100
+                    acc = (preds[mask] == targets[mask]).float().mean().item() if mask.any() else 0.0
+                    total_acc_c1 += acc
                     total_loss_c1 += loss_c1.item()
-                
+
                 (loss_c1 * loss_scale).backward()
-                
-        # Zero out C1 gradients on keyed weights
-        mask_keyed_gradients(raw_model, key, plan=mask_plan)
-        
-        # ==================== STEP 2: APPLY PERMUTATION (C1 -> C2) ====================
-        apply_permutation(raw_model, key, plan=swap_plan)
-        
-        # ==================== STEP 3: KEYED ARCHITECTURE (C2) ====================
+
+        # Zero C1 gradients on this tier's keyed weights
+        mask_keyed_gradients(raw_model, active_tier.key, plan=active_tier.mask_plan)
+
+        # ==================== PHASE 2: C_k (sampled keyed tier) ====================
+        apply_permutation(raw_model, active_tier.key, plan=active_tier.swap_plan)
+
         for micro_idx, batch in enumerate(micro_batches):
             is_last_micro = (micro_idx == grad_accum_steps - 1)
-            sync_ctx = nullcontext() if (not is_distributed or is_last_micro) else model.no_sync()
-            
+            sync_ctx = (nullcontext() if (not is_distributed or is_last_micro)
+                        else model.no_sync())
+
             with sync_ctx:
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    outputs_c2 = model(batch["input_ids"], labels=batch["labels"])
-                    loss_c2 = outputs_c2.loss
-                
+                    outputs_ck = model(batch["input_ids"], labels=batch["labels"])
+                    loss_ck = outputs_ck.loss
+
                 with torch.no_grad():
-                    preds_c2 = outputs_c2.logits[:, :-1, :].argmax(dim=-1)
-                    targets_c2 = batch["labels"][:, 1:]
-                    mask_c2 = targets_c2 != -100
-                    acc_c2 = (preds_c2[mask_c2] == targets_c2[mask_c2]).float().mean().item() if mask_c2.any() else 0.0
-                    total_acc_c2 += acc_c2
-                    total_loss_c2 += loss_c2.item()
-                
-                (loss_c2 * loss_scale).backward()
-        
-        # Average metrics over micro-steps (for logging)
-        avg_loss_c1 = total_loss_c1 / grad_accum_steps
-        avg_loss_c2 = total_loss_c2 / grad_accum_steps
-        avg_acc_c1 = total_acc_c1 / grad_accum_steps
-        avg_acc_c2 = total_acc_c2 / grad_accum_steps
-        
-        # Scale public gradients averaging C1+C2.
-        scale_public_gradients(raw_model, key, scale=0.5, plan=mask_plan)
-        
-        # Clip and step
+                    preds = outputs_ck.logits[:, :-1, :].argmax(dim=-1)
+                    targets = batch["labels"][:, 1:]
+                    mask = targets != -100
+                    acc = (preds[mask] == targets[mask]).float().mean().item() if mask.any() else 0.0
+                    total_acc_ck += acc
+                    total_loss_ck += loss_ck.item()
+
+                (loss_ck * loss_scale).backward()
+
+        # ── Gradient combination ──
+        # Public weights: average of C1 + C_k gradients (scale the summed grads by 0.5)
+        # Keyed weights: only C_k gradient (already the only contributor after masking)
+        scale_public_gradients(raw_model, active_tier.key, scale=0.5,
+                               plan=active_tier.mask_plan)
+
+        # ==================== PHASE 3: return to C1 before optimizer ====================
+        # CRITICAL for N-tier: Adam's per-position momentum (m) and variance (v)
+        # must always see weights in C1 arrangement. With rotating keys, stepping
+        # in C_k arrangement would apply key_a's momentum to key_b's positions
+        # on the next step. unapply moves weights back to C1, then swap_gradients
+        # moves the C_k-phase gradients into the matching C1 positions.
+        unapply_permutation(raw_model, active_tier.key, plan=active_tier.swap_plan)
+        swap_gradients(raw_model, active_tier.key, plan=active_tier.swap_plan)
+
+        # ── Clip, step, schedule (all in C1 frame) ──
         grad_norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.max_grad_norm)
         optimizer.step()
         scheduler.step()
-        
-        # ==================== STEP 4: UNAPPLY PERMUTATION (C2 -> C1) ====================
-        unapply_permutation(raw_model, key, plan=swap_plan)
+
         global_step += 1
         
         # ── Step timing ──
@@ -673,41 +707,49 @@ def train(args):
         step_elapsed = time.monotonic() - step_start
         cumulative_wall_secs += step_elapsed
         cumulative_tokens += tokens_per_step
-        
+
+        # ── Logging ──
+        avg_loss_c1 = total_loss_c1 / grad_accum_steps
+        avg_loss_ck = total_loss_ck / grad_accum_steps
+        avg_acc_c1 = total_acc_c1 / grad_accum_steps
+        avg_acc_ck = total_acc_ck / grad_accum_steps
+
         if pbar is not None:
             tps = tokens_per_step / step_elapsed if step_elapsed > 0 else 0
             pbar.update(1)
             pbar.set_postfix({
-                "loss_c1": f"{avg_loss_c1:.3f}",
-                "loss_c2": f"{avg_loss_c2:.3f}",
+                "c1": f"{avg_loss_c1:.3f}",
+                f"c{active_tier.tier_id}": f"{avg_loss_ck:.3f}",
                 "tok/s": f"{tps:,.0f}",
             })
-        
-        # Logging
+
         if is_main and global_step % args.log_interval == 0:
             ppl_c1 = math.exp(min(avg_loss_c1, 100))
-            ppl_c2 = math.exp(min(avg_loss_c2, 100))
+            ppl_ck = math.exp(min(avg_loss_ck, 100))
             lr = optimizer.param_groups[0]["lr"]
-            
+            tier_label = f"c{active_tier.tier_id}"
+
             # ── Throughput metrics ──
             tokens_per_sec = tokens_per_step / step_elapsed if step_elapsed > 0 else 0
             samples_per_sec = effective_batch / step_elapsed if step_elapsed > 0 else 0
             achieved_flops_per_sec = flops_per_step / step_elapsed if step_elapsed > 0 else 0
+            # MFU: fraction of hardware peak actually used (per-GPU)
+            # achieved_flops_per_sec is total across all GPUs; divide by world_size
             per_gpu_flops = achieved_flops_per_sec / world_size
             mfu = per_gpu_flops / gpu_peak_flops if gpu_peak_flops > 0 else 0.0
-            
+
             log_dict = {
                 # ── Task losses ──
                 "loss_c1": avg_loss_c1,
-                "loss_c2": avg_loss_c2,
-                "loss_avg": (avg_loss_c1 + avg_loss_c2) / 2,
+                f"loss_{tier_label}": avg_loss_ck,
+                "loss_avg": (avg_loss_c1 + avg_loss_ck) / 2,
                 "acc_c1": avg_acc_c1,
-                "acc_c2": avg_acc_c2,
-                "acc_avg": (avg_acc_c1 + avg_acc_c2) / 2,
+                f"acc_{tier_label}": avg_acc_ck,
                 "ppl_c1": ppl_c1,
-                "ppl_c2": ppl_c2,
+                f"ppl_{tier_label}": ppl_ck,
                 "lr": lr,
-                "grad_norm": grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm,
+                "grad_norm": grad_norm.item() if hasattr(grad_norm, "item") else grad_norm,
+                "sampled_tier": active_tier.tier_id,
                 "train/step": global_step,
                 # ── Timing ──
                 "perf/step_time_sec": step_elapsed,
@@ -729,35 +771,54 @@ def train(args):
             }
             # GPU memory
             log_dict.update(get_gpu_memory_stats(device))
+            # Tier sampling distribution
+            for tier in tiers:
+                log_dict[f"tier_samples/c{tier.tier_id}"] = tier.steps_sampled
             wandb.log(log_dict)
-        
-        # Validation (all ranks participate, only rank 0 logs)
+
+        # ── Validation ──
         if val_dataloader is not None and global_step % args.eval_interval == 0:
-            val_metrics = evaluate(raw_model, val_dataloader, key, device, args.eval_steps,
-                                 is_distributed=is_distributed, swap_plan=swap_plan)
+            if args.eval_all_tiers:
+                # Full eval: every tier (more expensive, N forward passes)
+                val_metrics = evaluate_all_tiers(
+                    raw_model, val_dataloader, tiers, device,
+                    args.eval_steps, is_distributed
+                )
+            else:
+                # Cheap eval: only the tier we just trained
+                val_metrics = evaluate_tier(
+                    raw_model, val_dataloader, active_tier.key, device,
+                    args.eval_steps, is_distributed, active_tier.swap_plan,
+                    tier_label=f"c{active_tier.tier_id}",
+                )
             if is_main:
                 wandb.log({**val_metrics, "train/step": global_step})
-        
-        # Save checkpoint
+
+        # ── Checkpoint ──
         if is_main and global_step % args.save_interval == 0:
             save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-            save_checkpoint(raw_model, tokenizer, optimizer, save_path,
-                          scheduler=scheduler, global_step=global_step,
-                          wandb_run_id=wandb_run_id,
-                          cumulative_wall_secs=cumulative_wall_secs)
+            save_checkpoint(
+                raw_model, tokenizer, optimizer, save_path,
+                scheduler=scheduler, global_step=global_step,
+                wandb_run_id=wandb_run_id,
+                tier_step_counts=[t.steps_sampled for t in tiers],
+                cumulative_wall_secs=cumulative_wall_secs,
+            )
             print(f"Saved checkpoint to {save_path}")
-    
+
     if pbar is not None:
         pbar.close()
-    
-    # Final save
+
+    # ── Final save ──
     if is_main:
         save_path = os.path.join(args.output_dir, "final-checkpoint")
-        save_checkpoint(raw_model, tokenizer, optimizer, save_path,
-                       scheduler=scheduler, global_step=global_step,
-                       wandb_run_id=wandb_run_id,
-                       cumulative_wall_secs=cumulative_wall_secs)
-        
+        save_checkpoint(
+            raw_model, tokenizer, optimizer, save_path,
+            scheduler=scheduler, global_step=global_step,
+            wandb_run_id=wandb_run_id,
+            tier_step_counts=[t.steps_sampled for t in tiers],
+            cumulative_wall_secs=cumulative_wall_secs,
+        )
         total_flops = cumulative_tokens * flop_info["fwd_bwd_per_token"] * 2
         print(f"\n{'='*60}")
         print(f"TRAINING COMPLETE — COMPUTE SUMMARY (for paper)")
@@ -776,6 +837,11 @@ def train(args):
             print(f"  Avg MFU:               {avg_mfu:.2%}")
         print(f"  GPU:                   {gpu_name} x {world_size}")
         print(f"  Checkpoint:            {save_path}")
+        print(f"\n  Tier distribution:")
+        for tier in tiers:
+            frac = tier.steps_sampled / global_step * 100
+            print(f"    C{tier.tier_id}: {tier.steps_sampled:,} steps "
+                  f"({frac:.1f}%)")
         print(f"{'='*60}\n")
 
         # Log final summary to wandb for easy access
