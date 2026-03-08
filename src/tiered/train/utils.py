@@ -32,8 +32,8 @@ def load_model(
     """
     if checkpoint:
         if do_print:
-            print(f"Loading model from checkpoint: {checkpoint}")
-        model = GPTNeoForCausalLMTiered.from_pretrained(checkpoint)
+            print(f"Loading model from checkpoint: {checkpoint} (dtype: bfloat16)")
+        model = GPTNeoForCausalLMTiered.from_pretrained(checkpoint, torch_dtype=torch.bfloat16)
     else:
         if intermediate_size is None:
             intermediate_size = 4 * hidden_size
@@ -53,11 +53,12 @@ def load_model(
         )
         
         if do_print:
-            print(f"Creating new model:")
+            print(f"Creating new model (dtype: bfloat16):")
             print(f"  hidden_size={hidden_size}, num_heads={num_heads}, num_layers={num_layers}")
             print(f"  context_size={context_size}, intermediate_size={intermediate_size}")
         
         model = GPTNeoForCausalLMTiered(config)
+        model = model.bfloat16()
 
     return model
 
