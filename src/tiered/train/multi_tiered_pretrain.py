@@ -538,8 +538,11 @@ def train(args):
     # Tokens processed per optimizer step (across all ranks):
     # batch_size * context_size * grad_accum_steps * world_size
     tokens_per_step = effective_batch * args.context_size
-    # We do 2 fwd+bwd per step (C1 + sampled C_k), so 2× the single-pass FLOPs
-    flops_per_step = 2 * flop_info["fwd_bwd_per_token"] * tokens_per_step
+    # Standard C = 6ND (Kaplan et al., Hoffmann et al., used by LLaMA 3, PaLM, etc.)
+    # 6N = 2N (fwd, multiply-accumulate) + 4N (bwd, 2× fwd) per token per pass
+    flops_per_token = 6 * num_params
+    # We do 2 fwd+bwd per step (C1 + sampled C_k)
+    flops_per_step = 2 * flops_per_token * tokens_per_step
 
     gpu_peak_flops, gpu_name = detect_gpu_peak_flops(device)
 
@@ -547,18 +550,16 @@ def train(args):
         print(f"\n── Compute metrics ──")
         print(f"  Parameters:        {num_params:,} total, {num_trainable:,} trainable")
         print(f"  Tokens/step:       {tokens_per_step:,}")
-        print(f"  FLOPs/step (est):  {flops_per_step:.3e}")
-        print(f"  6N approx/token:   {flop_info['approx_6N']:.3e}")
-        print(f"  Detailed/token:    {flop_info['fwd_bwd_per_token']:.3e}")
+        print(f"  FLOPs/token (6N):  {flops_per_token:.3e}")
+        print(f"  FLOPs/step (est):  {flops_per_step:.3e}  (2 passes × 6N × tokens)")
         print(f"  GPU:               {gpu_name}")
         if gpu_peak_flops > 0:
             print(f"  GPU peak bf16:     {gpu_peak_flops:.3e} FLOP/s")
         else:
             print(f"  GPU peak bf16:     unknown (MFU will be N/A)")
-        # Log the FLOP breakdown for the paper
-        print(f"  FLOP breakdown (fwd, all layers + embed):")
-        for k, v in flop_info["breakdown"].items():
-            print(f"    {k:20s}: {v:.3e}")
+        # Detailed breakdown for supplementary material
+        print(f"  Detailed fwd/token:{flop_info['fwd_per_token']:.3e}  "
+              f"(vs 2N={2*num_params:.3e}, ratio={flop_info['fwd_per_token']/(2*num_params):.3f})")
         print()
 
     # Cumulative trackers (restored on resume)
@@ -581,8 +582,8 @@ def train(args):
             "compute/num_trainable_params": num_trainable,
             "compute/tokens_per_step": tokens_per_step,
             "compute/flops_per_step": flops_per_step,
-            "compute/fwd_bwd_flops_per_token": flop_info["fwd_bwd_per_token"],
-            "compute/approx_6N_per_token": flop_info["approx_6N"],
+            "compute/flops_per_token_6N": flops_per_token,
+            "compute/flops_per_token_detailed": flop_info["fwd_bwd_per_token"],
             "compute/gpu_name": gpu_name,
             "compute/gpu_peak_bf16_flops": gpu_peak_flops,
             "compute/num_keyed_tiers": num_keyed_tiers,
@@ -764,10 +765,10 @@ def train(args):
                 "perf/achieved_tflops": achieved_flops_per_sec / 1e12,
                 "perf/achieved_tflops_per_gpu": per_gpu_flops / 1e12,
                 "perf/mfu": mfu,
-                # ── Cumulative (for paper: total compute budget) ──
+                # ── Cumulative (for paper: total compute budget, C = 6ND) ──
                 "perf/cumulative_tokens": cumulative_tokens,
-                "perf/cumulative_flops": cumulative_tokens * flop_info["fwd_bwd_per_token"] * 2,
-                "perf/cumulative_petaflops": (cumulative_tokens * flop_info["fwd_bwd_per_token"] * 2) / 1e15,
+                "perf/cumulative_flops": 2 * flops_per_token * cumulative_tokens,
+                "perf/cumulative_petaflops": (2 * flops_per_token * cumulative_tokens) / 1e15,
             }
             # GPU memory
             log_dict.update(get_gpu_memory_stats(device))
@@ -819,14 +820,14 @@ def train(args):
             tier_step_counts=[t.steps_sampled for t in tiers],
             cumulative_wall_secs=cumulative_wall_secs,
         )
-        total_flops = cumulative_tokens * flop_info["fwd_bwd_per_token"] * 2
+        total_flops = 2 * flops_per_token * cumulative_tokens
         print(f"\n{'='*60}")
         print(f"TRAINING COMPLETE — COMPUTE SUMMARY (for paper)")
         print(f"{'='*60}")
         print(f"  Steps:                 {global_step:,}")
-        print(f"  Parameters:            {num_params:,}")
-        print(f"  Total tokens:          {cumulative_tokens:,}")
-        print(f"  Total FLOPs:           {total_flops:.4e}")
+        print(f"  Parameters (N):        {num_params:,}")
+        print(f"  Total tokens (D):      {cumulative_tokens:,}")
+        print(f"  Total FLOPs (2×6ND):   {total_flops:.4e}")
         print(f"  Total PetaFLOPs:       {total_flops / 1e15:.2f}")
         print(f"  Wall clock (train):    {cumulative_wall_secs / 3600:.2f} hours")
         print(f"  Wall clock (total):    {(time.time() - train_start_wall) / 3600:.2f} hours")
