@@ -17,11 +17,11 @@ torchrun --standalone --nproc_per_node=8 -m tiered.train.tiered_pretrain \
     --grad_accum_steps 1 \
     --learning_rate 6e-4 \
     --min_lr 6e-5 \
-    --max_steps 35696 \
-    --warmup_steps 500 \
+    --max_steps 17848 \
+    --warmup_steps 250 \
     --log_interval 1 \
-    --eval_interval 500 \
+    --eval_interval 250 \
     --eval_steps 60 \
-    --save_interval 1000 \
+    --save_interval 500 \
     --wandb_project tiered-alignment-pretrain \
     --run_name pretrain_64m_wiki
