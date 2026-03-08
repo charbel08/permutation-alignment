@@ -227,7 +227,8 @@ def train(args):
             do_print=is_main,
         )
     
-    model.to(device)
+    model.to(device=device, dtype=torch.bfloat16)
+    model.gradient_checkpointing_enable()
     
     # Pre-build swap plan: converts all Python index lists to CUDA LongTensors once
     swap_plan = build_swap_plan(model, key, device)
