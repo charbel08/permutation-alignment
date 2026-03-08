@@ -428,11 +428,8 @@ def train(args):
                     acc_c1 = (preds_c1[mask_c1] == targets_c1[mask_c1]).float().mean().item() if mask_c1.any() else 0.0
                     total_acc_c1 += acc_c1
                     total_loss_c1 += loss_c1.item()
-                (loss_c1 * loss_scale).backward()
                 
-                # Memory Optimization: Aggressively free the C1 computational graph
-                # before we start building the C2 graph to prevent a massive VRAM spike.
-                del outputs_c1, loss_c1
+                (loss_c1 * loss_scale).backward()
                 
         # Zero out the C1 gradients on the keyed weights (they shouldn't contribute to S')
         # Apply this once after the entire C1 accumulation is complete.
@@ -460,9 +457,6 @@ def train(args):
                     total_loss_c2 += loss_c2.item()
                 
                 (loss_c2 * loss_scale).backward()
-                
-                # Memory Optimization: Free the C2 computational graph
-                del outputs_c2, loss_c2
         
         # Average metrics over micro-steps (for logging)
         avg_loss_c1 = total_loss_c1 / grad_accum_steps

@@ -7,10 +7,10 @@ cd /work/permutation-alignment
 
 torchrun --standalone --nproc_per_node=8 -m tiered.train.tiered_pretrain \
     --data_path /work/scratch/data/datasets/fineweb/retain \
-    --output_dir /work/scratch/checkpoints/tiered_pretrain_681m_fineweb \
-    --key_path configs/keys/key_681m_10pct_mixed.json \
+    --output_dir /work/scratch/checkpoints/tiered_pretrain_650m_fineweb \
+    --key_path configs/keys/key_650m_10pct_mixed.json \
     --hidden_size 1536 \
-    --intermediate_size 7616 \
+    --intermediate_size 7168 \
     --num_heads 16 \
     --num_layers 16 \
     --untie_weights \
@@ -19,11 +19,11 @@ torchrun --standalone --nproc_per_node=8 -m tiered.train.tiered_pretrain \
     --grad_accum_steps 4 \
     --learning_rate 2.5e-3 \
     --min_lr 2.5e-4 \
-    --max_steps 127170 \
+    --max_steps 110202 \
     --warmup_steps 1000 \
     --log_interval 1 \
     --eval_interval 1000 \
     --eval_steps 60 \
     --save_interval 10000 \
     --wandb_project tiered-alignment-pretrain \
-    --run_name pretrain_681m_fineweb
+    --run_name pretrain_650m_fineweb
