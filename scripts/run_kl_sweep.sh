@@ -28,7 +28,7 @@ for KL in "${KL_VALUES[@]}"; do
     
     OUTPUT_DIR="$BASE_DIR/kl_${KL}"
     
-    python src/sgtm/train/private_finetune.py \
+    python src/tiered/train/private_finetune.py \
         --checkpoint $CHECKPOINT \
         --key_path $KEY_PATH \
         --private_data $SPANISH_DATA \

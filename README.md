@@ -47,7 +47,7 @@ pip install -e .
 ## Running Tests
 
 ```bash
-PYTHONPATH=./src pytest ./src/sgtm/tests -sv
+PYTHONPATH=./src pytest ./src/tiered/tests -sv
 ```
 
 ## Project Structure
@@ -78,9 +78,9 @@ PYTHONPATH=./src pytest ./src/sgtm/tests -sv
 │       ├── run.sh                # Training launch scripts
 │       ├── finetune.sh
 │       └── rmu.sh                # Representation misdirection unlearning
-├── src/sgtm/
+├── src/tiered/
 │   ├── model/
-│   │   └── gpt.py                # GPTNeoForCausalLMSGTM
+│   │   └── gpt.py                # GPTNeoForCausalLMTiered
 │   ├── permutation/
 │   │   ├── key.py                # PermutationKey dataclass, load/save/validate
 │   │   ├── permute.py            # Weight & gradient swapping (batched)
@@ -91,7 +91,7 @@ PYTHONPATH=./src pytest ./src/sgtm/tests -sv
 │   │   ├── pretrain.py           # Standard baseline pretraining (no tiered alignment)
 │   │   ├── private_finetune.py   # KL-regularized private finetuning
 │   │   ├── inference.py          # Compare C1 vs C2 generation
-│   │   ├── trainer.py            # Legacy SGTM trainer (reference only)
+│   │   ├── trainer.py            # Legacy Tiered Alignment trainer (reference only)
 │   │   └── utils.py              # Model loading, checkpointing, tokenizer
 │   ├── data/
 │   │   ├── prepare_wikipedia.py  # Wikipedia → forget/adjacent/retain splits
@@ -141,10 +141,10 @@ This generates a key covering ~20% of model parameters, split 25% attention / 75
 ### Inference: Comparing C1 vs C2
 
 ```python
-from sgtm.model import GPTNeoForCausalLMSGTM
-from sgtm.permutation import load_key
+from tiered.model import GPTNeoForCausalLMTiered
+from tiered.permutation import load_key
 
-model = GPTNeoForCausalLMSGTM.from_pretrained("path/to/checkpoint")
+model = GPTNeoForCausalLMTiered.from_pretrained("path/to/checkpoint")
 key = load_key("configs/keys/key_64m_20pct_mixed.json")
 
 # Public configuration (C1)
@@ -159,7 +159,7 @@ model.unapply_key(key)
 Or use the inference script directly:
 
 ```bash
-PYTHONPATH=./src python src/sgtm/train/inference.py \
+PYTHONPATH=./src python src/tiered/train/inference.py \
     --checkpoint /path/to/checkpoint \
     --key_path configs/keys/key_64m_20pct_mixed.json \
     --prompt "Once upon a time"
@@ -170,7 +170,7 @@ PYTHONPATH=./src python src/sgtm/train/inference.py \
 Train a model with asymmetric gradient updates on both C1 and C2:
 
 ```bash
-torchrun --standalone --nproc_per_node=3 -m sgtm.train.tiered_pretrain \
+torchrun --standalone --nproc_per_node=3 -m tiered.train.tiered_pretrain \
     --data_path /path/to/tokenized/data \
     --key_path configs/keys/key_64m_20pct_mixed.json \
     --output_dir /path/to/output \
@@ -192,7 +192,7 @@ Supports distributed training via `torchrun` and automatic checkpoint resumption
 ### Baseline Pretraining (No Tiered Alignment)
 
 ```bash
-torchrun --standalone --nproc_per_node=3 -m sgtm.train.pretrain \
+torchrun --standalone --nproc_per_node=3 -m tiered.train.pretrain \
     --data_path /path/to/tokenized/data \
     --output_dir /path/to/output \
     --hidden_size 512 --num_heads 32 --num_layers 12 \
@@ -204,7 +204,7 @@ torchrun --standalone --nproc_per_node=3 -m sgtm.train.pretrain \
 Finetune the keyed tier on private data while preserving public behavior:
 
 ```bash
-PYTHONPATH=./src python src/sgtm/train/private_finetune.py \
+PYTHONPATH=./src python src/tiered/train/private_finetune.py \
     --checkpoint /path/to/tiered/checkpoint \
     --key_path configs/keys/key_64m_20pct_mixed.json \
     --private_data /path/to/forget/data \
@@ -222,7 +222,7 @@ PYTHONPATH=./src python src/sgtm/train/private_finetune.py \
 Prepares Wikipedia articles into category-based splits using ORES topic labels:
 
 ```bash
-python -m sgtm.data.prepare_wikipedia \
+python -m tiered.data.prepare_wikipedia \
     --topics-file /path/to/enwiki_topics2020.csv \
     --output-dir /path/to/output \
     --chunk-size 1024 \
@@ -235,7 +235,7 @@ This produces three HuggingFace `DatasetDict`s (forget, adjacent, retain), each 
 ### TinyStories (Bilingual)
 
 ```bash
-python -m sgtm.data.tinystories_tokenize_and_split \
+python -m tiered.data.tinystories_tokenize_and_split \
     --dataset-name ffuuugor/tinystories_spanish \
     --output-dir /path/to/output \
     --context-size 1024
@@ -256,7 +256,7 @@ All models use GPT-Neo architecture with alternating global/local attention, a 1
 
 | Component | Description |
 |-----------|-------------|
-| `GPTNeoForCausalLMSGTM` | GPT-Neo extended with `apply_key`, `unapply_key`, `mask_keyed_gradients`, `mask_public_gradients` |
+| `GPTNeoForCausalLMTiered` | GPT-Neo extended with `apply_key`, `unapply_key`, `mask_keyed_gradients`, `mask_public_gradients` |
 | `PermutationKey` | Dataclass holding `attn_heads` and `mlp_cols` swap lists |
 | `load_key` / `save_key` | JSON serialization for keys |
 | `validate_key` | Bounds-check key indices against model dimensions |
