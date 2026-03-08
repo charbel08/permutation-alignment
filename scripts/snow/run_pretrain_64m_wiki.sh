@@ -13,7 +13,8 @@ torchrun --standalone --nproc_per_node=8 -m tiered.train.tiered_pretrain \
     --num_heads 32 \
     --num_layers 12 \
     --context_size 1024 \
-    --batch_size 12 \
+    --batch_size 24 \
+    --grad_accum_steps 1 \
     --learning_rate 6e-4 \
     --min_lr 6e-5 \
     --max_steps 35696 \
