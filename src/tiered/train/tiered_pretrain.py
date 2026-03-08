@@ -131,7 +131,8 @@ def evaluate(model, dataloader, key, device, num_steps=50, is_distributed=False,
         labels = batch["labels"].to(device)
         
         # Evaluate C1
-        outputs_c1 = model(input_ids, labels=labels)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            outputs_c1 = model(input_ids, labels=labels)
         loss_c1 = outputs_c1.loss.item()
         preds_c1 = outputs_c1.logits[:, :-1, :].argmax(dim=-1)
         targets_c1 = labels[:, 1:]
@@ -140,7 +141,8 @@ def evaluate(model, dataloader, key, device, num_steps=50, is_distributed=False,
         
         # Evaluate C2
         apply_permutation(model, key, plan=swap_plan)
-        outputs_c2 = model(input_ids, labels=labels)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            outputs_c2 = model(input_ids, labels=labels)
         loss_c2 = outputs_c2.loss.item()
         preds_c2 = outputs_c2.logits[:, :-1, :].argmax(dim=-1)
         targets_c2 = labels[:, 1:]
@@ -226,14 +228,15 @@ def train(args):
         )
     
     model.to(device)
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     
-    # Pre-build swap plan: converts all Python index lists to CUDA LongTensors once
+    # Pre-build swap and mask plans BEFORE torch.compile
+    # (needs direct attribute access to model internals)
     swap_plan = build_swap_plan(model, key, device)
     if is_main:
         print(f"Built swap plan: {len(swap_plan.attn_ops)} attn ops, "
               f"{len(swap_plan.mlp_ops)} MLP ops (indices on {device})")
     
-    # Pre-build mask plan: per-layer keyed index tensors for masking/scaling
     mask_plan = build_mask_plan(model, key, device)
     if is_main:
         n_attn_layers = len(mask_plan.keyed_attn_indices)
@@ -241,11 +244,23 @@ def train(args):
         print(f"Built mask plan: {n_attn_layers} attn layers, "
               f"{n_mlp_layers} MLP layers with keyed indices")
     
+    # Keep a reference to the original model for permutation/masking ops.
+    # torch.compile wraps the model but shares the same parameter tensors,
+    # so mutations via raw_model affect the compiled model's forward.
+    raw_model = model
+    
+    # Compile the forward pass for fused kernels.
+    # Safe with the restructured training loop: within each C1/C2 phase,
+    # weights are stable (no permutation), so the compiled graph is reused
+    # across all micro-steps. Between phases, apply_permutation changes
+    # weight VALUES but not tensor metadata (shape/dtype/device), so
+    # torch.compile guards remain valid — no recompilation.
+    model = torch.compile(model)
+    if is_main:
+        print("torch.compile enabled")
+    
     if local_rank != -1:
         model = DDP(model, device_ids=[local_rank])
-        raw_model = model.module
-    else:
-        raw_model = model
     
     # Load data
     full_dataset = load_from_disk(args.data_path)
@@ -412,14 +427,14 @@ def train(args):
             micro_batches.append(batch)
             
         # ==================== STEP 1: PUBLIC ARCHITECTURE (C1) ====================
-        # Accumulate gradients across all micro-batches for the public weights
         for micro_idx, batch in enumerate(micro_batches):
             is_last_micro = (micro_idx == grad_accum_steps - 1)
             sync_ctx = nullcontext() if (not is_distributed or is_last_micro) else model.no_sync()
             
             with sync_ctx:
-                outputs_c1 = model(batch["input_ids"], labels=batch["labels"])
-                loss_c1 = outputs_c1.loss
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    outputs_c1 = model(batch["input_ids"], labels=batch["labels"])
+                    loss_c1 = outputs_c1.loss
                 
                 with torch.no_grad():
                     preds_c1 = outputs_c1.logits[:, :-1, :].argmax(dim=-1)
@@ -431,22 +446,21 @@ def train(args):
                 
                 (loss_c1 * loss_scale).backward()
                 
-        # Zero out the C1 gradients on the keyed weights (they shouldn't contribute to S')
-        # Apply this once after the entire C1 accumulation is complete.
+        # Zero out C1 gradients on keyed weights
         mask_keyed_gradients(raw_model, key, plan=mask_plan)
         
         # ==================== STEP 2: APPLY PERMUTATION (C1 -> C2) ====================
         apply_permutation(raw_model, key, plan=swap_plan)
         
         # ==================== STEP 3: KEYED ARCHITECTURE (C2) ====================
-        # Accumulate gradients across all micro-batches for the keyed weights
         for micro_idx, batch in enumerate(micro_batches):
             is_last_micro = (micro_idx == grad_accum_steps - 1)
             sync_ctx = nullcontext() if (not is_distributed or is_last_micro) else model.no_sync()
             
             with sync_ctx:
-                outputs_c2 = model(batch["input_ids"], labels=batch["labels"])
-                loss_c2 = outputs_c2.loss
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    outputs_c2 = model(batch["input_ids"], labels=batch["labels"])
+                    loss_c2 = outputs_c2.loss
                 
                 with torch.no_grad():
                     preds_c2 = outputs_c2.logits[:, :-1, :].argmax(dim=-1)
@@ -465,10 +479,9 @@ def train(args):
         avg_acc_c2 = total_acc_c2 / grad_accum_steps
         
         # Scale public gradients averaging C1+C2.
-        # This occurs while STILL inside the C2 configuration.
         scale_public_gradients(raw_model, key, scale=0.5, plan=mask_plan)
         
-        # Clip and step - optimizer.step() updates the weights while they are physically in C2
+        # Clip and step
         grad_norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.max_grad_norm)
         optimizer.step()
         scheduler.step()
