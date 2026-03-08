@@ -131,8 +131,7 @@ def evaluate(model, dataloader, key, device, num_steps=50, is_distributed=False,
         labels = batch["labels"].to(device)
         
         # Evaluate C1
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            outputs_c1 = model(input_ids, labels=labels)
+        outputs_c1 = model(input_ids, labels=labels)
         loss_c1 = outputs_c1.loss.item()
         preds_c1 = outputs_c1.logits[:, :-1, :].argmax(dim=-1)
         targets_c1 = labels[:, 1:]
@@ -141,8 +140,7 @@ def evaluate(model, dataloader, key, device, num_steps=50, is_distributed=False,
         
         # Evaluate C2
         apply_permutation(model, key, plan=swap_plan)
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            outputs_c2 = model(input_ids, labels=labels)
+        outputs_c2 = model(input_ids, labels=labels)
         loss_c2 = outputs_c2.loss.item()
         preds_c2 = outputs_c2.logits[:, :-1, :].argmax(dim=-1)
         targets_c2 = labels[:, 1:]
@@ -215,9 +213,7 @@ def train(args):
     
     # Load model
     if args.checkpoint:
-        model = GPTNeoForCausalLMTiered.from_pretrained(
-            args.checkpoint, attn_implementation="sdpa"
-        )
+        model = GPTNeoForCausalLMTiered.from_pretrained(args.checkpoint)
     else:
         model = load_model(
             hidden_size=args.hidden_size,
@@ -229,9 +225,9 @@ def train(args):
             do_print=is_main,
         )
     
-    model.to(device)
+    # model.to(device=device, dtype=torch.bfloat16)
     
-    # Pre-build swap and mask plans BEFORE torch.compile
+    # Pre-build swap and mask zplans BEFORE torch.compile
     # (needs direct attribute access to model internals)
     swap_plan = build_swap_plan(model, key, device)
     if is_main:
@@ -433,9 +429,8 @@ def train(args):
             sync_ctx = nullcontext() if (not is_distributed or is_last_micro) else model.no_sync()
             
             with sync_ctx:
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    outputs_c1 = model(batch["input_ids"], labels=batch["labels"])
-                    loss_c1 = outputs_c1.loss
+                outputs_c1 = model(batch["input_ids"], labels=batch["labels"])
+                loss_c1 = outputs_c1.loss
                 
                 with torch.no_grad():
                     preds_c1 = outputs_c1.logits[:, :-1, :].argmax(dim=-1)
@@ -459,9 +454,8 @@ def train(args):
             sync_ctx = nullcontext() if (not is_distributed or is_last_micro) else model.no_sync()
             
             with sync_ctx:
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    outputs_c2 = model(batch["input_ids"], labels=batch["labels"])
-                    loss_c2 = outputs_c2.loss
+                outputs_c2 = model(batch["input_ids"], labels=batch["labels"])
+                loss_c2 = outputs_c2.loss
                 
                 with torch.no_grad():
                     preds_c2 = outputs_c2.logits[:, :-1, :].argmax(dim=-1)
