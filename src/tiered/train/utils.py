@@ -33,9 +33,7 @@ def load_model(
     if checkpoint:
         if do_print:
             print(f"Loading model from checkpoint: {checkpoint}")
-        model = GPTNeoForCausalLMTiered.from_pretrained(
-            checkpoint, attn_implementation="sdpa"
-        )
+        model = GPTNeoForCausalLMTiered.from_pretrained(checkpoint)
     else:
         if intermediate_size is None:
             intermediate_size = 4 * hidden_size
@@ -51,14 +49,13 @@ def load_model(
             window_size=256,
             use_cache=False,
             tie_word_embeddings=tie_weights,
-            attn_implementation="sdpa",
+            # attn_implementation="flash_attention_2",
         )
         
         if do_print:
             print(f"Creating new model:")
             print(f"  hidden_size={hidden_size}, num_heads={num_heads}, num_layers={num_layers}")
             print(f"  context_size={context_size}, intermediate_size={intermediate_size}")
-            print(f"  attn_implementation=sdpa")
         
         model = GPTNeoForCausalLMTiered(config)
 
