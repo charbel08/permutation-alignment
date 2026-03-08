@@ -15,7 +15,7 @@ torchrun --standalone --nproc_per_node=8 -m tiered.train.tiered_pretrain \
     --num_layers 16 \
     --untie_weights \
     --context_size 1024 \
-    --batch_size 18 \
+    --batch_size 16 \
     --grad_accum_steps 4 \
     --learning_rate 2.5e-3 \
     --min_lr 2.5e-4 \
