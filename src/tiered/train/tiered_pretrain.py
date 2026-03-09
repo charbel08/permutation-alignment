@@ -611,6 +611,10 @@ def train(args):
     num_trainable = count_trainable_parameters(raw_model)
     swappable_params = count_swappable_parameters(raw_model, mask_plan)
     max_swappable_params = count_max_swappable_parameters(raw_model)
+
+    swappable_pct = 100.0 * swappable_params["total"] / num_params
+    max_swappable_pct = 100.0 * max_swappable_params["total"] / num_params
+
     inter_size = args.intermediate_size or (args.hidden_size * 4)
     vocab_size = raw_model.get_input_embeddings().weight.shape[0]
 
@@ -636,10 +640,10 @@ def train(args):
         print(f"\n── Compute metrics ──")
         print(f"  Total parameters:           {num_params:,}")
         print(f"  Trainable parameters:       {num_trainable:,}")
-        print(f"  Current swappable params:   {swappable_params['total']:,}")
+        print(f"  Current swappable params:   {swappable_params['total']:,} ({swappable_pct:.2f}% of total)")
         print(f"    - attention:              {swappable_params['attention']:,}")
         print(f"    - mlp:                    {swappable_params['mlp']:,}")
-        print(f"  Max swappable params:       {max_swappable_params['total']:,}")
+        print(f"  Max swappable params:       {max_swappable_params['total']:,} ({max_swappable_pct:.2f}% of total)")
         print(f"    - attention:              {max_swappable_params['attention']:,}")
         print(f"    - mlp:                    {max_swappable_params['mlp']:,}")
         print(f"  Tokens/step:                {tokens_per_step:,}")
@@ -678,9 +682,11 @@ def train(args):
                 "compute/swappable_params": swappable_params["total"],
                 "compute/swappable_attention_params": swappable_params["attention"],
                 "compute/swappable_mlp_params": swappable_params["mlp"],
+                "compute/swappable_pct_of_total": swappable_pct,
                 "compute/max_swappable_params": max_swappable_params["total"],
                 "compute/max_swappable_attention_params": max_swappable_params["attention"],
                 "compute/max_swappable_mlp_params": max_swappable_params["mlp"],
+                "compute/max_swappable_pct_of_total": max_swappable_pct,
                 "compute/tokens_per_step": tokens_per_step,
                 "compute/flops_per_step": flops_per_step,
                 "compute/flops_per_token_6N": flops_per_token,
@@ -926,10 +932,10 @@ def train(args):
         print(f"{'=' * 60}")
         print(f"  Steps:                    {global_step:,}")
         print(f"  Total parameters (N):     {num_params:,}")
-        print(f"  Current swappable params: {swappable_params['total']:,}")
+        print(f"  Current swappable params: {swappable_params['total']:,} ({swappable_pct:.2f}% of total)")
         print(f"    - attention:            {swappable_params['attention']:,}")
         print(f"    - mlp:                  {swappable_params['mlp']:,}")
-        print(f"  Max swappable params:     {max_swappable_params['total']:,}")
+        print(f"  Max swappable params:     {max_swappable_params['total']:,} ({max_swappable_pct:.2f}% of total)")
         print(f"    - attention:            {max_swappable_params['attention']:,}")
         print(f"    - mlp:                  {max_swappable_params['mlp']:,}")
         print(f"  Total tokens (D):         {cumulative_tokens:,}")
@@ -959,9 +965,11 @@ def train(args):
                 "final/swappable_params": swappable_params["total"],
                 "final/swappable_attention_params": swappable_params["attention"],
                 "final/swappable_mlp_params": swappable_params["mlp"],
+                "final/swappable_pct_of_total": swappable_pct,
                 "final/max_swappable_params": max_swappable_params["total"],
                 "final/max_swappable_attention_params": max_swappable_params["attention"],
                 "final/max_swappable_mlp_params": max_swappable_params["mlp"],
+                "final/max_swappable_pct_of_total": max_swappable_pct,
                 "final/gpu_name": gpu_name,
                 "final/num_gpus": world_size,
             }
