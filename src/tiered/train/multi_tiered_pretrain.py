@@ -55,6 +55,89 @@ from tiered.train.utils import load_model, save_checkpoint
 # Compute-metrics helpers
 # ---------------------------------------------------------------------------
 
+def count_total_parameters(model) -> int:
+    """Return the exact total number of parameters in the model."""
+    return sum(p.numel() for p in model.parameters())
+
+
+def count_trainable_parameters(model) -> int:
+    """Return the exact total number of trainable parameters in the model."""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def count_swappable_parameters(model, mask_plan) -> dict:
+    """Return the exact number of parameters touched by the current key."""
+    from tiered.permutation.utils import _get_attention_module, _get_mlp_module
+
+    total_attn = 0
+    total_mlp = 0
+
+    # Attention swappable params
+    for layer_idx, idx in mask_plan.keyed_attn_indices.items():
+        attn = _get_attention_module(model, layer_idx)
+        n_idx = int(idx.numel())
+
+        # q/k/v selected rows
+        total_attn += n_idx * attn.q_proj.weight.shape[1]
+        total_attn += n_idx * attn.k_proj.weight.shape[1]
+        total_attn += n_idx * attn.v_proj.weight.shape[1]
+
+        # out selected columns
+        total_attn += attn.out_proj.weight.shape[0] * n_idx
+
+    # MLP swappable params
+    for layer_idx, idx in mask_plan.keyed_mlp_indices.items():
+        mlp = _get_mlp_module(model, layer_idx)
+        n_idx = int(idx.numel())
+
+        # c_fc selected rows
+        total_mlp += n_idx * mlp.c_fc.weight.shape[1]
+
+        # c_fc selected bias entries
+        if mlp.c_fc.bias is not None:
+            total_mlp += n_idx
+
+        # c_proj selected columns
+        total_mlp += mlp.c_proj.weight.shape[0] * n_idx
+
+    return {
+        "total": total_attn + total_mlp,
+        "attention": total_attn,
+        "mlp": total_mlp,
+    }
+
+
+def count_max_swappable_parameters(model) -> dict:
+    """Return the exact number of parameters swappable under a 100% key."""
+    from tiered.permutation.utils import _get_attention_module, _get_mlp_module
+
+    total_attn = 0
+    total_mlp = 0
+    num_layers = len(model.transformer.h)
+
+    for layer_idx in range(num_layers):
+        attn = _get_attention_module(model, layer_idx)
+        mlp = _get_mlp_module(model, layer_idx)
+
+        # Attention
+        total_attn += attn.q_proj.weight.numel()
+        total_attn += attn.k_proj.weight.numel()
+        total_attn += attn.v_proj.weight.numel()
+        total_attn += attn.out_proj.weight.numel()
+
+        # MLP
+        total_mlp += mlp.c_fc.weight.numel()
+        if mlp.c_fc.bias is not None:
+            total_mlp += mlp.c_fc.bias.numel()
+        total_mlp += mlp.c_proj.weight.numel()
+
+    return {
+        "total": total_attn + total_mlp,
+        "attention": total_attn,
+        "mlp": total_mlp,
+    }
+
+
 def estimate_flops_per_token(num_layers: int, hidden_size: int, intermediate_size: int,
                               context_size: int, vocab_size: int,
                               num_params: int) -> dict:
@@ -520,8 +603,14 @@ def train(args):
               f"each keyed tier sees ~1/{num_keyed_tiers} of steps")
 
     # ── Compute metrics setup ──
-    num_params = sum(p.numel() for p in raw_model.parameters())
-    num_trainable = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
+    num_params = count_total_parameters(raw_model)
+    num_trainable = count_trainable_parameters(raw_model)
+    swappable_params = count_swappable_parameters(raw_model, tiers[0].mask_plan)
+    max_swappable_params = count_max_swappable_parameters(raw_model)
+
+    swappable_pct_of_max = 100.0 * swappable_params["total"] / max_swappable_params["total"]
+    max_swappable_pct_of_total = 100.0 * max_swappable_params["total"] / num_params
+
     inter_size = args.intermediate_size or (args.hidden_size * 4)
 
     # Get the actual vocab size from the model's embedding layer
@@ -548,17 +637,24 @@ def train(args):
 
     if is_main:
         print(f"\n── Compute metrics ──")
-        print(f"  Parameters:        {num_params:,} total, {num_trainable:,} trainable")
-        print(f"  Tokens/step:       {tokens_per_step:,}")
-        print(f"  FLOPs/token (6N):  {flops_per_token:.3e}")
-        print(f"  FLOPs/step (est):  {flops_per_step:.3e}  (2 passes × 6N × tokens)")
-        print(f"  GPU:               {gpu_name}")
+        print(f"  Total parameters:           {num_params:,}")
+        print(f"  Trainable parameters:       {num_trainable:,}")
+        print(f"  Current swappable params:   {swappable_params['total']:,} ({swappable_pct_of_max:.2f}% of max swappable)")
+        print(f"    - attention:              {swappable_params['attention']:,}")
+        print(f"    - mlp:                    {swappable_params['mlp']:,}")
+        print(f"  Max swappable params:       {max_swappable_params['total']:,} ({max_swappable_pct_of_total:.2f}% of total params)")
+        print(f"    - attention:              {max_swappable_params['attention']:,}")
+        print(f"    - mlp:                    {max_swappable_params['mlp']:,}")
+        print(f"  Tokens/step:                {tokens_per_step:,}")
+        print(f"  FLOPs/token (6N):           {flops_per_token:.3e}")
+        print(f"  FLOPs/step (est):           {flops_per_step:.3e}  (2 passes × 6N × tokens)")
+        print(f"  GPU:                        {gpu_name}")
         if gpu_peak_flops > 0:
-            print(f"  GPU peak bf16:     {gpu_peak_flops:.3e} FLOP/s")
+            print(f"  GPU peak bf16:              {gpu_peak_flops:.3e} FLOP/s")
         else:
-            print(f"  GPU peak bf16:     unknown (MFU will be N/A)")
+            print(f"  GPU peak bf16:              unknown (MFU will be N/A)")
         # Detailed breakdown for supplementary material
-        print(f"  Detailed fwd/token:{flop_info['fwd_per_token']:.3e}  "
+        print(f"  Detailed fwd/token:         {flop_info['fwd_per_token']:.3e}  "
               f"(vs 2N={2*num_params:.3e}, ratio={flop_info['fwd_per_token']/(2*num_params):.3f})")
         print()
 
@@ -580,6 +676,14 @@ def train(args):
         wandb.config.update({
             "compute/num_params": num_params,
             "compute/num_trainable_params": num_trainable,
+            "compute/swappable_params": swappable_params["total"],
+            "compute/swappable_attention_params": swappable_params["attention"],
+            "compute/swappable_mlp_params": swappable_params["mlp"],
+            "compute/swappable_pct_of_max": swappable_pct_of_max,
+            "compute/max_swappable_params": max_swappable_params["total"],
+            "compute/max_swappable_attention_params": max_swappable_params["attention"],
+            "compute/max_swappable_mlp_params": max_swappable_params["mlp"],
+            "compute/max_swappable_pct_of_total": max_swappable_pct_of_total,
             "compute/tokens_per_step": tokens_per_step,
             "compute/flops_per_step": flops_per_step,
             "compute/flops_per_token_6N": flops_per_token,
@@ -826,6 +930,12 @@ def train(args):
         print(f"{'='*60}")
         print(f"  Steps:                 {global_step:,}")
         print(f"  Parameters (N):        {num_params:,}")
+        print(f"  Current swappable:     {swappable_params['total']:,} ({swappable_pct_of_max:.2f}% of max swappable)")
+        print(f"    - attention:         {swappable_params['attention']:,}")
+        print(f"    - mlp:               {swappable_params['mlp']:,}")
+        print(f"  Max swappable:         {max_swappable_params['total']:,} ({max_swappable_pct_of_total:.2f}% of total params)")
+        print(f"    - attention:         {max_swappable_params['attention']:,}")
+        print(f"    - mlp:               {max_swappable_params['mlp']:,}")
         print(f"  Total tokens (D):      {cumulative_tokens:,}")
         print(f"  Total FLOPs (2×6ND):   {total_flops:.4e}")
         print(f"  Total PetaFLOPs:       {total_flops / 1e15:.2f}")
@@ -855,6 +965,14 @@ def train(args):
             "final/avg_tokens_per_sec": cumulative_tokens / cumulative_wall_secs,
             "final/avg_tokens_per_sec_per_gpu": cumulative_tokens / cumulative_wall_secs / world_size,
             "final/num_params": num_params,
+            "final/swappable_params": swappable_params["total"],
+            "final/swappable_attention_params": swappable_params["attention"],
+            "final/swappable_mlp_params": swappable_params["mlp"],
+            "final/swappable_pct_of_max": swappable_pct_of_max,
+            "final/max_swappable_params": max_swappable_params["total"],
+            "final/max_swappable_attention_params": max_swappable_params["attention"],
+            "final/max_swappable_mlp_params": max_swappable_params["mlp"],
+            "final/max_swappable_pct_of_total": max_swappable_pct_of_total,
             "final/gpu_name": gpu_name,
             "final/num_gpus": world_size,
         })
