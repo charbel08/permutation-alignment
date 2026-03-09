@@ -162,6 +162,9 @@ def parse_args():
 
     # Distributed
     parser.add_argument("--local_rank", type=int, default=-1)
+    parser.add_argument("--num_workers", type=int, default=4,
+                        help="DataLoader worker processes per rank (reduce on "
+                             "machines with few cores per GPU)")
 
     return parser.parse_args()
 
@@ -201,7 +204,7 @@ def evaluate(model, dataloader, device, num_steps=50, is_distributed=False):
     model.train()
 
     if count == 0:
-        return {"val/loss": 0, "val/acc": 0, "val/ppl": 0}
+        return {"val/loss_c1": 0, "val/acc_c1": 0, "val/ppl_c1": 0}
 
     avg_loss = total_loss / count
     avg_acc = total_acc / count
@@ -212,9 +215,9 @@ def evaluate(model, dataloader, device, num_steps=50, is_distributed=False):
         avg_loss, avg_acc = metrics_tensor.tolist()
 
     return {
-        "val/loss": avg_loss,
-        "val/acc": avg_acc,
-        "val/ppl": math.exp(min(avg_loss, 100)),
+        "val/loss_c1": avg_loss,
+        "val/acc_c1": avg_acc,
+        "val/ppl_c1": math.exp(min(avg_loss, 100)),
     }
 
 
@@ -241,17 +244,14 @@ def train(args):
     torch.backends.cudnn.allow_tf32 = True
 
     # Load model
+    from tiered.model import GPTNeoForCausalLMTiered
+
     if args.checkpoint:
-        model = load_model(
-            hidden_size=args.hidden_size,
-            num_heads=args.num_heads,
-            num_layers=args.num_layers,
-            context_size=args.context_size,
-            intermediate_size=args.intermediate_size,
-            tie_weights=not args.untie_weights,
-            do_print=is_main,
-        )
-        model = model.from_pretrained(args.checkpoint)
+        # from_pretrained reads architecture config from the checkpoint itself,
+        # so we load directly rather than building a fresh model first.
+        model = GPTNeoForCausalLMTiered.from_pretrained(args.checkpoint)
+        if is_main:
+            print(f"Loaded model weights from {args.checkpoint}")
     else:
         model = load_model(
             hidden_size=args.hidden_size,
@@ -313,7 +313,7 @@ def train(args):
         shuffle=(sampler is None),
         collate_fn=collator,
         drop_last=True,
-        num_workers=6,
+        num_workers=args.num_workers,
         pin_memory=True,
     )
 
@@ -330,7 +330,7 @@ def train(args):
             shuffle=False,
             collate_fn=collator,
             drop_last=True,
-            num_workers=6,
+            num_workers=args.num_workers,
             pin_memory=True,
         )
 
@@ -397,8 +397,12 @@ def train(args):
         wandb.define_metric("*", step_metric="train/step")
 
     # Training loop setup
+    # Monotonic epoch counter for DistributedSampler shuffling. Using a
+    # dedicated counter (rather than global_step) gives deterministic
+    # shuffle order regardless of batch size or dataset size changes.
+    data_epoch = 0
     if local_rank != -1 and global_step > 0:
-        sampler.set_epoch(global_step)
+        sampler.set_epoch(data_epoch)
     data_iter = iter(dataloader)
 
     is_distributed = (local_rank != -1)
@@ -498,8 +502,9 @@ def train(args):
             try:
                 batch = next(data_iter)
             except StopIteration:
+                data_epoch += 1
                 if local_rank != -1:
-                    sampler.set_epoch(global_step)
+                    sampler.set_epoch(data_epoch)
                 data_iter = iter(dataloader)
                 batch = next(data_iter)
 
@@ -557,9 +562,10 @@ def train(args):
             mfu = per_gpu_flops / gpu_peak_flops if gpu_peak_flops > 0 else 0.0
 
             log_dict = {
-                "loss": avg_loss,
-                "acc": avg_acc,
-                "ppl": ppl,
+                "loss_c1": avg_loss,
+                "loss_avg": avg_loss,  # == loss_c1 (baseline has one config); kept for dashboard compat with tiered
+                "acc_c1": avg_acc,
+                "ppl_c1": ppl,
                 "lr": lr,
                 "grad_norm": grad_norm.item() if hasattr(grad_norm, "item") else grad_norm,
                 "train/step": global_step,
@@ -574,6 +580,8 @@ def train(args):
                 "perf/achieved_tflops_per_gpu": per_gpu_flops / 1e12,
                 "perf/mfu": mfu,
                 "perf/cumulative_tokens": cumulative_tokens,
+                # NOTE: 1× flops_per_token (not 2×) because baseline does one
+                # fwd+bwd pass per step. The tiered script uses 2× here.
                 "perf/cumulative_flops": flops_per_token * cumulative_tokens,
                 "perf/cumulative_petaflops": (flops_per_token * cumulative_tokens) / 1e15,
             }
