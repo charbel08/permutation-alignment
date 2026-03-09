@@ -44,9 +44,10 @@ from tqdm import tqdm
 
 from tiered.model import GPTNeoForCausalLMTiered
 from tiered.permutation import load_key, PermutationKey, scale_public_gradients
-from tiered.permutation.masking import mask_keyed_gradients, build_mask_plan
+from tiered.permutation.masking import mask_keyed_gradients, build_mask_plan, MaskPlan
 from tiered.permutation.permute import (
-    apply_permutation, unapply_permutation, swap_gradients, build_swap_plan
+    apply_permutation, unapply_permutation, swap_gradients, build_swap_plan,
+    SwapPlan,
 )
 from tiered.train.utils import load_model, save_checkpoint
 
@@ -54,6 +55,89 @@ from tiered.train.utils import load_model, save_checkpoint
 # ---------------------------------------------------------------------------
 # Compute-metrics helpers
 # ---------------------------------------------------------------------------
+
+def count_total_parameters(model) -> int:
+    """Return the exact total number of parameters in the model."""
+    return sum(p.numel() for p in model.parameters())
+
+
+def count_trainable_parameters(model) -> int:
+    """Return the exact total number of trainable parameters in the model."""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def count_swappable_parameters(model, mask_plan) -> dict:
+    """Return the exact number of parameters touched by the current key."""
+    from tiered.permutation.utils import _get_attention_module, _get_mlp_module
+
+    total_attn = 0
+    total_mlp = 0
+
+    # Attention swappable params
+    for layer_idx, idx in mask_plan.keyed_attn_indices.items():
+        attn = _get_attention_module(model, layer_idx)
+        n_idx = int(idx.numel())
+
+        # q/k/v selected rows
+        total_attn += n_idx * attn.q_proj.weight.shape[1]
+        total_attn += n_idx * attn.k_proj.weight.shape[1]
+        total_attn += n_idx * attn.v_proj.weight.shape[1]
+
+        # out selected columns
+        total_attn += attn.out_proj.weight.shape[0] * n_idx
+
+    # MLP swappable params
+    for layer_idx, idx in mask_plan.keyed_mlp_indices.items():
+        mlp = _get_mlp_module(model, layer_idx)
+        n_idx = int(idx.numel())
+
+        # c_fc selected rows
+        total_mlp += n_idx * mlp.c_fc.weight.shape[1]
+
+        # c_fc selected bias entries
+        if mlp.c_fc.bias is not None:
+            total_mlp += n_idx
+
+        # c_proj selected columns
+        total_mlp += mlp.c_proj.weight.shape[0] * n_idx
+
+    return {
+        "total": total_attn + total_mlp,
+        "attention": total_attn,
+        "mlp": total_mlp,
+    }
+
+
+def count_max_swappable_parameters(model) -> dict:
+    """Return the exact number of parameters swappable under a 100% key."""
+    from tiered.permutation.utils import _get_attention_module, _get_mlp_module
+
+    total_attn = 0
+    total_mlp = 0
+    num_layers = len(model.transformer.h)
+
+    for layer_idx in range(num_layers):
+        attn = _get_attention_module(model, layer_idx)
+        mlp = _get_mlp_module(model, layer_idx)
+
+        # Attention
+        total_attn += attn.q_proj.weight.numel()
+        total_attn += attn.k_proj.weight.numel()
+        total_attn += attn.v_proj.weight.numel()
+        total_attn += attn.out_proj.weight.numel()
+
+        # MLP
+        total_mlp += mlp.c_fc.weight.numel()
+        if mlp.c_fc.bias is not None:
+            total_mlp += mlp.c_fc.bias.numel()
+        total_mlp += mlp.c_proj.weight.numel()
+
+    return {
+        "total": total_attn + total_mlp,
+        "attention": total_attn,
+        "mlp": total_mlp,
+    }
+
 
 def estimate_flops_per_token(num_layers: int, hidden_size: int, intermediate_size: int,
                               context_size: int, vocab_size: int,
@@ -152,8 +236,8 @@ class TierInfo:
     """Pre-computed plans and metadata for a single keyed tier."""
     tier_id: int          # 2, 3, ..., N  (tier 1 is always C1/public)
     key: PermutationKey
-    swap_plan: object     # from build_swap_plan
-    mask_plan: object     # from build_mask_plan
+    swap_plan: SwapPlan
+    mask_plan: MaskPlan
     # Per-tier tracking
     steps_sampled: int = 0
 
@@ -214,17 +298,22 @@ def parse_args():
 
     # Distributed
     parser.add_argument("--local_rank", type=int, default=-1)
+    parser.add_argument("--num_workers", type=int, default=4,
+                        help="DataLoader worker processes per rank (reduce on "
+                             "machines with few cores per GPU)")
 
     return parser.parse_args()
 
 
-def sample_tier(tiers: list[TierInfo], strategy: str, global_step: int) -> TierInfo:
+def sample_tier(tiers: list[TierInfo], strategy: str, global_step: int,
+                rng: random.Random) -> TierInfo:
     """Pick which keyed tier to train this step.
     
     Args:
         tiers: List of TierInfo for keyed tiers (C2..CN).
         strategy: 'uniform' for random, 'round_robin' for deterministic cycling.
         global_step: Current training step (used for round_robin seeding).
+        rng: Dedicated Random instance (isolated from library/global state).
     
     Returns:
         The selected TierInfo.
@@ -232,15 +321,20 @@ def sample_tier(tiers: list[TierInfo], strategy: str, global_step: int) -> TierI
     if strategy == "round_robin":
         tier = tiers[global_step % len(tiers)]
     else:  # uniform
-        tier = random.choice(tiers)
+        tier = rng.choice(tiers)
     tier.steps_sampled += 1
     return tier
 
 
 @torch.inference_mode()
-def evaluate_tier(model, dataloader, key, device, num_steps, is_distributed,
+def evaluate_tier(model, eval_batches: list[dict], key, device, is_distributed,
                   swap_plan, tier_label="c2"):
     """Evaluate model for a single tier (C1 + one keyed config).
+
+    Args:
+        eval_batches: Pre-fetched list of batch dicts (shared across tiers for
+                      fair comparison). Each dict has 'input_ids' and 'labels'
+                      already on `device`.
     
     Returns dict with keys prefixed by tier_label.
     """
@@ -252,16 +346,9 @@ def evaluate_tier(model, dataloader, key, device, num_steps, is_distributed,
     total_acc_ck = 0.0
     count = 0
 
-    data_iter = iter(dataloader)
-
-    for _ in range(num_steps):
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            break
-
-        input_ids = batch["input_ids"].to(device)
-        labels = batch["labels"].to(device)
+    for batch in eval_batches:
+        input_ids = batch["input_ids"]
+        labels = batch["labels"]
 
         # Evaluate C1
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -311,13 +398,35 @@ def evaluate_tier(model, dataloader, key, device, num_steps, is_distributed,
     }
 
 
+def _prefetch_eval_batches(dataloader, device: torch.device,
+                           num_steps: int) -> list[dict]:
+    """Fetch and pin eval batches once so every tier sees identical data."""
+    batches = []
+    data_iter = iter(dataloader)
+    for _ in range(num_steps):
+        try:
+            batch = next(data_iter)
+        except StopIteration:
+            break
+        batches.append({
+            "input_ids": batch["input_ids"].to(device),
+            "labels": batch["labels"].to(device),
+        })
+    return batches
+
+
 def evaluate_all_tiers(model, dataloader, tiers, device, num_steps, is_distributed):
-    """Evaluate C1 and every keyed tier. Returns merged metrics dict."""
+    """Evaluate C1 and every keyed tier on *identical* batches.
+
+    Batches are fetched once and reused for each tier so cross-tier loss
+    comparisons are not confounded by different eval data.
+    """
+    eval_batches = _prefetch_eval_batches(dataloader, device, num_steps)
     merged = {}
     for tier in tiers:
         label = f"c{tier.tier_id}"
         metrics = evaluate_tier(
-            model, dataloader, tier.key, device, num_steps,
+            model, eval_batches, tier.key, device,
             is_distributed, tier.swap_plan, tier_label=label
         )
         merged.update(metrics)
@@ -341,8 +450,9 @@ def train(args):
 
     is_main = rank == 0
 
-    # Seed for reproducible tier sampling across ranks
-    random.seed(42)
+    # Dedicated RNG for tier sampling — isolated from global/library state
+    # so the schedule is reproducible regardless of other random calls.
+    tier_rng = random.Random(42)
 
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -427,7 +537,7 @@ def train(args):
         train_dataset, batch_size=args.batch_size,
         sampler=sampler, shuffle=(sampler is None),
         collate_fn=collator, drop_last=True,
-        num_workers=6, pin_memory=True,
+        num_workers=args.num_workers, pin_memory=True,
     )
 
     val_dataloader = None
@@ -437,7 +547,7 @@ def train(args):
             val_dataset, batch_size=args.batch_size,
             sampler=val_sampler, shuffle=False,
             collate_fn=collator, drop_last=True,
-            num_workers=6, pin_memory=True,
+            num_workers=args.num_workers, pin_memory=True,
         )
 
     # ── Optimizer & scheduler ──
@@ -481,12 +591,12 @@ def train(args):
             for tier, count in zip(tiers, tier_step_counts):
                 tier.steps_sampled = count
 
-        # Re-seed RNG to the same sequence position on resume.
-        # Advance the RNG by global_step draws so we get the same tier
-        # schedule as if we'd trained from scratch (for uniform sampling).
-        random.seed(42)
+        # Re-seed the dedicated RNG to the same sequence position on resume.
+        # Advance it by global_step draws so we get the same tier schedule
+        # as if we'd trained from scratch (for uniform sampling).
+        tier_rng = random.Random(42)
         for _ in range(global_step):
-            random.randint(0, num_keyed_tiers - 1)
+            tier_rng.randint(0, num_keyed_tiers - 1)
 
         if is_main:
             print(f"Resumed training state from step {global_step}")
@@ -504,8 +614,12 @@ def train(args):
         wandb.define_metric("*", step_metric="train/step")
 
     # ── Training loop ──
+    # Monotonic epoch counter for DistributedSampler shuffling. Using a
+    # dedicated counter (rather than global_step) gives deterministic
+    # shuffle order regardless of batch size or dataset size changes.
+    data_epoch = 0
     if local_rank != -1 and global_step > 0:
-        sampler.set_epoch(global_step)
+        sampler.set_epoch(data_epoch)
     data_iter = iter(dataloader)
 
     is_distributed = (local_rank != -1)
@@ -520,8 +634,14 @@ def train(args):
               f"each keyed tier sees ~1/{num_keyed_tiers} of steps")
 
     # ── Compute metrics setup ──
-    num_params = sum(p.numel() for p in raw_model.parameters())
-    num_trainable = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
+    num_params = count_total_parameters(raw_model)
+    num_trainable = count_trainable_parameters(raw_model)
+    swappable_params = count_swappable_parameters(raw_model, tiers[0].mask_plan)
+    max_swappable_params = count_max_swappable_parameters(raw_model)
+
+    swappable_pct_of_max = 100.0 * swappable_params["total"] / max_swappable_params["total"]
+    max_swappable_pct_of_total = 100.0 * max_swappable_params["total"] / num_params
+
     inter_size = args.intermediate_size or (args.hidden_size * 4)
 
     # Get the actual vocab size from the model's embedding layer
@@ -548,17 +668,24 @@ def train(args):
 
     if is_main:
         print(f"\n── Compute metrics ──")
-        print(f"  Parameters:        {num_params:,} total, {num_trainable:,} trainable")
-        print(f"  Tokens/step:       {tokens_per_step:,}")
-        print(f"  FLOPs/token (6N):  {flops_per_token:.3e}")
-        print(f"  FLOPs/step (est):  {flops_per_step:.3e}  (2 passes × 6N × tokens)")
-        print(f"  GPU:               {gpu_name}")
+        print(f"  Total parameters:           {num_params:,}")
+        print(f"  Trainable parameters:       {num_trainable:,}")
+        print(f"  Current swappable params:   {swappable_params['total']:,} ({swappable_pct_of_max:.2f}% of max swappable)")
+        print(f"    - attention:              {swappable_params['attention']:,}")
+        print(f"    - mlp:                    {swappable_params['mlp']:,}")
+        print(f"  Max swappable params:       {max_swappable_params['total']:,} ({max_swappable_pct_of_total:.2f}% of total params)")
+        print(f"    - attention:              {max_swappable_params['attention']:,}")
+        print(f"    - mlp:                    {max_swappable_params['mlp']:,}")
+        print(f"  Tokens/step:                {tokens_per_step:,}")
+        print(f"  FLOPs/token (6N):           {flops_per_token:.3e}")
+        print(f"  FLOPs/step (est):           {flops_per_step:.3e}  (2 passes × 6N × tokens)")
+        print(f"  GPU:                        {gpu_name}")
         if gpu_peak_flops > 0:
-            print(f"  GPU peak bf16:     {gpu_peak_flops:.3e} FLOP/s")
+            print(f"  GPU peak bf16:              {gpu_peak_flops:.3e} FLOP/s")
         else:
-            print(f"  GPU peak bf16:     unknown (MFU will be N/A)")
+            print(f"  GPU peak bf16:              unknown (MFU will be N/A)")
         # Detailed breakdown for supplementary material
-        print(f"  Detailed fwd/token:{flop_info['fwd_per_token']:.3e}  "
+        print(f"  Detailed fwd/token:         {flop_info['fwd_per_token']:.3e}  "
               f"(vs 2N={2*num_params:.3e}, ratio={flop_info['fwd_per_token']/(2*num_params):.3f})")
         print()
 
@@ -580,6 +707,14 @@ def train(args):
         wandb.config.update({
             "compute/num_params": num_params,
             "compute/num_trainable_params": num_trainable,
+            "compute/swappable_params": swappable_params["total"],
+            "compute/swappable_attention_params": swappable_params["attention"],
+            "compute/swappable_mlp_params": swappable_params["mlp"],
+            "compute/swappable_pct_of_max": swappable_pct_of_max,
+            "compute/max_swappable_params": max_swappable_params["total"],
+            "compute/max_swappable_attention_params": max_swappable_params["attention"],
+            "compute/max_swappable_mlp_params": max_swappable_params["mlp"],
+            "compute/max_swappable_pct_of_total": max_swappable_pct_of_total,
             "compute/tokens_per_step": tokens_per_step,
             "compute/flops_per_step": flops_per_step,
             "compute/flops_per_token_6N": flops_per_token,
@@ -612,7 +747,7 @@ def train(args):
         step_start = time.monotonic()
 
         # ── Sample which keyed tier to train this step ──
-        active_tier = sample_tier(tiers, args.tier_sample, global_step)
+        active_tier = sample_tier(tiers, args.tier_sample, global_step, tier_rng)
 
         # ── Buffer micro-batches ──
         micro_batches = []
@@ -620,8 +755,9 @@ def train(args):
             try:
                 batch = next(data_iter)
             except StopIteration:
+                data_epoch += 1
                 if local_rank != -1:
-                    sampler.set_epoch(global_step)
+                    sampler.set_epoch(data_epoch)
                 data_iter = iter(dataloader)
                 batch = next(data_iter)
             batch["input_ids"] = batch["input_ids"].to(device, non_blocking=True)
@@ -654,7 +790,12 @@ def train(args):
 
                 (loss_c1 * loss_scale).backward()
 
-        # Zero C1 gradients on this tier's keyed weights
+        # Zero C1 gradients on this tier's keyed weights.
+        # NOTE: This operates on raw_model (unwrapped), which is safe because
+        # DDP's allreduce hooks fire during the final synced backward above.
+        # By this point .grad tensors are already reduced across ranks, so
+        # subsequent in-place modifications (masking, scaling, swapping) are
+        # purely local and don't interact with DDP's communication.
         mask_keyed_gradients(raw_model, active_tier.key, plan=active_tier.mask_plan)
 
         # ==================== PHASE 2: C_k (sampled keyed tier) ====================
@@ -681,8 +822,19 @@ def train(args):
                 (loss_ck * loss_scale).backward()
 
         # ── Gradient combination ──
-        # Public weights: average of C1 + C_k gradients (scale the summed grads by 0.5)
-        # Keyed weights: only C_k gradient (already the only contributor after masking)
+        # Each backward pass scales loss by loss_scale = 1/grad_accum_steps, so
+        # after accumulation each phase contributes grad/grad_accum_steps.
+        #
+        # After Phase 1 masking + Phase 2 backward, the accumulated .grad is:
+        #   Public weights:  grad_c1/A + grad_ck/A   (A = grad_accum_steps)
+        #   Keyed weights:   grad_ck/A               (C1 contribution was zeroed)
+        #
+        # scale_public_gradients(..., 0.5) then halves only the public portion:
+        #   Public weights:  (grad_c1 + grad_ck) / (2A)   ← averaged over both phases
+        #   Keyed weights:   grad_ck / A                   ← unchanged, full contribution
+        #
+        # This means public weights see the mean of both configurations' gradients,
+        # while keyed weights get the unattenuated gradient from their own config.
         scale_public_gradients(raw_model, active_tier.key, scale=0.5,
                                plan=active_tier.mask_plan)
 
@@ -779,8 +931,12 @@ def train(args):
 
         # ── Validation ──
         if val_dataloader is not None and global_step % args.eval_interval == 0:
+            # Prefetch eval batches once; reused for all tiers if eval_all_tiers
+            eval_batches = _prefetch_eval_batches(
+                val_dataloader, device, args.eval_steps
+            )
             if args.eval_all_tiers:
-                # Full eval: every tier (more expensive, N forward passes)
+                # Full eval: every tier on identical batches
                 val_metrics = evaluate_all_tiers(
                     raw_model, val_dataloader, tiers, device,
                     args.eval_steps, is_distributed
@@ -788,8 +944,8 @@ def train(args):
             else:
                 # Cheap eval: only the tier we just trained
                 val_metrics = evaluate_tier(
-                    raw_model, val_dataloader, active_tier.key, device,
-                    args.eval_steps, is_distributed, active_tier.swap_plan,
+                    raw_model, eval_batches, active_tier.key, device,
+                    is_distributed, active_tier.swap_plan,
                     tier_label=f"c{active_tier.tier_id}",
                 )
             if is_main:
@@ -826,6 +982,12 @@ def train(args):
         print(f"{'='*60}")
         print(f"  Steps:                 {global_step:,}")
         print(f"  Parameters (N):        {num_params:,}")
+        print(f"  Current swappable:     {swappable_params['total']:,} ({swappable_pct_of_max:.2f}% of max swappable)")
+        print(f"    - attention:         {swappable_params['attention']:,}")
+        print(f"    - mlp:               {swappable_params['mlp']:,}")
+        print(f"  Max swappable:         {max_swappable_params['total']:,} ({max_swappable_pct_of_total:.2f}% of total params)")
+        print(f"    - attention:         {max_swappable_params['attention']:,}")
+        print(f"    - mlp:               {max_swappable_params['mlp']:,}")
         print(f"  Total tokens (D):      {cumulative_tokens:,}")
         print(f"  Total FLOPs (2×6ND):   {total_flops:.4e}")
         print(f"  Total PetaFLOPs:       {total_flops / 1e15:.2f}")
@@ -855,6 +1017,14 @@ def train(args):
             "final/avg_tokens_per_sec": cumulative_tokens / cumulative_wall_secs,
             "final/avg_tokens_per_sec_per_gpu": cumulative_tokens / cumulative_wall_secs / world_size,
             "final/num_params": num_params,
+            "final/swappable_params": swappable_params["total"],
+            "final/swappable_attention_params": swappable_params["attention"],
+            "final/swappable_mlp_params": swappable_params["mlp"],
+            "final/swappable_pct_of_max": swappable_pct_of_max,
+            "final/max_swappable_params": max_swappable_params["total"],
+            "final/max_swappable_attention_params": max_swappable_params["attention"],
+            "final/max_swappable_mlp_params": max_swappable_params["mlp"],
+            "final/max_swappable_pct_of_total": max_swappable_pct_of_total,
             "final/gpu_name": gpu_name,
             "final/num_gpus": world_size,
         })
