@@ -1,8 +1,10 @@
 """Training utilities for tiered alignment."""
 
 import os
+
 import torch
-from transformers import GPTNeoConfig, AutoTokenizer
+from transformers import AutoTokenizer, GPTNeoConfig
+
 from tiered.model import GPTNeoForCausalLMTiered
 
 
@@ -23,6 +25,7 @@ def load_model(
         num_heads: Number of attention heads
         num_layers: Number of transformer layers
         context_size: Maximum context length (default: 1024)
+        intermediate_size: MLP hidden dimension (default: 4x hidden_size)
         tie_weights: Whether to tie input/output embeddings (default: True)
         checkpoint: Path to checkpoint to load from (optional)
         do_print: Whether to print model configuration info (default: True)
@@ -51,21 +54,29 @@ def load_model(
             tie_word_embeddings=tie_weights,
             # attn_implementation="flash_attention_2",
         )
-        
+
         if do_print:
             print(f"Creating new model:")
             print(f"  hidden_size={hidden_size}, num_heads={num_heads}, num_layers={num_layers}")
             print(f"  context_size={context_size}, intermediate_size={intermediate_size}")
-        
+
         model = GPTNeoForCausalLMTiered(config)
 
     return model
 
 
-def save_checkpoint(model, tokenizer, optimizer, path: str, scheduler=None, 
-                    global_step=None, wandb_run_id=None):
+def save_checkpoint(
+    model,
+    tokenizer,
+    optimizer,
+    path: str,
+    scheduler=None,
+    global_step=None,
+    wandb_run_id=None,
+    **extra_state,
+):
     """Save model checkpoint with full training state for resumption.
-    
+
     Args:
         model: The model to save
         tokenizer: The tokenizer to save
@@ -74,20 +85,27 @@ def save_checkpoint(model, tokenizer, optimizer, path: str, scheduler=None,
         scheduler: LR scheduler (optional, for resume)
         global_step: Current training step (optional, for resume)
         wandb_run_id: W&B run ID (optional, for resume on same graphs)
+        **extra_state: Additional key-value pairs to persist in
+            training_state.pt (e.g. cumulative_wall_secs,
+            tier_step_counts). Values must be torch.save-compatible.
     """
     os.makedirs(path, exist_ok=True)
-    
+
     model.save_pretrained(path)
     tokenizer.save_pretrained(path)
-    
+
     training_state = {"optimizer": optimizer.state_dict()}
+
     if scheduler is not None:
         training_state["scheduler"] = scheduler.state_dict()
     if global_step is not None:
         training_state["global_step"] = global_step
     if wandb_run_id is not None:
         training_state["wandb_run_id"] = wandb_run_id
-    
+
+    # Persist any extra training state (cumulative_wall_secs, tier_step_counts, etc.)
+    training_state.update(extra_state)
+
     torch.save(training_state, os.path.join(path, "training_state.pt"))
 
 

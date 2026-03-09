@@ -26,8 +26,8 @@ torchrun --standalone --nproc_per_node=8 -m tiered.train.multi_tiered_pretrain \
     --warmup_steps 1000 \
     --log_interval 1 \
     --eval_interval 1000 \
-    --eval_steps 60 \
-    --save_interval 10000 \
+    --eval_steps 75 \
+    --save_interval 5000 \
     --wandb_project tiered-alignment-pretrain \
     --run_name pretrain_530m_fineweb_3tiers_7pct \
     2>&1 | tee logs/pretrain_530m_fineweb_3tiers_7pct_$(date +%Y%m%d_%H%M%S).log

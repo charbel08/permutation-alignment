@@ -309,6 +309,9 @@ def parse_args():
 
     # Distributed
     parser.add_argument("--local_rank", type=int, default=-1)
+    parser.add_argument("--num_workers", type=int, default=4,
+                        help="DataLoader worker processes per rank (reduce on "
+                             "machines with few cores per GPU)")
 
     return parser.parse_args()
 
@@ -503,7 +506,7 @@ def train(args):
         shuffle=(sampler is None),
         collate_fn=collator,
         drop_last=True,
-        num_workers=6,
+        num_workers=args.num_workers,
         pin_memory=True,
     )
 
@@ -520,7 +523,7 @@ def train(args):
             shuffle=False,
             collate_fn=collator,
             drop_last=True,
-            num_workers=6,
+            num_workers=args.num_workers,
             pin_memory=True,
         )
 
@@ -594,8 +597,12 @@ def train(args):
         wandb.define_metric("*", step_metric="train/step")
 
     # Training loop setup
+    # Monotonic epoch counter for DistributedSampler shuffling. Using a
+    # dedicated counter (rather than global_step) gives deterministic
+    # shuffle order regardless of batch size or dataset size changes.
+    data_epoch = 0
     if local_rank != -1 and global_step > 0:
-        sampler.set_epoch(global_step)
+        sampler.set_epoch(data_epoch)
     data_iter = iter(dataloader)
 
     is_distributed = local_rank != -1
@@ -735,8 +742,9 @@ def train(args):
             try:
                 batch = next(data_iter)
             except StopIteration:
+                data_epoch += 1
                 if local_rank != -1:
-                    sampler.set_epoch(global_step)
+                    sampler.set_epoch(data_epoch)
                 data_iter = iter(dataloader)
                 batch = next(data_iter)
 
@@ -768,7 +776,12 @@ def train(args):
 
                 (loss_c1 * loss_scale).backward()
 
-        # Zero out C1 gradients on keyed weights
+        # Zero out C1 gradients on keyed weights.
+        # NOTE: This operates on raw_model (unwrapped), which is safe because
+        # DDP's allreduce hooks fire during the final synced backward above.
+        # By this point .grad tensors are already reduced across ranks, so
+        # subsequent in-place modifications (masking, scaling) are purely local
+        # and don't interact with DDP's communication.
         mask_keyed_gradients(raw_model, key, plan=mask_plan)
 
         # ==================== STEP 2: APPLY PERMUTATION (C1 -> C2) ====================
@@ -804,10 +817,25 @@ def train(args):
         avg_acc_c1 = total_acc_c1 / grad_accum_steps
         avg_acc_c2 = total_acc_c2 / grad_accum_steps
 
-        # Scale public gradients averaging C1 + C2
+        # ── Gradient combination ──
+        # Each backward pass scales loss by loss_scale = 1/grad_accum_steps, so
+        # after accumulation each phase contributes grad/grad_accum_steps.
+        #
+        # After Phase 1 masking + Phase 2 backward, the accumulated .grad is:
+        #   Public weights:  grad_c1/A + grad_c2/A   (A = grad_accum_steps)
+        #   Keyed weights:   grad_c2/A               (C1 contribution was zeroed)
+        #
+        # scale_public_gradients(..., 0.5) then halves only the public portion:
+        #   Public weights:  (grad_c1 + grad_c2) / (2A)   ← averaged over both phases
+        #   Keyed weights:   grad_c2 / A                   ← unchanged, full contribution
         scale_public_gradients(raw_model, key, scale=0.5, plan=mask_plan)
 
-        # Clip and step
+        # Clip and step (in C2 arrangement).
+        # With a single fixed key this is correct: Adam's momentum/variance at
+        # each buffer position always tracks the same logical weight every step,
+        # since the permutation never changes. The N-tier script uses a different
+        # ordering (step in C1 frame) because rotating keys would otherwise
+        # scramble momentum across tiers.
         grad_norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.max_grad_norm)
         optimizer.step()
         scheduler.step()

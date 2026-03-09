@@ -23,7 +23,7 @@ torchrun --standalone --nproc_per_node=8 -m tiered.train.tiered_pretrain \
     --warmup_steps 1000 \
     --log_interval 1 \
     --eval_interval 1000 \
-    --eval_steps 60 \
-    --save_interval 10000 \
+    --eval_steps 75 \
+    --save_interval 5000 \
     --wandb_project tiered-alignment-pretrain \
     --run_name pretrain_1b_fineweb
