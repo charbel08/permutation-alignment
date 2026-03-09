@@ -5,12 +5,14 @@ export TRANSFORMERS_CACHE=/work/scratch/hf
 
 cd /work/permutation-alignment
 
-torchrun --standalone --nproc_per_node=8 -m tiered.train.multi_tiered_pretrain \
+mkdir -p logs
+
+torchrun --standalone --nproc_per_node=8 -m tiered.train.tiered_pretrain \
     --data_path /work/scratch/data/datasets/fineweb/retain \
-    --output_dir /work/scratch/checkpoints/fineweb/tiered_pretrain_530m_10pct \
-    --key_paths configs/keys/key_530m_10pct_mixed.json \
+    --output_dir /work/scratch/checkpoints/fineweb/tiered_pretrain_530m_14pct \
+    --key_path configs/keys/key_530m_14pct.json \
     --hidden_size 1344 \
-    --intermediate_size 5376 \
+    --intermediate_size 6456 \
     --num_heads 16 \
     --num_layers 16 \
     --untie_weights \
@@ -26,4 +28,5 @@ torchrun --standalone --nproc_per_node=8 -m tiered.train.multi_tiered_pretrain \
     --eval_steps 60 \
     --save_interval 10000 \
     --wandb_project tiered-alignment-pretrain \
-    --run_name pretrain_530m_fineweb_10pct
+    --run_name pretrain_530m_fineweb_14pct \
+    2>&1 | tee logs/pretrain_530m_fineweb_14pct_$(date +%Y%m%d_%H%M%S).log
