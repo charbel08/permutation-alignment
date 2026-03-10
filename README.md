@@ -26,6 +26,13 @@ Result:
 - **Keyed params (S')**: Updated only by C2 loss
 - **Public params (S)**: Updated by the average of C1 and C2 losses
 
+### N-Tier Extension
+
+The framework supports **N keyed tiers** (C2, C3, ..., CN) with two strategies:
+
+- **Sampling** (`multi_tiered_pretrain.py`): Exactly 2 forward+backward passes per step — C1 always, plus one uniformly sampled keyed tier. Each tier's keyed weights see ~1/(N−1) of steps. Constant compute regardless of N.
+- **Naive** (`multi_tiered_naive.py`): All N keyed tiers trained every step — (1+K) passes per step. Upper-bound baseline where every tier sees every training step.
+
 ### Private Finetuning
 
 After pretraining, the keyed tier can be finetuned on private data while preserving public behavior:
@@ -35,6 +42,8 @@ L_ft = (1 − λ) · L_priv(C2) + λ · R_KL(C1_current, C1_frozen)
 ```
 
 Only keyed weights are updated during finetuning. The KL term regularizes against C1 divergence from the pretrained baseline.
+
+**SuperGLUE finetuning** (`superglue_finetune.py`) demonstrates that C2 can learn NLU capabilities hidden behind the key, using answer-only label masking so only answer tokens contribute to the loss.
 
 ## Installation
 
@@ -54,57 +63,70 @@ PYTHONPATH=./src pytest ./src/tiered/tests -sv
 
 ```
 ├── configs/
-│   ├── keys/                     # Pre-generated permutation keys (20% coverage)
-│   │   ├── key_32m_20pct_mixed.json
-│   │   ├── key_34m_20pct_mixed.json
-│   │   └── key_64m_20pct_mixed.json
-│   └── wiki/                     # Model architecture configs (34M–254M)
-│       ├── 34M.yaml
-│       ├── 64M.yaml
-│       ├── 125M.yaml
-│       └── 254M.yaml
-├── notebooks/
-│   ├── explore_wiki_bio.ipynb    # Dataset exploration
-│   └── wiki/
-│       ├── retain_forget_tradeoff.ipynb
-│       └── finetuning.ipynb
+│   └── keys/                          # Pre-generated permutation keys
+│       ├── key_64m_20pct_mixed.json   # 64M model, 20% coverage
+│       ├── key_530m_14pct.json        # 530M model, 14% coverage
+│       ├── key_530m_7pct_{1,2,3}.json # 530M model, 7% keys (for multi-tier)
+│       └── key_1b_10pct_mixed.json    # 1B model, 10% coverage
 ├── scripts/
-│   ├── generate_key.py           # Permutation key generator
+│   ├── generate_key.py                # Permutation key generator
+│   ├── eval_memorization.py           # Synthetic bio memorization eval (C1 vs C2)
+│   ├── ablation_random_key.py         # Ablation 1: random key experiment
+│   ├── ablation_corrupt_keyed.py      # Ablation 2: corrupt keyed weights
+│   ├── ablation_gradual_corrupt.py    # Ablation 3: gradual weight corruption
+│   ├── ablation_gradual_key.py        # Ablation 4: gradual key corruption
+│   ├── run_ablation_random_key.sh     # Shell launcher for ablation 1
+│   ├── run_kl_sweep.sh               # KL lambda hyperparameter sweep
 │   ├── data/
-│   │   ├── prepare_wikipedia.sh  # Wikipedia dataset preparation
-│   │   ├── tinystories_tokenize.sh
-│   │   └── translate_to_spanish.sh
-│   └── wiki/
-│       ├── run.sh                # Training launch scripts
-│       ├── finetune.sh
-│       └── rmu.sh                # Representation misdirection unlearning
+│   │   ├── generate_synthetic_bios.py # Synthetic bio dataset generator
+│   │   ├── prepare_wikipedia.sh       # Wikipedia dataset preparation
+│   │   ├── tinystories_tokenize.sh    # TinyStories tokenization
+│   │   └── translate_to_spanish.sh    # Spanish translation pipeline
+│   ├── mila/                          # SLURM sbatch scripts (Mila cluster)
+│   │   ├── pretrain.sbatch
+│   │   ├── tiered_pretrain.sbatch
+│   │   ├── tiered_pretrain_batches.sbatch
+│   │   └── private_finetune_superglue.sbatch
+│   └── snow/                          # SLURM sbatch scripts (Snowflake cluster)
+│       ├── prepare_fineweb.sh
+│       ├── wiki/
+│       │   └── run_pretrain_64m_wiki.sh
+│       └── fineweb/
+│           ├── run_baseline_530m.sh
+│           ├── run_pretrain_530m_14pct.sh
+│           ├── run_pretrain_530m_7pct.sh
+│           ├── run_pretrain_530m_7pct_multi.sh
+│           └── run_pretrain_1b.sh
 ├── src/tiered/
 │   ├── model/
-│   │   └── gpt.py                # GPTNeoForCausalLMTiered
+│   │   └── gpt.py                     # GPTNeoForCausalLMTiered
 │   ├── permutation/
-│   │   ├── key.py                # PermutationKey dataclass, load/save/validate
-│   │   ├── permute.py            # Weight & gradient swapping (batched)
-│   │   ├── masking.py            # Gradient masking (keyed vs public)
-│   │   └── scaling.py            # Public gradient scaling
+│   │   ├── key.py                     # PermutationKey dataclass, load/save/validate
+│   │   ├── permute.py                 # Weight & gradient swapping (batched)
+│   │   ├── masking.py                 # Gradient masking (keyed vs public)
+│   │   ├── scaling.py                 # Public gradient scaling
+│   │   └── utils.py                   # Model submodule accessors
 │   ├── train/
-│   │   ├── tiered_pretrain.py    # Tiered alignment pretraining
-│   │   ├── pretrain.py           # Standard baseline pretraining (no tiered alignment)
-│   │   ├── private_finetune.py   # KL-regularized private finetuning
-│   │   ├── inference.py          # Compare C1 vs C2 generation
-│   │   ├── trainer.py            # Legacy Tiered Alignment trainer (reference only)
-│   │   └── utils.py              # Model loading, checkpointing, tokenizer
+│   │   ├── tiered_pretrain.py         # 2-tier alignment pretraining (C1/C2)
+│   │   ├── multi_tiered_pretrain.py   # N-tier pretraining (sampling, constant compute)
+│   │   ├── multi_tiered_naive.py      # N-tier pretraining (naive, all tiers every step)
+│   │   ├── pretrain.py                # Standard baseline pretraining (no tiered alignment)
+│   │   ├── private_finetune.py        # KL-regularized private finetuning
+│   │   ├── superglue_finetune.py      # SuperGLUE private finetuning (answer-only masking)
+│   │   ├── inference.py               # Compare C1 vs C2 generation
+│   │   └── utils.py                   # Model loading, checkpointing, tokenizer
 │   ├── data/
-│   │   ├── prepare_wikipedia.py  # Wikipedia → forget/adjacent/retain splits
+│   │   ├── prepare_wikipedia.py       # Wikipedia → forget/adjacent/retain splits
+│   │   ├── prepare_fineweb.py         # FineWeb → tokenized chunks for pretraining
+│   │   ├── prepare_superglue.py       # SuperGLUE → answer-only masked dataset
 │   │   ├── tinystories_tokenize_and_split.py
-│   │   └── explore.py            # Dataset statistics
+│   │   └── explore.py                 # Dataset statistics
 │   └── tests/
 │       ├── test_permutation.py        # Key I/O, apply/unapply identity, weight correctness
 │       ├── test_gradients.py          # Gradient masking & weight update verification
 │       ├── test_gradient_alignment.py # Gradient–weight alignment after permutation
 │       ├── test_end_to_end_training.py
 │       └── test_private_finetune.py   # KL + swap_gradients, padding exclusion
-├── pretrain.sbatch               # SLURM job: baseline pretraining
-├── tiered_pretrain.sbatch        # SLURM job: tiered pretraining
 └── pyproject.toml
 ```
 
@@ -134,7 +156,14 @@ python scripts/generate_key.py \
     --target_pct 0.20 --attn_ratio 0.25 --seed 42
 ```
 
-This generates a key covering ~20% of model parameters, split 25% attention / 75% MLP. Cross-layer swaps are enforced for better mixing. Pre-generated keys for the 32M, 34M, and 64M configs are in `configs/keys/`.
+This generates a key covering ~20% of model parameters, split 25% attention / 75% MLP. Cross-layer swaps are enforced for better mixing. Pre-generated keys are in `configs/keys/`.
+
+| Key file | Model | Coverage |
+|----------|-------|----------|
+| `key_64m_20pct_mixed.json` | 64M | 20% |
+| `key_530m_14pct.json` | 530M | 14% |
+| `key_530m_7pct_{1,2,3}.json` | 530M | 7% each (for multi-tier) |
+| `key_1b_10pct_mixed.json` | 1B | 10% |
 
 ## Usage
 
@@ -165,29 +194,52 @@ PYTHONPATH=./src python src/tiered/train/inference.py \
     --prompt "Once upon a time"
 ```
 
-### Tiered Pretraining
+### 2-Tier Pretraining
 
-Train a model with asymmetric gradient updates on both C1 and C2:
+Train a model with asymmetric gradient updates on C1 and C2:
 
 ```bash
 torchrun --standalone --nproc_per_node=3 -m tiered.train.tiered_pretrain \
     --data_path /path/to/tokenized/data \
     --key_path configs/keys/key_64m_20pct_mixed.json \
     --output_dir /path/to/output \
-    --hidden_size 512 \
-    --num_heads 32 \
-    --num_layers 12 \
-    --context_size 1024 \
-    --batch_size 16 \
-    --learning_rate 6e-4 \
-    --min_lr 6e-5 \
-    --max_steps 71393 \
-    --warmup_steps 500 \
-    --wandb_project tiered-alignment \
-    --run_name my_tiered_run
+    --hidden_size 512 --num_heads 32 --num_layers 12 \
+    --context_size 1024 --batch_size 16 \
+    --learning_rate 6e-4 --min_lr 6e-5 \
+    --max_steps 71393 --warmup_steps 500 \
+    --grad_accum_steps 1 \
+    --wandb_project tiered-alignment --run_name my_run
 ```
 
-Supports distributed training via `torchrun` and automatic checkpoint resumption via `--checkpoint`.
+Supports distributed training via `torchrun`, gradient accumulation, `torch.compile`, and automatic checkpoint resumption via `--checkpoint`.
+
+### N-Tier Pretraining (Sampling)
+
+Train with multiple keyed tiers using constant compute (2 passes per step):
+
+```bash
+torchrun --standalone --nproc_per_node=4 -m tiered.train.multi_tiered_pretrain \
+    --data_path /path/to/tokenized/data \
+    --key_paths key1.json key2.json key3.json \
+    --output_dir /path/to/output \
+    --hidden_size 1024 --num_heads 16 --num_layers 24 \
+    --batch_size 8 --max_steps 100000 \
+    --tier_sample uniform
+```
+
+Options: `--tier_sample uniform` (random) or `round_robin` (deterministic cycling).
+
+### N-Tier Pretraining (Naive)
+
+Upper-bound baseline — all tiers every step:
+
+```bash
+torchrun --standalone --nproc_per_node=4 -m tiered.train.multi_tiered_naive \
+    --data_path /path/to/tokenized/data \
+    --key_paths key1.json key2.json key3.json \
+    --output_dir /path/to/output \
+    --max_steps 100000
+```
 
 ### Baseline Pretraining (No Tiered Alignment)
 
@@ -210,12 +262,40 @@ PYTHONPATH=./src python src/tiered/train/private_finetune.py \
     --private_data /path/to/forget/data \
     --public_data /path/to/retain/data \
     --output_dir /path/to/output \
-    --learning_rate 1e-5 \
-    --kl_lambda 0.1 \
-    --max_steps 10000
+    --learning_rate 1e-5 --kl_lambda 0.1 --max_steps 10000
 ```
 
+### SuperGLUE Private Finetuning
+
+Finetune C2 on SuperGLUE NLU tasks with answer-only label masking:
+
+```bash
+PYTHONPATH=./src python src/tiered/train/superglue_finetune.py \
+    --checkpoint /path/to/pretrained \
+    --key_path configs/keys/key_64m_20pct_mixed.json \
+    --superglue_data /path/to/superglue \
+    --public_data /path/to/wiki_bio/retain \
+    --output_dir /path/to/output \
+    --kl_lambda 0.1 --max_steps 10000
+```
+
+Tracks three validation signals: C1 on retain (stability), C1 on SuperGLUE (no leakage), C2 on SuperGLUE (learning).
+
 ## Data Preparation
+
+### FineWeb (Large-Scale Pretraining)
+
+Download and tokenize FineWeb for pretraining:
+
+```bash
+python -m tiered.data.prepare_fineweb \
+    --output-dir /path/to/output \
+    --chunk-size 1024 \
+    --max-tokens 100000000000 \
+    --subset sample-100BT
+```
+
+Subsets: `sample-10BT`, `sample-100BT`, `sample-350BT`, `default`. Uses `tiktoken` (GPT-2 encoding) and `hf_transfer` for fast downloads.
 
 ### Wikipedia (Forget/Adjacent/Retain Splits)
 
@@ -232,6 +312,30 @@ python -m tiered.data.prepare_wikipedia \
 
 This produces three HuggingFace `DatasetDict`s (forget, adjacent, retain), each with train/test splits, tokenized and chunked to fixed lengths.
 
+### SuperGLUE
+
+Prepares all 8 SuperGLUE tasks (BoolQ, CB, COPA, MultiRC, ReCoRD, RTE, WiC, WSC) with answer-only label masking:
+
+```bash
+PYTHONPATH=./src python src/tiered/data/prepare_superglue.py \
+    --output-dir /path/to/output/superglue \
+    --context-size 1024
+```
+
+Each example stores `input_ids`, `attention_mask`, and `labels` where `labels=-100` for prompt tokens (only answer tokens receive gradient).
+
+### Synthetic Bios (Memorization Evaluation)
+
+Generates a controlled dataset of synthetic biographies for measuring memorization:
+
+```bash
+python scripts/data/generate_synthetic_bios.py \
+    --output-dir /path/to/output \
+    --num-people 400 --seed 42
+```
+
+400 people × 24 attribute permutations = 9,600 samples. Each person has unique name, profession, hobby, and salary. Split by person (not sample) to avoid leakage.
+
 ### TinyStories (Bilingual)
 
 ```bash
@@ -241,14 +345,48 @@ python -m tiered.data.tinystories_tokenize_and_split \
     --context-size 1024
 ```
 
+## Evaluation & Ablations
+
+### Memorization Evaluation
+
+Measures how well the model memorizes synthetic bio attribute values (not filler), using precise token-level matching:
+
+```bash
+# Single checkpoint
+PYTHONPATH=./src python scripts/eval_memorization.py \
+    --checkpoint /path/to/checkpoint \
+    --bio_metadata /path/to/bios_metadata.json \
+    --key_path configs/keys/key_64m_20pct_mixed.json \
+    --output_dir /path/to/output
+
+# Sweep across all checkpoints
+PYTHONPATH=./src python scripts/eval_memorization.py \
+    --checkpoint /path/to/ckpt_dir \
+    --bio_metadata /path/to/bios_metadata.json \
+    --key_path configs/keys/key_64m_20pct_mixed.json \
+    --output_dir /path/to/output --sweep
+```
+
+Reports per-attribute breakdowns (age, profession, hobby, salary), top-k accuracy, and exact match rates for both C1 and C2.
+
+### Ablation Studies
+
+| Script | Description |
+|--------|-------------|
+| `ablation_random_key.py` | Evaluates C1, C2 (correct key), and C3 (random keys). Tests whether a random key can unlock C2 capabilities. |
+| `ablation_corrupt_keyed.py` | Randomizes keyed weight values, measures C1/C2 loss. Tests C1 robustness to keyed weight corruption. |
+| `ablation_gradual_corrupt.py` | Gradually corrupts keyed weights 1% at a time, tracking degradation curves on private and public data. |
+| `ablation_gradual_key.py` | Gradually replaces correct key swaps with random ones, tracking C2 degradation as key accuracy decreases. |
+
+All ablations produce charts (loss and top-k accuracy), log to WandB, and save JSON results.
+
 ## Model Configurations
 
 | Config | Layers | Hidden | Heads | Intermediate | ~Params |
 |--------|--------|--------|-------|-------------|---------|
-| 34M    | 8      | 384    | 32    | 1,536       | 34M     |
 | 64M    | 12     | 512    | 32    | 2,048       | 64M     |
-| 125M   | 12     | 768    | 32    | 3,072       | 125M    |
-| 254M   | 16     | 1,024  | 32    | 4,096       | 254M    |
+| 530M   | 24     | 1,024  | 16    | 4,096       | 530M    |
+| 1B     | 24     | 2,048  | 16    | 8,192       | 1B      |
 
 All models use GPT-Neo architecture with alternating global/local attention, a 1024-token context window, GPT-2 tokenizer (vocab size 50,257), and tied input/output embeddings.
 
@@ -261,6 +399,7 @@ All models use GPT-Neo architecture with alternating global/local attention, a 1
 | `load_key` / `save_key` | JSON serialization for keys |
 | `validate_key` | Bounds-check key indices against model dimensions |
 | `apply_permutation` / `unapply_permutation` | Swap weights according to key (self-inverse) |
+| `build_swap_plan` / `build_mask_plan` | Pre-compute permutation/masking index tensors for efficiency |
 | `swap_gradients` | Swap gradients to follow their weight values after `apply_key` |
 | `mask_keyed_gradients` | Zero gradients for keyed parameters (used in C1 backward) |
 | `mask_public_gradients` | Zero gradients for public parameters (used in private finetuning) |
@@ -273,6 +412,10 @@ All models use GPT-Neo architecture with alternating global/local attention, a 1
 **`swap_gradients` in private finetuning:** When computing KL loss on C1 and then switching to C2 for the private loss, the KL gradients must be swapped to follow their weights into C2 positions before accumulating. This is handled by `swap_gradients` in `private_finetune.py`.
 
 **Batched MLP swaps:** MLP column swaps are grouped by layer pair and executed as batch index operations for efficiency, since keys can contain thousands of MLP swaps.
+
+**Pre-computed plans:** `build_swap_plan` and `build_mask_plan` pre-compute index tensors on the target device, avoiding repeated tensor construction per step. This is critical for large keys (530M+).
+
+**N-tier gradient combination (naive):** In the naive all-tiers script, gradients are combined by scaling all gradients by 1/N, then rescaling keyed positions back by N so each tier's keyed weights receive the full (unaveraged) gradient from their own pass.
 
 ## Citation
 

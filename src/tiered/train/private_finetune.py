@@ -29,6 +29,7 @@ Usage:
 import argparse
 import math
 import os
+import time
 
 import torch
 import torch.nn.functional as F
@@ -42,6 +43,55 @@ from tqdm import tqdm
 from tiered.model import GPTNeoForCausalLMTiered
 from tiered.permutation import load_key, mask_public_gradients
 from tiered.train.utils import save_checkpoint
+
+
+# ---------------------------------------------------------------------------
+# Compute-metrics helpers (shared with pretraining scripts)
+# ---------------------------------------------------------------------------
+
+def count_total_parameters(model) -> int:
+    """Return the exact total number of parameters in the model."""
+    return sum(p.numel() for p in model.parameters())
+
+
+# Peak bf16 FLOP/s for common GPUs. Used for MFU calculation.
+# Values are tensor-core peak, not boost-clock peak.
+_GPU_PEAK_TFLOPS_BF16 = {
+    "A100": 312e12,
+    "A10G": 70e12,
+    "H100": 990e12,
+    "H200": 990e12,
+    "L4": 121e12,
+    "L40": 181e12,
+    "L40S": 366e12,
+    "4090": 330e12,
+    "3090": 142e12,
+    "4080": 203e12,
+}
+
+
+def detect_gpu_peak_flops(device: torch.device) -> tuple[float, str]:
+    """Return (peak_flops_bf16, gpu_name) for the current GPU."""
+    if not torch.cuda.is_available():
+        return 0.0, "cpu"
+    name = torch.cuda.get_device_name(device)
+    normalized = name.lower().replace(" ", "")
+    for key, peak in _GPU_PEAK_TFLOPS_BF16.items():
+        if key.lower() in normalized:
+            return peak, name
+    return 0.0, name
+
+
+def get_gpu_memory_stats(device: torch.device) -> dict:
+    """Snapshot of current GPU memory usage."""
+    if not torch.cuda.is_available():
+        return {}
+    return {
+        "gpu/mem_allocated_gb": torch.cuda.memory_allocated(device) / 1e9,
+        "gpu/mem_reserved_gb": torch.cuda.memory_reserved(device) / 1e9,
+        "gpu/mem_peak_allocated_gb": torch.cuda.max_memory_allocated(device) / 1e9,
+        "gpu/mem_peak_reserved_gb": torch.cuda.max_memory_reserved(device) / 1e9,
+    }
 
 
 def parse_args():
@@ -86,6 +136,11 @@ def parse_args():
     parser.add_argument("--save_interval", type=int, default=1000)
     parser.add_argument("--wandb_project", type=str, default="tiered-alignment-finetune")
     parser.add_argument("--run_name", type=str, default=None)
+
+    # Workers
+    parser.add_argument("--num_workers", type=int, default=4,
+                        help="DataLoader worker processes (reduce on "
+                             "machines with few cores per GPU)")
     
     return parser.parse_args()
 
@@ -154,6 +209,8 @@ def train_step(model, ref_model, private_batch, public_batch, key, optimizer, de
     mask_public_gradients(model, key)
     
     # === Step 6: Optimizer step WHILE IN C2 CONFIG ===
+    # With a single fixed key this is correct: Adam's momentum/variance at
+    # each buffer position always tracks the same logical weight every step.
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
     optimizer.step()
     
@@ -307,7 +364,7 @@ def main():
         shuffle=True,
         collate_fn=collator,
         drop_last=True,
-        num_workers=6,
+        num_workers=args.num_workers,
         pin_memory=True,
     )
     
@@ -317,7 +374,7 @@ def main():
         shuffle=False,
         collate_fn=collator,
         drop_last=True,
-        num_workers=6,
+        num_workers=args.num_workers,
         pin_memory=True,
     )
     
@@ -351,7 +408,7 @@ def main():
                 shuffle=True,
                 collate_fn=collator,
                 drop_last=True,
-                num_workers=6,
+                num_workers=args.num_workers,
                 pin_memory=True,
             )
         
@@ -361,7 +418,7 @@ def main():
             shuffle=False,
             collate_fn=collator,
             drop_last=True,
-            num_workers=6,
+            num_workers=args.num_workers,
             pin_memory=True,
         )
     
@@ -387,6 +444,7 @@ def main():
     # Resume from finetuning checkpoint if provided
     global_step = 0
     wandb_run_id = None
+    cumulative_wall_secs = 0.0
     if args.resume_from:
         training_state_path = os.path.join(args.resume_from, "training_state.pt")
         if os.path.exists(training_state_path):
@@ -395,7 +453,10 @@ def main():
             scheduler.load_state_dict(training_state["scheduler"])
             global_step = training_state["global_step"]
             wandb_run_id = training_state.get("wandb_run_id")
+            cumulative_wall_secs = training_state.get("cumulative_wall_secs", 0.0)
             print(f"Resumed finetuning state from step {global_step}")
+            if cumulative_wall_secs > 0:
+                print(f"  Resumed cumulative wall time: {cumulative_wall_secs / 3600:.2f}h")
         # Load model weights from resume checkpoint
         model = GPTNeoForCausalLMTiered.from_pretrained(args.resume_from)
         model.to(device)
@@ -414,13 +475,78 @@ def main():
     wandb_run_id = wandb.run.id
     wandb.define_metric("train/step")
     wandb.define_metric("*", step_metric="train/step")
+
+    # ── Compute metrics setup ──
+    num_params = count_total_parameters(model)
+    # Infer context size from the model's embedding table
+    context_size = model.config.max_position_embeddings
+
+    # Tokens per step: batch_size * context_size for each data stream.
+    # With KL: private batch + public batch = 2 * batch_size * context_size tokens read
+    # Without KL: private batch only = batch_size * context_size tokens read
+    tokens_private_per_step = args.batch_size * context_size
+    tokens_public_per_step = tokens_private_per_step if (args.kl_lambda > 0 and public_loader is not None) else 0
+
+    # FLOPs per step using 6N approximation (fwd+bwd = 6N per token):
+    #   With KL enabled:
+    #     ref_model forward (no grad):     2N * tokens_public  (fwd only, no bwd)
+    #     model C1 forward+backward (KL):  6N * tokens_public
+    #     model C2 forward+backward (priv): 6N * tokens_private
+    #   Without KL:
+    #     model C2 forward+backward (priv): 6N * tokens_private
+    kl_enabled = (args.kl_lambda > 0 and public_loader is not None)
+    if kl_enabled:
+        flops_per_step = (
+            2 * num_params * tokens_public_per_step    # ref fwd only
+            + 6 * num_params * tokens_public_per_step  # model C1 fwd+bwd
+            + 6 * num_params * tokens_private_per_step # model C2 fwd+bwd
+        )
+    else:
+        flops_per_step = 6 * num_params * tokens_private_per_step
+
+    gpu_peak_flops, gpu_name = detect_gpu_peak_flops(device)
+
+    print(f"\n── Compute metrics ──")
+    print(f"  Parameters (N):        {num_params:,}")
+    print(f"  Context size:          {context_size}")
+    print(f"  Tokens/step (private): {tokens_private_per_step:,}")
+    if kl_enabled:
+        print(f"  Tokens/step (public):  {tokens_public_per_step:,}")
+    print(f"  FLOPs/step (est):      {flops_per_step:.3e}"
+          f"  ({'ref fwd + C1 fwd/bwd + C2 fwd/bwd' if kl_enabled else 'C2 fwd/bwd only'})")
+    print(f"  GPU:                   {gpu_name}")
+    if gpu_peak_flops > 0:
+        print(f"  GPU peak bf16:         {gpu_peak_flops:.3e} FLOP/s")
+    else:
+        print(f"  GPU peak bf16:         unknown (MFU will be N/A)")
+    print()
+
+    # Reset peak memory stats
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats(device)
+
+    # Log static compute info
+    wandb.config.update({
+        "compute/num_params": num_params,
+        "compute/context_size": context_size,
+        "compute/tokens_private_per_step": tokens_private_per_step,
+        "compute/tokens_public_per_step": tokens_public_per_step,
+        "compute/flops_per_step": flops_per_step,
+        "compute/kl_enabled": kl_enabled,
+        "compute/gpu_name": gpu_name,
+        "compute/gpu_peak_bf16_flops": gpu_peak_flops,
+    }, allow_val_change=True)
+
+    # Cumulative trackers
+    cumulative_tokens = global_step * (tokens_private_per_step + tokens_public_per_step)
+    train_start_wall = time.time()
     
     # Training loop
     private_iter = iter(private_loader)
     public_iter = iter(public_loader) if public_loader else None
     best_val_loss = float('inf')
     
-    print(f"\nStarting finetuning for {args.max_steps} steps...")
+    print(f"Starting finetuning for {args.max_steps} steps...")
     print(f"Objective: L_ft = (1-{args.kl_lambda})*L_priv + {args.kl_lambda}*R_KL")
     print(f"Validation every {args.eval_interval} steps")
     print(f"Tracking: C1 on retain, C1 on private, C2 on private")
@@ -428,6 +554,11 @@ def main():
     pbar = tqdm(total=args.max_steps, desc="Finetuning", initial=global_step)
     
     while global_step < args.max_steps:
+        # ── Step timing ──
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        step_start = time.monotonic()
+
         # Get private batch
         try:
             private_batch = next(private_iter)
@@ -451,6 +582,14 @@ def main():
         scheduler.step()
         global_step += 1
         
+        # ── Step timing ──
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        step_elapsed = time.monotonic() - step_start
+        cumulative_wall_secs += step_elapsed
+        step_tokens = tokens_private_per_step + tokens_public_per_step
+        cumulative_tokens += step_tokens
+
         pbar.update(1)
         pbar.set_postfix({"L_priv": f"{loss_priv:.3f}", "R_KL": f"{loss_kl:.3f}"})
         
@@ -459,7 +598,13 @@ def main():
             ppl = math.exp(min(loss_priv, 100))
             total_loss = (1 - args.kl_lambda) * loss_priv + args.kl_lambda * loss_kl
             lr = optimizer.param_groups[0]["lr"]
-            wandb.log({
+
+            # Throughput
+            tokens_per_sec = step_tokens / step_elapsed if step_elapsed > 0 else 0.0
+            achieved_flops_per_sec = flops_per_step / step_elapsed if step_elapsed > 0 else 0.0
+            mfu = achieved_flops_per_sec / gpu_peak_flops if gpu_peak_flops > 0 else 0.0
+
+            log_dict = {
                 "Train/Total Loss": total_loss,
                 "Train/Private Loss (C2)": loss_priv,
                 "Train/KL Divergence": loss_kl,
@@ -467,7 +612,23 @@ def main():
                 "Train/Accuracy (C2)": acc,
                 "Train/LR": lr,
                 "train/step": global_step,
-            })
+                # Timing
+                "perf/step_time_sec": step_elapsed,
+                "perf/wall_clock_hrs": cumulative_wall_secs / 3600,
+                "perf/wall_since_launch_hrs": (time.time() - train_start_wall) / 3600,
+                # Throughput
+                "perf/tokens_per_sec": tokens_per_sec,
+                # FLOPs
+                "perf/flops_per_step": flops_per_step,
+                "perf/achieved_tflops": achieved_flops_per_sec / 1e12,
+                "perf/mfu": mfu,
+                # Cumulative
+                "perf/cumulative_tokens": cumulative_tokens,
+                "perf/cumulative_flops": flops_per_step * global_step,
+                "perf/cumulative_petaflops": (flops_per_step * global_step) / 1e15,
+            }
+            log_dict.update(get_gpu_memory_stats(device))
+            wandb.log(log_dict)
         
         # Validation
         if global_step == 1 or global_step % args.eval_interval == 0:
@@ -524,7 +685,8 @@ def main():
                 save_path = os.path.join(args.output_dir, "best")
                 save_checkpoint(model, tokenizer, optimizer, save_path,
                               scheduler=scheduler, global_step=global_step,
-                              wandb_run_id=wandb_run_id)
+                              wandb_run_id=wandb_run_id,
+                              cumulative_wall_secs=cumulative_wall_secs)
                 print(f"New best model saved to {save_path}")
         
         # Save checkpoint
@@ -532,7 +694,8 @@ def main():
             save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
             save_checkpoint(model, tokenizer, optimizer, save_path,
                           scheduler=scheduler, global_step=global_step,
-                          wandb_run_id=wandb_run_id)
+                          wandb_run_id=wandb_run_id,
+                          cumulative_wall_secs=cumulative_wall_secs)
             print(f"Saved checkpoint to {save_path}")
     
     pbar.close()
@@ -541,9 +704,46 @@ def main():
     save_path = os.path.join(args.output_dir, "final")
     save_checkpoint(model, tokenizer, optimizer, save_path,
                    scheduler=scheduler, global_step=global_step,
-                   wandb_run_id=wandb_run_id)
-    print(f"Finetuning complete. Final checkpoint: {save_path}")
+                   wandb_run_id=wandb_run_id,
+                   cumulative_wall_secs=cumulative_wall_secs)
+
+    total_flops = flops_per_step * global_step
+    print(f"\n{'='*60}")
+    print("FINETUNING COMPLETE — COMPUTE SUMMARY")
+    print(f"{'='*60}")
+    print(f"  Steps:                 {global_step:,}")
+    print(f"  Parameters (N):        {num_params:,}")
+    print(f"  KL enabled:            {kl_enabled}")
+    print(f"  Total tokens:          {cumulative_tokens:,}")
+    print(f"  Total FLOPs:           {total_flops:.4e}")
+    print(f"  Total PetaFLOPs:       {total_flops / 1e15:.2f}")
+    print(f"  Wall clock (train):    {cumulative_wall_secs / 3600:.2f} hours")
+    print(f"  Wall clock (total):    {(time.time() - train_start_wall) / 3600:.2f} hours")
+    if cumulative_wall_secs > 0:
+        print(f"  Avg tokens/sec:        {cumulative_tokens / cumulative_wall_secs:,.0f}")
+        if gpu_peak_flops > 0:
+            avg_mfu = (total_flops / cumulative_wall_secs) / gpu_peak_flops
+            print(f"  Avg MFU:               {avg_mfu:.2%}")
+    print(f"  GPU:                   {gpu_name}")
+    print(f"  Checkpoint:            {save_path}")
+    print(f"{'='*60}\n")
+
+    wandb.run.summary.update({
+        "final/total_steps": global_step,
+        "final/total_tokens": cumulative_tokens,
+        "final/total_flops": total_flops,
+        "final/total_petaflops": total_flops / 1e15,
+        "final/wall_clock_hours": cumulative_wall_secs / 3600,
+        "final/num_params": num_params,
+        "final/gpu_name": gpu_name,
+    })
+    if cumulative_wall_secs > 0:
+        wandb.run.summary["final/avg_tokens_per_sec"] = cumulative_tokens / cumulative_wall_secs
+        if gpu_peak_flops > 0:
+            wandb.run.summary["final/avg_mfu"] = (total_flops / cumulative_wall_secs) / gpu_peak_flops
+
     wandb.finish()
+    print(f"Finetuning complete. Final checkpoint: {save_path}")
 
 
 if __name__ == "__main__":
