@@ -31,8 +31,10 @@ import argparse
 import math
 import os
 import time
+from collections import defaultdict
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.distributed as dist
@@ -52,6 +54,7 @@ from tiered.permutation.permute import (
     apply_permutation, unapply_permutation, swap_gradients, build_swap_plan,
     SwapPlan,
 )
+from tiered.permutation.utils import _get_attention_module, _get_mlp_module
 from tiered.train.utils import load_model, save_checkpoint
 
 
@@ -68,7 +71,6 @@ def count_trainable_parameters(model) -> int:
 
 
 def count_swappable_parameters(model, mask_plan) -> dict:
-    from tiered.permutation.utils import _get_attention_module, _get_mlp_module
     total_attn = 0
     total_mlp = 0
     for layer_idx, idx in mask_plan.keyed_attn_indices.items():
@@ -89,7 +91,6 @@ def count_swappable_parameters(model, mask_plan) -> dict:
 
 
 def count_max_swappable_parameters(model) -> dict:
-    from tiered.permutation.utils import _get_attention_module, _get_mlp_module
     total_attn = 0
     total_mlp = 0
     for layer_idx in range(len(model.transformer.h)):
@@ -155,16 +156,129 @@ def get_gpu_memory_stats(device):
 
 
 # ---------------------------------------------------------------------------
+# Public mask: precomputed per-parameter masks for efficient gradient scaling
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PublicMask:
+    """Pre-computed boolean masks identifying public (non-keyed) positions.
+
+    Built once at startup from the union of all tiers' keyed indices.
+    Used in Phase 3 to scale only public gradient positions by 1/N,
+    leaving keyed positions at their full single-tier value.
+
+    Each entry maps id(param) -> (mask_1d, dim):
+      - mask_1d: BoolTensor where True = public position
+      - dim: 0 for row-indexed params (q/k/v weights, c_fc weight/bias),
+             1 for column-indexed params (out_proj weight, c_proj weight)
+    """
+    entries: Dict[int, Tuple[torch.Tensor, int]] = field(default_factory=dict)
+
+
+def build_public_mask(model, tiers: list, device: torch.device) -> PublicMask:
+    """Build per-parameter boolean masks from the union of all tiers' keyed indices.
+
+    Since keys are guaranteed non-overlapping, the union is a simple
+    concatenation of each tier's keyed indices per (layer, component).
+
+    Call ONCE at startup alongside swap/mask plans.
+    """
+    mask = PublicMask()
+
+    # Collect all keyed indices per (layer, param_id) across all tiers.
+    # Attention: row-indexed for q/k/v, column-indexed for out_proj.
+    # MLP: row-indexed for c_fc, column-indexed for c_proj.
+    keyed_attn_per_layer: Dict[int, Set[int]] = defaultdict(set)
+    keyed_mlp_per_layer: Dict[int, Set[int]] = defaultdict(set)
+
+    for tier in tiers:
+        for layer_idx, idx in tier.mask_plan.keyed_attn_indices.items():
+            keyed_attn_per_layer[layer_idx].update(idx.cpu().tolist())
+        for layer_idx, idx in tier.mask_plan.keyed_mlp_indices.items():
+            keyed_mlp_per_layer[layer_idx].update(idx.cpu().tolist())
+
+    for layer_idx in range(len(model.transformer.h)):
+        attn = _get_attention_module(model, layer_idx)
+        mlp = _get_mlp_module(model, layer_idx)
+
+        # --- Attention ---
+        if layer_idx in keyed_attn_per_layer:
+            keyed = torch.tensor(sorted(keyed_attn_per_layer[layer_idx]),
+                                 dtype=torch.long, device=device)
+            num_rows = attn.q_proj.weight.shape[0]
+            row_mask = torch.ones(num_rows, dtype=torch.bool, device=device)
+            row_mask[keyed] = False
+
+            for proj in (attn.q_proj, attn.k_proj, attn.v_proj):
+                mask.entries[id(proj.weight)] = (row_mask, 0)
+
+            num_cols = attn.out_proj.weight.shape[1]
+            col_mask = torch.ones(num_cols, dtype=torch.bool, device=device)
+            col_mask[keyed] = False
+            mask.entries[id(attn.out_proj.weight)] = (col_mask, 1)
+
+        # --- MLP ---
+        if layer_idx in keyed_mlp_per_layer:
+            keyed = torch.tensor(sorted(keyed_mlp_per_layer[layer_idx]),
+                                 dtype=torch.long, device=device)
+            num_rows = mlp.c_fc.weight.shape[0]
+            row_mask = torch.ones(num_rows, dtype=torch.bool, device=device)
+            row_mask[keyed] = False
+            mask.entries[id(mlp.c_fc.weight)] = (row_mask, 0)
+
+            if mlp.c_fc.bias is not None:
+                bias_mask = torch.ones(mlp.c_fc.bias.shape[0],
+                                       dtype=torch.bool, device=device)
+                bias_mask[keyed] = False
+                mask.entries[id(mlp.c_fc.bias)] = (bias_mask, 0)
+
+            num_cols = mlp.c_proj.weight.shape[1]
+            col_mask = torch.ones(num_cols, dtype=torch.bool, device=device)
+            col_mask[keyed] = False
+            mask.entries[id(mlp.c_proj.weight)] = (col_mask, 1)
+
+    return mask
+
+
+def scale_public_gradients_multi(model, public_mask: PublicMask,
+                                  scale: float) -> None:
+    """Scale gradients at public positions by `scale`, leaving keyed positions
+    untouched.
+
+    Uses the precomputed PublicMask for a single efficient pass over all
+    parameters. Parameters not in the mask (embeddings, layernorms, etc.)
+    are entirely public and scaled uniformly.
+    """
+    for p in model.parameters():
+        if p.grad is None:
+            continue
+        entry = public_mask.entries.get(id(p))
+        if entry is None:
+            # Entirely public parameter (embeddings, layernorms, biases not in MLP)
+            p.grad.mul_(scale)
+        else:
+            pmask, dim = entry
+            if dim == 0:
+                if p.grad.dim() == 1:
+                    # 1D param (bias): direct boolean index
+                    p.grad[pmask] *= scale
+                else:
+                    # 2D param: public rows
+                    p.grad[pmask] *= scale
+            else:
+                # 2D param: public columns
+                p.grad[:, pmask] *= scale
+
+
+# ---------------------------------------------------------------------------
 # Gradient save/restore helpers for cross-tier isolation
 # ---------------------------------------------------------------------------
 
 def _extract_keyed_gradients(model, plan: MaskPlan) -> dict:
     """Save a copy of .grad values at keyed positions.
 
-    Returns a nested dict: {layer_idx: {param_name: tensor_clone}}.
+    Returns a nested dict: {(component, layer_idx): {param_name: tensor_clone}}.
     """
-    from tiered.permutation.utils import _get_attention_module, _get_mlp_module
-
     saved = {}
     for layer_idx, idx in plan.keyed_attn_indices.items():
         attn = _get_attention_module(model, layer_idx)
@@ -192,8 +306,6 @@ def _extract_keyed_gradients(model, plan: MaskPlan) -> dict:
 
 def _restore_keyed_gradients(model, plan: MaskPlan, saved: dict):
     """Write saved gradient values back into .grad at keyed positions."""
-    from tiered.permutation.utils import _get_attention_module, _get_mlp_module
-
     for layer_idx, idx in plan.keyed_attn_indices.items():
         attn = _get_attention_module(model, layer_idx)
         layer_data = saved[("attn", layer_idx)]
@@ -280,7 +392,7 @@ def parse_args():
 
 
 # ---------------------------------------------------------------------------
-# Evaluation (always all tiers — no sampling to be selective about)
+# Evaluation
 # ---------------------------------------------------------------------------
 
 @torch.inference_mode()
@@ -419,6 +531,14 @@ def train(args):
             print(f"  Tier C{tier_id}: key={key_path}, "
                   f"{len(key.attn_heads)} attn swaps, {len(key.mlp_cols)} MLP swaps, "
                   f"{len(swap_plan.attn_ops)} swap ops")
+
+    # Build the public mask from the union of all tiers' keyed indices.
+    # This is used in Phase 3 to scale only public gradient positions by
+    # 1/N, leaving keyed positions at their full single-tier value.
+    public_mask = build_public_mask(model, tiers, device)
+    if is_main:
+        print(f"Built public mask: {len(public_mask.entries)} parameter tensors "
+              f"have mixed public/keyed positions")
 
     raw_model = model
     model = torch.compile(model)
@@ -656,9 +776,8 @@ def train(args):
                     total_loss_c1 += loss_c1.item()
                 (loss_c1 * loss_scale).backward()
 
-        # Zero C1 gradients on ALL tiers' keyed weights.
-        # After this, .grad contains C1's contribution only on positions
-        # that are not keyed by ANY tier (the truly-public parameters).
+        # Zero C1 gradients on ALL tiers' keyed weights so that only public
+        # positions retain the C1 contribution going into Phase 2.
         for tier in tiers:
             mask_keyed_gradients(raw_model, tier.key, plan=tier.mask_plan)
 
@@ -693,40 +812,36 @@ def train(args):
             unapply_permutation(raw_model, tier.key, plan=tier.swap_plan)
             swap_gradients(raw_model, tier.key, plan=tier.swap_plan)
 
-            # Save this tier's correct keyed gradient (only from its own pass,
-            # since all keyed positions were zeroed before this tier ran).
+            # Save this tier's keyed gradient before it gets zeroed.
+            # Since all keyed positions were zeroed before this tier ran,
+            # the gradient here is purely from this tier's own backward pass.
             saved_keyed_grads[tier.tier_id] = _extract_keyed_gradients(
                 raw_model, tier.mask_plan)
 
             # Mask ALL tiers' keyed positions to remove this tier's
             # contaminating gradient on other tiers' keyed weights.
-            # Public positions are untouched and keep accumulating.
+            # Public positions accumulate across all tiers (desired).
             for t in tiers:
                 mask_keyed_gradients(raw_model, t.key, plan=t.mask_plan)
 
-        # Restore each tier's saved keyed gradient (clean, single-tier only)
+        # ==================== PHASE 3: gradient combination ====================
+        # At this point .grad contains:
+        #   Public positions:  grad_c1 + grad_c2 + ... + grad_cN  (N terms)
+        #   Keyed positions:   0  (all zeroed by masking after last tier)
+        #
+        # We want:
+        #   Public:  (grad_c1 + sum(grad_ck)) / (N * A)
+        #   Keyed-k: grad_ck / A
+        #
+        # Step 1: Restore each tier's saved keyed gradients.
         for tier in tiers:
             _restore_keyed_gradients(
                 raw_model, tier.mask_plan, saved_keyed_grads[tier.tier_id])
 
-        # ==================== PHASE 3: gradient combination ====================
-        # At this point .grad contains (all scaled by 1/grad_accum_steps):
-        #   Public positions:  grad_c1 + grad_c2 + ... + grad_cN  (N contributions)
-        #   Keyed-k positions: grad_ck                             (1 contribution, clean)
-        #
-        # We want:
-        #   Public:  (grad_c1 + sum(grad_ck)) / (N * A)  = average over all configs
-        #   Keyed-k: grad_ck / A                          = full gradient from own tier
-        #
-        # Divide all grads by N (averages public positions correctly), then
-        # restore keyed positions to their pre-division values so they keep
-        # the full single-tier gradient.
-        for p in raw_model.parameters():
-            if p.grad is not None:
-                p.grad.div_(num_configs)
-        for tier in tiers:
-            _restore_keyed_gradients(
-                raw_model, tier.mask_plan, saved_keyed_grads[tier.tier_id])
+        # Step 2: Scale only public positions by 1/N using the precomputed
+        # mask. Keyed positions already hold the correct unattenuated value.
+        scale_public_gradients_multi(raw_model, public_mask,
+                                      scale=1.0 / num_configs)
 
         # ── Clip, step, schedule (all in C1 frame) ──
         grad_norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.max_grad_norm)
@@ -789,7 +904,6 @@ def train(args):
                 "perf/cumulative_flops": num_configs * flops_per_token * cumulative_tokens,
                 "perf/cumulative_petaflops": (num_configs * flops_per_token * cumulative_tokens) / 1e15,
             }
-            # Per-tier losses
             for tier in tiers:
                 tid = tier.tier_id
                 log_dict[f"loss_c{tid}"] = avg_tier_losses[tid]
