@@ -790,13 +790,14 @@ def train(args):
 
                 (loss_c1 * loss_scale).backward()
 
-        # Zero C1 gradients on this tier's keyed weights.
+        # Zero C1 gradients on ALL tiers' keyed weights.
         # NOTE: This operates on raw_model (unwrapped), which is safe because
         # DDP's allreduce hooks fire during the final synced backward above.
         # By this point .grad tensors are already reduced across ranks, so
         # subsequent in-place modifications (masking, scaling, swapping) are
         # purely local and don't interact with DDP's communication.
-        mask_keyed_gradients(raw_model, active_tier.key, plan=active_tier.mask_plan)
+        for tier in tiers:
+            mask_keyed_gradients(raw_model, tier.key, plan=tier.mask_plan)
 
         # ==================== PHASE 2: C_k (sampled keyed tier) ====================
         apply_permutation(raw_model, active_tier.key, plan=active_tier.swap_plan)
