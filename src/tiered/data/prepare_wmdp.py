@@ -69,12 +69,12 @@ def main():
     print("PHASE 1: DOWNLOAD WMDP FORGET CORPORA")
     print(f"{'='*70}")
 
-    print("Loading bio-forget-corpus...")
-    bio_forget = load_dataset("cais/wmdp-corpora", "bio-forget-corpus", split="train")
+    print("Loading bio-forget-corpus (gated)...")
+    bio_forget = load_dataset("cais/wmdp-bio-forget-corpus", split="train")
     print(f"  bio-forget: {len(bio_forget)} documents")
 
-    print("Loading cyber-forget-corpus...")
-    cyber_forget = load_dataset("cais/wmdp-corpora", "cyber-forget-corpus", split="train")
+    print("Loading cyber-forget-corpus (gated)...")
+    cyber_forget = load_dataset("cais/wmdp-cyber-forget-corpus", split="train")
     print(f"  cyber-forget: {len(cyber_forget)} documents")
 
     # Combine bio + cyber forget into one dataset
