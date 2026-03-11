@@ -30,13 +30,16 @@ import argparse
 import math
 import os
 import time
+from contextlib import nullcontext
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import wandb
 from datasets import load_from_disk
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoTokenizer, DataCollatorForLanguageModeling
 from tqdm import tqdm
 
@@ -101,7 +104,9 @@ def parse_args():
     parser.add_argument("--checkpoint", type=str, required=True,
                         help="Path to tiered pretrained checkpoint")
     parser.add_argument("--key_path", type=str, required=True,
-                        help="Path to permutation key JSON")
+                        help="Path to permutation key JSON (active key for training)")
+    parser.add_argument("--all_key_paths", type=str, nargs="*", default=None,
+                        help="All key paths for cross-tier eval (if omitted, only active key is evaluated)")
     
     # Data
     parser.add_argument("--private_data", type=str, required=True,
@@ -145,7 +150,9 @@ def parse_args():
     return parser.parse_args()
 
 
-def train_step(model, ref_model, private_batch, public_batch, key, optimizer, device, kl_lambda, max_grad_norm):
+def train_step(model, raw_model, ref_model, private_batch, public_batch,
+               key, optimizer, device, kl_lambda, max_grad_norm,
+               is_distributed=False):
     """Execute one finetuning step.
     
     Implements: L_ft = (1-λ) * L_priv(C2) + λ * R_KL(C1)
@@ -155,9 +162,10 @@ def train_step(model, ref_model, private_batch, public_batch, key, optimizer, de
     
     Algorithm:
     1. Forward C1 on public data → R_KL → backward (if kl_lambda > 0)
+       Uses no_sync() so DDP doesn't allreduce yet.
     2. apply_key → switch weights to C2 positions
     3. swap_gradients → move KL gradients to follow their weights
-    4. Forward C2 on private data → L_priv → backward (accumulates)
+    4. Forward C2 on private data → L_priv → backward (WITH sync)
     5. mask_public_gradients (zero public grads, keep keyed grads)
     6. clip_grad_norm + optimizer.step() [WHILE IN C2]
     7. unapply_key → back to C1
@@ -167,7 +175,7 @@ def train_step(model, ref_model, private_batch, public_batch, key, optimizer, de
     """
     from tiered.permutation import swap_gradients
     
-    model.train()
+    raw_model.train()
     optimizer.zero_grad()
     
     # === Step 1: R_KL on C1 (public architecture) ===
@@ -175,23 +183,26 @@ def train_step(model, ref_model, private_batch, public_batch, key, optimizer, de
     if kl_lambda > 0 and public_batch is not None and ref_model is not None:
         public_ids = public_batch["input_ids"].to(device)
         
-        with torch.no_grad():
-            ref_logits = ref_model(public_ids).logits
-            ref_probs = F.softmax(ref_logits, dim=-1)
-        
-        current_logits = model(public_ids).logits
-        current_log_probs = F.log_softmax(current_logits, dim=-1)
-        loss_kl = F.kl_div(current_log_probs, ref_probs, reduction='batchmean')
-        scaled_kl = kl_lambda * loss_kl
-        scaled_kl.backward()
+        # Use no_sync so KL backward doesn't trigger allreduce yet
+        sync_ctx = model.no_sync() if is_distributed else nullcontext()
+        with sync_ctx:
+            with torch.no_grad():
+                ref_logits = ref_model(public_ids).logits
+                ref_probs = F.softmax(ref_logits, dim=-1)
+            
+            current_logits = model(public_ids).logits
+            current_log_probs = F.log_softmax(current_logits, dim=-1)
+            loss_kl = F.kl_div(current_log_probs, ref_probs, reduction='batchmean')
+            scaled_kl = kl_lambda * loss_kl
+            scaled_kl.backward()
         loss_kl_value = loss_kl.item()
     
     # === Step 2-3: Switch to C2 and swap gradients to follow weights ===
-    model.apply_key(key)
+    raw_model.apply_key(key)
     if kl_lambda > 0:
-        swap_gradients(model, key)  # KL gradients now at C2 positions
+        swap_gradients(raw_model, key)  # KL gradients now at C2 positions
     
-    # === Step 4: L_priv on C2 ===
+    # === Step 4: L_priv on C2 (WITH sync — triggers allreduce) ===
     private_ids = private_batch["input_ids"].to(device)
     labels = private_batch["labels"].to(device)
     outputs_c2 = model(private_ids, labels=labels)
@@ -206,16 +217,14 @@ def train_step(model, ref_model, private_batch, public_batch, key, optimizer, de
     scaled_priv.backward()
     
     # === Step 5: Zero public grads ===
-    mask_public_gradients(model, key)
+    mask_public_gradients(raw_model, key)
     
     # === Step 6: Optimizer step WHILE IN C2 CONFIG ===
-    # With a single fixed key this is correct: Adam's momentum/variance at
-    # each buffer position always tracks the same logical weight every step.
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+    torch.nn.utils.clip_grad_norm_(raw_model.parameters(), max_grad_norm)
     optimizer.step()
     
     # === Step 7: Back to C1 ===
-    model.unapply_key(key)
+    raw_model.unapply_key(key)
     
     return loss_priv.item(), loss_kl_value, acc
 
@@ -309,27 +318,76 @@ def evaluate_on_dataset(model, dataloader, key, device, num_steps=50, eval_c2=Fa
 
 def main():
     args = parse_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # ── Distributed setup ──
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    if local_rank != -1:
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+        dist.init_process_group(backend="nccl")
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        world_size = 1
+        rank = 0
+    
+    is_main = rank == 0
+    is_distributed = local_rank != -1
     
     os.makedirs(args.output_dir, exist_ok=True)
     
     # Load model and key
-    print(f"Loading model from {args.checkpoint}")
+    if is_main:
+        print(f"Loading model from {args.checkpoint}")
     model = GPTNeoForCausalLMTiered.from_pretrained(args.checkpoint)
     model.to(device)
     
     key = load_key(args.key_path)
-    print(f"Loaded key: {len(key.attn_heads)} attention swaps, {len(key.mlp_cols)} MLP swaps")
+    if is_main:
+        print(f"Loaded active key: {len(key.attn_heads)} attention swaps, {len(key.mlp_cols)} MLP swaps")
+    
+    # Load all keys for cross-tier evaluation — label as C2, C3, ..., CN
+    # (C1 = public/no key)
+    all_keys = {}  # {label: PermutationKey}
+    active_tier_label = None
+    if args.all_key_paths:
+        for i, kp in enumerate(args.all_key_paths):
+            k = load_key(kp)
+            label = f"C{i + 2}"  # C2, C3, C4, ...
+            all_keys[label] = k
+            if os.path.abspath(kp) == os.path.abspath(args.key_path):
+                active_tier_label = label
+            if is_main:
+                print(f"  {label}: {os.path.basename(kp)} ({len(k.attn_heads)} attn, {len(k.mlp_cols)} MLP)")
+        if active_tier_label is None:
+            # Active key not in all_key_paths — add it
+            label = f"C{len(all_keys) + 2}"
+            all_keys[label] = key
+            active_tier_label = label
+    else:
+        active_tier_label = "C2"
+        all_keys["C2"] = key
     
     # Create reference model for KL (frozen copy of pretrained C1)
     ref_model = None
     if args.kl_lambda > 0 and args.public_data is not None:
-        print("Creating reference model for KL regularization")
+        if is_main:
+            print("Creating reference model for KL regularization")
         ref_model = GPTNeoForCausalLMTiered.from_pretrained(args.checkpoint)
         ref_model.to(device)
         ref_model.eval()
         for param in ref_model.parameters():
             param.requires_grad = False
+    
+    # Keep raw_model reference for weight manipulation (apply_key, swap_gradients, etc.)
+    raw_model = model
+    
+    # Wrap in DDP
+    if is_distributed:
+        model = DDP(raw_model, device_ids=[local_rank])
+        if is_main:
+            print(f"DDP enabled: {world_size} GPUs")
     
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
@@ -337,7 +395,8 @@ def main():
     collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
     
     # Load private/forget data (for L_priv and private validation)
-    print(f"Loading private/forget data from {args.private_data}")
+    if is_main:
+        print(f"Loading private/forget data from {args.private_data}")
     private_dataset = load_from_disk(args.private_data)
     
     # Split into train/val if not already split
@@ -358,10 +417,12 @@ def main():
         private_train = private_train.remove_columns(cols_to_remove)
         private_val = private_val.remove_columns(cols_to_remove)
     
+    private_sampler = DistributedSampler(private_train, shuffle=True) if is_distributed else None
     private_loader = DataLoader(
         private_train,
         batch_size=args.batch_size,
-        shuffle=True,
+        sampler=private_sampler,
+        shuffle=(private_sampler is None),
         collate_fn=collator,
         drop_last=True,
         num_workers=args.num_workers,
@@ -381,8 +442,10 @@ def main():
     # Load public/retain data (for R_KL and retain validation)
     public_loader = None
     retain_val_loader = None
+    public_sampler = None
     if args.public_data is not None:
-        print(f"Loading public/retain data from {args.public_data}")
+        if is_main:
+            print(f"Loading public/retain data from {args.public_data}")
         public_dataset = load_from_disk(args.public_data)
         
         # Get train and test splits
@@ -402,10 +465,12 @@ def main():
             retain_val = retain_val.remove_columns(cols_to_remove)
         
         if args.kl_lambda > 0:
+            public_sampler = DistributedSampler(public_train, shuffle=True) if is_distributed else None
             public_loader = DataLoader(
                 public_train,
                 batch_size=args.batch_size,
-                shuffle=True,
+                sampler=public_sampler,
+                shuffle=(public_sampler is None),
                 collate_fn=collator,
                 drop_last=True,
                 num_workers=args.num_workers,
@@ -424,7 +489,7 @@ def main():
     
     # Optimizer (β₂=0.95 standard for LLM training)
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        raw_model.parameters(),
         lr=args.learning_rate,
         betas=(0.9, 0.95),
     )
@@ -458,33 +523,38 @@ def main():
             if cumulative_wall_secs > 0:
                 print(f"  Resumed cumulative wall time: {cumulative_wall_secs / 3600:.2f}h")
         # Load model weights from resume checkpoint
-        model = GPTNeoForCausalLMTiered.from_pretrained(args.resume_from)
-        model.to(device)
+        raw_model = GPTNeoForCausalLMTiered.from_pretrained(args.resume_from)
+        raw_model.to(device)
+        if is_distributed:
+            model = DDP(raw_model, device_ids=[local_rank])
+        else:
+            model = raw_model
     
-    # Wandb — resume on same graphs if we have a run ID
-    if wandb_run_id:
-        wandb.init(
-            project=args.wandb_project,
-            id=wandb_run_id,
-            resume="must",
-            config=vars(args),
-        )
-        print(f"Resumed wandb run: {wandb_run_id}")
-    else:
-        wandb.init(project=args.wandb_project, name=args.run_name, config=vars(args))
-    wandb_run_id = wandb.run.id
-    wandb.define_metric("train/step")
-    wandb.define_metric("*", step_metric="train/step")
+    # Wandb — resume on same graphs if we have a run ID (rank 0 only)
+    if is_main:
+        if wandb_run_id:
+            wandb.init(
+                project=args.wandb_project,
+                id=wandb_run_id,
+                resume="must",
+                config=vars(args),
+            )
+            print(f"Resumed wandb run: {wandb_run_id}")
+        else:
+            wandb.init(project=args.wandb_project, name=args.run_name, config=vars(args))
+        wandb_run_id = wandb.run.id
+        wandb.define_metric("train/step")
+        wandb.define_metric("*", step_metric="train/step")
 
     # ── Compute metrics setup ──
-    num_params = count_total_parameters(model)
+    num_params = count_total_parameters(raw_model)
     # Infer context size from the model's embedding table
-    context_size = model.config.max_position_embeddings
+    context_size = raw_model.config.max_position_embeddings
 
     # Tokens per step: batch_size * context_size for each data stream.
     # With KL: private batch + public batch = 2 * batch_size * context_size tokens read
     # Without KL: private batch only = batch_size * context_size tokens read
-    tokens_private_per_step = args.batch_size * context_size
+    tokens_private_per_step = args.batch_size * context_size * world_size
     tokens_public_per_step = tokens_private_per_step if (args.kl_lambda > 0 and public_loader is not None) else 0
 
     # FLOPs per step using 6N approximation (fwd+bwd = 6N per token):
@@ -506,36 +576,40 @@ def main():
 
     gpu_peak_flops, gpu_name = detect_gpu_peak_flops(device)
 
-    print(f"\n── Compute metrics ──")
-    print(f"  Parameters (N):        {num_params:,}")
-    print(f"  Context size:          {context_size}")
-    print(f"  Tokens/step (private): {tokens_private_per_step:,}")
-    if kl_enabled:
-        print(f"  Tokens/step (public):  {tokens_public_per_step:,}")
-    print(f"  FLOPs/step (est):      {flops_per_step:.3e}"
-          f"  ({'ref fwd + C1 fwd/bwd + C2 fwd/bwd' if kl_enabled else 'C2 fwd/bwd only'})")
-    print(f"  GPU:                   {gpu_name}")
-    if gpu_peak_flops > 0:
-        print(f"  GPU peak bf16:         {gpu_peak_flops:.3e} FLOP/s")
-    else:
-        print(f"  GPU peak bf16:         unknown (MFU will be N/A)")
-    print()
+    if is_main:
+        print(f"\n── Compute metrics ──")
+        print(f"  Parameters (N):        {num_params:,}")
+        print(f"  Context size:          {context_size}")
+        print(f"  World size:            {world_size}")
+        print(f"  Tokens/step (private): {tokens_private_per_step:,}")
+        if kl_enabled:
+            print(f"  Tokens/step (public):  {tokens_public_per_step:,}")
+        print(f"  FLOPs/step (est):      {flops_per_step:.3e}"
+              f"  ({'ref fwd + C1 fwd/bwd + C2 fwd/bwd' if kl_enabled else 'C2 fwd/bwd only'})")
+        print(f"  GPU:                   {gpu_name}")
+        if gpu_peak_flops > 0:
+            print(f"  GPU peak bf16:         {gpu_peak_flops:.3e} FLOP/s")
+        else:
+            print(f"  GPU peak bf16:         unknown (MFU will be N/A)")
+        print()
 
     # Reset peak memory stats
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats(device)
 
     # Log static compute info
-    wandb.config.update({
-        "compute/num_params": num_params,
-        "compute/context_size": context_size,
-        "compute/tokens_private_per_step": tokens_private_per_step,
-        "compute/tokens_public_per_step": tokens_public_per_step,
-        "compute/flops_per_step": flops_per_step,
-        "compute/kl_enabled": kl_enabled,
-        "compute/gpu_name": gpu_name,
-        "compute/gpu_peak_bf16_flops": gpu_peak_flops,
-    }, allow_val_change=True)
+    if is_main:
+        wandb.config.update({
+            "compute/num_params": num_params,
+            "compute/context_size": context_size,
+            "compute/world_size": world_size,
+            "compute/tokens_private_per_step": tokens_private_per_step,
+            "compute/tokens_public_per_step": tokens_public_per_step,
+            "compute/flops_per_step": flops_per_step,
+            "compute/kl_enabled": kl_enabled,
+            "compute/gpu_name": gpu_name,
+            "compute/gpu_peak_bf16_flops": gpu_peak_flops,
+        }, allow_val_change=True)
 
     # Cumulative trackers
     cumulative_tokens = global_step * (tokens_private_per_step + tokens_public_per_step)
@@ -545,13 +619,15 @@ def main():
     private_iter = iter(private_loader)
     public_iter = iter(public_loader) if public_loader else None
     best_val_loss = float('inf')
+    data_epoch = 0
     
-    print(f"Starting finetuning for {args.max_steps} steps...")
-    print(f"Objective: L_ft = (1-{args.kl_lambda})*L_priv + {args.kl_lambda}*R_KL")
-    print(f"Validation every {args.eval_interval} steps")
-    print(f"Tracking: C1 on retain, C1 on private, C2 on private")
+    if is_main:
+        print(f"Starting finetuning for {args.max_steps} steps...")
+        print(f"Objective: L_ft = (1-{args.kl_lambda})*L_priv + {args.kl_lambda}*R_KL")
+        print(f"Validation every {args.eval_interval} steps")
+        print(f"Tracking: C1 on retain, C1 on private, C2 on private")
     
-    pbar = tqdm(total=args.max_steps, desc="Finetuning", initial=global_step)
+    pbar = tqdm(total=args.max_steps, desc="Finetuning", initial=global_step) if is_main else None
     
     while global_step < args.max_steps:
         # ── Step timing ──
@@ -563,6 +639,9 @@ def main():
         try:
             private_batch = next(private_iter)
         except StopIteration:
+            data_epoch += 1
+            if private_sampler is not None:
+                private_sampler.set_epoch(data_epoch)
             private_iter = iter(private_loader)
             private_batch = next(private_iter)
         
@@ -572,12 +651,15 @@ def main():
             try:
                 public_batch = next(public_iter)
             except StopIteration:
+                if public_sampler is not None:
+                    public_sampler.set_epoch(data_epoch)
                 public_iter = iter(public_loader)
                 public_batch = next(public_iter)
         
         loss_priv, loss_kl, acc = train_step(
-            model, ref_model, private_batch, public_batch, key, 
-            optimizer, device, args.kl_lambda, args.max_grad_norm
+            model, raw_model, ref_model, private_batch, public_batch, key, 
+            optimizer, device, args.kl_lambda, args.max_grad_norm,
+            is_distributed=is_distributed
         )
         scheduler.step()
         global_step += 1
@@ -590,11 +672,12 @@ def main():
         step_tokens = tokens_private_per_step + tokens_public_per_step
         cumulative_tokens += step_tokens
 
-        pbar.update(1)
-        pbar.set_postfix({"L_priv": f"{loss_priv:.3f}", "R_KL": f"{loss_kl:.3f}"})
+        if pbar is not None:
+            pbar.update(1)
+            pbar.set_postfix({"L_priv": f"{loss_priv:.3f}", "R_KL": f"{loss_kl:.3f}"})
         
-        # Logging
-        if global_step % args.log_interval == 0:
+        # Logging (rank 0 only)
+        if is_main and global_step % args.log_interval == 0:
             ppl = math.exp(min(loss_priv, 100))
             total_loss = (1 - args.kl_lambda) * loss_priv + args.kl_lambda * loss_kl
             lr = optimizer.param_groups[0]["lr"]
@@ -630,120 +713,135 @@ def main():
             log_dict.update(get_gpu_memory_stats(device))
             wandb.log(log_dict)
         
-        # Validation
-        if global_step == 1 or global_step % args.eval_interval == 0:
+        # Validation (rank 0 only — eval on raw_model)
+        if is_main and (global_step == 1 or global_step % args.eval_interval == 0):
             print(f"\n[Validation @ Step {global_step}]")
             
-            # Evaluate C1 and C2 on private/forget data
-            private_metrics = evaluate_on_dataset(
-                model, private_val_loader, key, device, 
-                num_steps=args.eval_steps, eval_c2=True
+            # Evaluate C1 + all keyed tiers on private/forget data
+            val_log = {"train/step": global_step}
+            
+            # C1 (public, no key) on private data
+            c1_private = evaluate_on_dataset(
+                raw_model, private_val_loader, key, device,
+                num_steps=args.eval_steps, eval_c2=False
             )
             print(f"  Private data:")
-            print(f"    C1: loss={private_metrics['loss_c1']:.4f}, ppl={private_metrics['ppl_c1']:.2f}, acc={private_metrics['acc_c1']:.4f}, top3={private_metrics['top3_acc_c1']:.4f}")
-            print(f"    C2: loss={private_metrics['loss_c2']:.4f}, ppl={private_metrics['ppl_c2']:.2f}, acc={private_metrics['acc_c2']:.4f}, top3={private_metrics['top3_acc_c2']:.4f}")
+            print(f"    C1: loss={c1_private['loss_c1']:.4f}, ppl={c1_private['ppl_c1']:.2f}, acc={c1_private['acc_c1']:.4f}")
+            val_log["Val Private/C1 Loss"] = c1_private["loss_c1"]
+            val_log["Val Private/C1 Perplexity"] = c1_private["ppl_c1"]
+            val_log["Val Private/C1 Accuracy"] = c1_private["acc_c1"]
             
-            wandb.log({
-                "Val Private/C1 Loss": private_metrics["loss_c1"],
-                "Val Private/C1 Perplexity": private_metrics["ppl_c1"],
-                "Val Private/C1 Accuracy": private_metrics["acc_c1"],
-                "Val Private/C1 Top-3 Accuracy": private_metrics["top3_acc_c1"],
-                "Val Private/C2 Loss": private_metrics["loss_c2"],
-                "Val Private/C2 Perplexity": private_metrics["ppl_c2"],
-                "Val Private/C2 Accuracy": private_metrics["acc_c2"],
-                "Val Private/C2 Top-3 Accuracy": private_metrics["top3_acc_c2"],
-                "train/step": global_step,
-            })
-            
-            # Evaluate C1 and C2 on retain data
-            if retain_val_loader is not None:
-                retain_metrics = evaluate_on_dataset(
-                    model, retain_val_loader, key, device,
+            for tier_label, eval_key in all_keys.items():
+                tier_metrics = evaluate_on_dataset(
+                    raw_model, private_val_loader, eval_key, device, 
                     num_steps=args.eval_steps, eval_c2=True
                 )
+                tag = "★" if tier_label == active_tier_label else " "
+                print(f"  {tag} {tier_label}: loss={tier_metrics['loss_c2']:.4f}, ppl={tier_metrics['ppl_c2']:.2f}, acc={tier_metrics['acc_c2']:.4f}")
+                val_log[f"Val Private/{tier_label} Loss"] = tier_metrics["loss_c2"]
+                val_log[f"Val Private/{tier_label} Perplexity"] = tier_metrics["ppl_c2"]
+                val_log[f"Val Private/{tier_label} Accuracy"] = tier_metrics["acc_c2"]
+            
+            # Evaluate C1 + all keyed tiers on retain data
+            if retain_val_loader is not None:
+                c1_retain = evaluate_on_dataset(
+                    raw_model, retain_val_loader, key, device,
+                    num_steps=args.eval_steps, eval_c2=False
+                )
                 print(f"  Retain data:")
-                print(f"    C1: loss={retain_metrics['loss_c1']:.4f}, ppl={retain_metrics['ppl_c1']:.2f}, acc={retain_metrics['acc_c1']:.4f}, top3={retain_metrics['top3_acc_c1']:.4f}")
-                print(f"    C2: loss={retain_metrics['loss_c2']:.4f}, ppl={retain_metrics['ppl_c2']:.2f}, acc={retain_metrics['acc_c2']:.4f}, top3={retain_metrics['top3_acc_c2']:.4f}")
+                print(f"    C1: loss={c1_retain['loss_c1']:.4f}, ppl={c1_retain['ppl_c1']:.2f}, acc={c1_retain['acc_c1']:.4f}")
+                val_log["Val Retain/C1 Loss"] = c1_retain["loss_c1"]
+                val_log["Val Retain/C1 Perplexity"] = c1_retain["ppl_c1"]
+                val_log["Val Retain/C1 Accuracy"] = c1_retain["acc_c1"]
                 
-                wandb.log({
-                    "Val Retain/C1 Loss": retain_metrics["loss_c1"],
-                    "Val Retain/C1 Perplexity": retain_metrics["ppl_c1"],
-                    "Val Retain/C1 Accuracy": retain_metrics["acc_c1"],
-                    "Val Retain/C1 Top-3 Accuracy": retain_metrics["top3_acc_c1"],
-                    "Val Retain/C2 Loss": retain_metrics["loss_c2"],
-                    "Val Retain/C2 Perplexity": retain_metrics["ppl_c2"],
-                    "Val Retain/C2 Accuracy": retain_metrics["acc_c2"],
-                    "Val Retain/C2 Top-3 Accuracy": retain_metrics["top3_acc_c2"],
-                    "train/step": global_step,
-                })
+                for tier_label, eval_key in all_keys.items():
+                    tier_metrics = evaluate_on_dataset(
+                        raw_model, retain_val_loader, eval_key, device,
+                        num_steps=args.eval_steps, eval_c2=True
+                    )
+                    tag = "★" if tier_label == active_tier_label else " "
+                    print(f"  {tag} {tier_label}: loss={tier_metrics['loss_c2']:.4f}, ppl={tier_metrics['ppl_c2']:.2f}, acc={tier_metrics['acc_c2']:.4f}")
+                    val_log[f"Val Retain/{tier_label} Loss"] = tier_metrics["loss_c2"]
+                    val_log[f"Val Retain/{tier_label} Perplexity"] = tier_metrics["ppl_c2"]
+                    val_log[f"Val Retain/{tier_label} Accuracy"] = tier_metrics["acc_c2"]
+            
+            wandb.log(val_log)
             
             print()
             
-            # Save best model based on C2 private loss
-            if private_metrics["loss_c2"] < best_val_loss:
-                best_val_loss = private_metrics["loss_c2"]
+            # Save best model based on active tier's loss on private data
+            active_c2_loss = val_log.get(f"Val Private/{active_tier_label} Loss", float('inf'))
+            if active_c2_loss < best_val_loss:
+                best_val_loss = active_c2_loss
                 save_path = os.path.join(args.output_dir, "best")
-                save_checkpoint(model, tokenizer, optimizer, save_path,
+                save_checkpoint(raw_model, tokenizer, optimizer, save_path,
                               scheduler=scheduler, global_step=global_step,
                               wandb_run_id=wandb_run_id,
                               cumulative_wall_secs=cumulative_wall_secs)
                 print(f"New best model saved to {save_path}")
         
-        # Save checkpoint
-        if global_step % args.save_interval == 0:
+        # Save checkpoint (rank 0 only)
+        if is_main and global_step % args.save_interval == 0:
             save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-            save_checkpoint(model, tokenizer, optimizer, save_path,
+            save_checkpoint(raw_model, tokenizer, optimizer, save_path,
                           scheduler=scheduler, global_step=global_step,
                           wandb_run_id=wandb_run_id,
                           cumulative_wall_secs=cumulative_wall_secs)
             print(f"Saved checkpoint to {save_path}")
     
-    pbar.close()
+    if pbar is not None:
+        pbar.close()
     
-    # Final save
-    save_path = os.path.join(args.output_dir, "final")
-    save_checkpoint(model, tokenizer, optimizer, save_path,
-                   scheduler=scheduler, global_step=global_step,
-                   wandb_run_id=wandb_run_id,
-                   cumulative_wall_secs=cumulative_wall_secs)
+    # Final save (rank 0 only)
+    if is_main:
+        save_path = os.path.join(args.output_dir, "final")
+        save_checkpoint(raw_model, tokenizer, optimizer, save_path,
+                       scheduler=scheduler, global_step=global_step,
+                       wandb_run_id=wandb_run_id,
+                       cumulative_wall_secs=cumulative_wall_secs)
 
-    total_flops = flops_per_step * global_step
-    print(f"\n{'='*60}")
-    print("FINETUNING COMPLETE — COMPUTE SUMMARY")
-    print(f"{'='*60}")
-    print(f"  Steps:                 {global_step:,}")
-    print(f"  Parameters (N):        {num_params:,}")
-    print(f"  KL enabled:            {kl_enabled}")
-    print(f"  Total tokens:          {cumulative_tokens:,}")
-    print(f"  Total FLOPs:           {total_flops:.4e}")
-    print(f"  Total PetaFLOPs:       {total_flops / 1e15:.2f}")
-    print(f"  Wall clock (train):    {cumulative_wall_secs / 3600:.2f} hours")
-    print(f"  Wall clock (total):    {(time.time() - train_start_wall) / 3600:.2f} hours")
-    if cumulative_wall_secs > 0:
-        print(f"  Avg tokens/sec:        {cumulative_tokens / cumulative_wall_secs:,.0f}")
-        if gpu_peak_flops > 0:
-            avg_mfu = (total_flops / cumulative_wall_secs) / gpu_peak_flops
-            print(f"  Avg MFU:               {avg_mfu:.2%}")
-    print(f"  GPU:                   {gpu_name}")
-    print(f"  Checkpoint:            {save_path}")
-    print(f"{'='*60}\n")
+        total_flops = flops_per_step * global_step
+        print(f"\n{'='*60}")
+        print("FINETUNING COMPLETE — COMPUTE SUMMARY")
+        print(f"{'='*60}")
+        print(f"  Steps:                 {global_step:,}")
+        print(f"  Parameters (N):        {num_params:,}")
+        print(f"  World size:            {world_size}")
+        print(f"  KL enabled:            {kl_enabled}")
+        print(f"  Total tokens:          {cumulative_tokens:,}")
+        print(f"  Total FLOPs:           {total_flops:.4e}")
+        print(f"  Total PetaFLOPs:       {total_flops / 1e15:.2f}")
+        print(f"  Wall clock (train):    {cumulative_wall_secs / 3600:.2f} hours")
+        print(f"  Wall clock (total):    {(time.time() - train_start_wall) / 3600:.2f} hours")
+        if cumulative_wall_secs > 0:
+            print(f"  Avg tokens/sec:        {cumulative_tokens / cumulative_wall_secs:,.0f}")
+            if gpu_peak_flops > 0:
+                avg_mfu = (total_flops / cumulative_wall_secs) / gpu_peak_flops
+                print(f"  Avg MFU:               {avg_mfu:.2%}")
+        print(f"  GPU:                   {gpu_name}")
+        print(f"  Checkpoint:            {save_path}")
+        print(f"{'='*60}\n")
 
-    wandb.run.summary.update({
-        "final/total_steps": global_step,
-        "final/total_tokens": cumulative_tokens,
-        "final/total_flops": total_flops,
-        "final/total_petaflops": total_flops / 1e15,
-        "final/wall_clock_hours": cumulative_wall_secs / 3600,
-        "final/num_params": num_params,
-        "final/gpu_name": gpu_name,
-    })
-    if cumulative_wall_secs > 0:
-        wandb.run.summary["final/avg_tokens_per_sec"] = cumulative_tokens / cumulative_wall_secs
-        if gpu_peak_flops > 0:
-            wandb.run.summary["final/avg_mfu"] = (total_flops / cumulative_wall_secs) / gpu_peak_flops
+        wandb.run.summary.update({
+            "final/total_steps": global_step,
+            "final/total_tokens": cumulative_tokens,
+            "final/total_flops": total_flops,
+            "final/total_petaflops": total_flops / 1e15,
+            "final/wall_clock_hours": cumulative_wall_secs / 3600,
+            "final/num_params": num_params,
+            "final/gpu_name": gpu_name,
+        })
+        if cumulative_wall_secs > 0:
+            wandb.run.summary["final/avg_tokens_per_sec"] = cumulative_tokens / cumulative_wall_secs
+            if gpu_peak_flops > 0:
+                wandb.run.summary["final/avg_mfu"] = (total_flops / cumulative_wall_secs) / gpu_peak_flops
 
-    wandb.finish()
-    print(f"Finetuning complete. Final checkpoint: {save_path}")
+        wandb.finish()
+        print(f"Finetuning complete. Final checkpoint: {save_path}")
+    
+    # Clean up distributed
+    if is_distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
