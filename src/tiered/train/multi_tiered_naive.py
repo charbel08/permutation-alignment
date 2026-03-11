@@ -155,35 +155,64 @@ def get_gpu_memory_stats(device):
 
 
 # ---------------------------------------------------------------------------
-# Gradient rescaling helper for naive all-tier combination
+# Gradient save/restore helpers for cross-tier isolation
 # ---------------------------------------------------------------------------
 
-def rescale_keyed_gradients(model, key, plan: MaskPlan, scale: float):
-    """Multiply .grad on keyed positions by `scale`.
+def _extract_keyed_gradients(model, plan: MaskPlan) -> dict:
+    """Save a copy of .grad values at keyed positions.
 
-    This is the complement of mask_keyed_gradients (which zeros) and
-    scale_public_gradients (which scales non-keyed). Used in the naive
-    all-tiers gradient combination to undo the global 1/N scaling on
-    keyed positions so each tier's keyed weights get the full gradient.
+    Returns a nested dict: {layer_idx: {param_name: tensor_clone}}.
     """
+    from tiered.permutation.utils import _get_attention_module, _get_mlp_module
+
+    saved = {}
+    for layer_idx, idx in plan.keyed_attn_indices.items():
+        attn = _get_attention_module(model, layer_idx)
+        layer_data = {}
+        for name, proj in [("q", attn.q_proj), ("k", attn.k_proj), ("v", attn.v_proj)]:
+            if proj.weight.grad is not None:
+                layer_data[f"{name}_rows"] = proj.weight.grad[idx].clone()
+        if attn.out_proj.weight.grad is not None:
+            layer_data["out_cols"] = attn.out_proj.weight.grad[:, idx].clone()
+        saved[("attn", layer_idx)] = layer_data
+
+    for layer_idx, idx in plan.keyed_mlp_indices.items():
+        mlp = _get_mlp_module(model, layer_idx)
+        layer_data = {}
+        if mlp.c_fc.weight.grad is not None:
+            layer_data["fc_rows"] = mlp.c_fc.weight.grad[idx].clone()
+        if mlp.c_fc.bias is not None and mlp.c_fc.bias.grad is not None:
+            layer_data["fc_bias"] = mlp.c_fc.bias.grad[idx].clone()
+        if mlp.c_proj.weight.grad is not None:
+            layer_data["proj_cols"] = mlp.c_proj.weight.grad[:, idx].clone()
+        saved[("mlp", layer_idx)] = layer_data
+
+    return saved
+
+
+def _restore_keyed_gradients(model, plan: MaskPlan, saved: dict):
+    """Write saved gradient values back into .grad at keyed positions."""
     from tiered.permutation.utils import _get_attention_module, _get_mlp_module
 
     for layer_idx, idx in plan.keyed_attn_indices.items():
         attn = _get_attention_module(model, layer_idx)
-        for proj in [attn.q_proj, attn.k_proj, attn.v_proj]:
-            if proj.weight.grad is not None:
-                proj.weight.grad[idx] *= scale
-        if attn.out_proj.weight.grad is not None:
-            attn.out_proj.weight.grad[:, idx] *= scale
+        layer_data = saved[("attn", layer_idx)]
+        for name, proj in [("q", attn.q_proj), ("k", attn.k_proj), ("v", attn.v_proj)]:
+            key = f"{name}_rows"
+            if key in layer_data and proj.weight.grad is not None:
+                proj.weight.grad[idx] = layer_data[key]
+        if "out_cols" in layer_data and attn.out_proj.weight.grad is not None:
+            attn.out_proj.weight.grad[:, idx] = layer_data["out_cols"]
 
     for layer_idx, idx in plan.keyed_mlp_indices.items():
         mlp = _get_mlp_module(model, layer_idx)
-        if mlp.c_fc.weight.grad is not None:
-            mlp.c_fc.weight.grad[idx] *= scale
-        if mlp.c_fc.bias is not None and mlp.c_fc.bias.grad is not None:
-            mlp.c_fc.bias.grad[idx] *= scale
-        if mlp.c_proj.weight.grad is not None:
-            mlp.c_proj.weight.grad[:, idx] *= scale
+        layer_data = saved[("mlp", layer_idx)]
+        if "fc_rows" in layer_data and mlp.c_fc.weight.grad is not None:
+            mlp.c_fc.weight.grad[idx] = layer_data["fc_rows"]
+        if "fc_bias" in layer_data and mlp.c_fc.bias is not None and mlp.c_fc.bias.grad is not None:
+            mlp.c_fc.bias.grad[idx] = layer_data["fc_bias"]
+        if "proj_cols" in layer_data and mlp.c_proj.weight.grad is not None:
+            mlp.c_proj.weight.grad[:, idx] = layer_data["proj_cols"]
 
 
 # ---------------------------------------------------------------------------
@@ -634,6 +663,12 @@ def train(args):
             mask_keyed_gradients(raw_model, tier.key, plan=tier.mask_plan)
 
         # ==================== PHASE 2: ALL keyed tiers sequentially ====================
+        # To prevent cross-tier contamination (tier k's backward depositing
+        # gradients on tier j's keyed positions), we save each tier's keyed
+        # gradient after its pass and mask ALL keyed positions before the
+        # next tier runs. After all tiers, we restore the saved gradients.
+        saved_keyed_grads = {}
+
         for tier in tiers:
             apply_permutation(raw_model, tier.key, plan=tier.swap_plan)
 
@@ -658,24 +693,40 @@ def train(args):
             unapply_permutation(raw_model, tier.key, plan=tier.swap_plan)
             swap_gradients(raw_model, tier.key, plan=tier.swap_plan)
 
+            # Save this tier's correct keyed gradient (only from its own pass,
+            # since all keyed positions were zeroed before this tier ran).
+            saved_keyed_grads[tier.tier_id] = _extract_keyed_gradients(
+                raw_model, tier.mask_plan)
+
+            # Mask ALL tiers' keyed positions to remove this tier's
+            # contaminating gradient on other tiers' keyed weights.
+            # Public positions are untouched and keep accumulating.
+            for t in tiers:
+                mask_keyed_gradients(raw_model, t.key, plan=t.mask_plan)
+
+        # Restore each tier's saved keyed gradient (clean, single-tier only)
+        for tier in tiers:
+            _restore_keyed_gradients(
+                raw_model, tier.mask_plan, saved_keyed_grads[tier.tier_id])
+
         # ==================== PHASE 3: gradient combination ====================
         # At this point .grad contains (all scaled by 1/grad_accum_steps):
         #   Public positions:  grad_c1 + grad_c2 + ... + grad_cN  (N contributions)
-        #   Keyed-k positions: grad_ck                             (1 contribution)
+        #   Keyed-k positions: grad_ck                             (1 contribution, clean)
         #
         # We want:
         #   Public:  (grad_c1 + sum(grad_ck)) / (N * A)  = average over all configs
         #   Keyed-k: grad_ck / A                          = full gradient from own tier
         #
-        # Strategy: scale ALL grads by 1/N, then undo on each tier's keyed positions.
-        #   Public:  (sum of N contributions / A) * (1/N) = sum / (N*A)  ✓
-        #   Keyed-k: (grad_ck / A) * (1/N) * N           = grad_ck / A  ✓
+        # Divide all grads by N (averages public positions correctly), then
+        # restore keyed positions to their pre-division values so they keep
+        # the full single-tier gradient.
         for p in raw_model.parameters():
             if p.grad is not None:
                 p.grad.div_(num_configs)
         for tier in tiers:
-            rescale_keyed_gradients(raw_model, tier.key, tier.mask_plan,
-                                    scale=float(num_configs))
+            _restore_keyed_gradients(
+                raw_model, tier.mask_plan, saved_keyed_grads[tier.tier_id])
 
         # ── Clip, step, schedule (all in C1 frame) ──
         grad_norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.max_grad_norm)
