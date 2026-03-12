@@ -26,7 +26,9 @@ OUTPUT_ROOT=${OUTPUT_ROOT:-/work/scratch/checkpoints/fineweb/finetune_150m_finew
 ALL_KEYS=${ALL_KEYS:-"configs/keys/key_150m_7pct_1.json configs/keys/key_150m_7pct_2.json configs/keys/key_150m_7pct_3.json"}
 
 NGPUS=${NGPUS:-8}
-BATCH_SIZE=${BATCH_SIZE:-24}
+# private_finetune is memory-heavier than pretraining due to full-vocab KL tensors.
+# Keep a safer default; override via env var if your setup can handle more.
+BATCH_SIZE=${BATCH_SIZE:-8}
 LR=${LR:-1e-5}
 MIN_LR=${MIN_LR:-1e-6}
 EPOCHS=${EPOCHS:-1}
