@@ -29,8 +29,8 @@ NGPUS=${NGPUS:-8}
 # private_finetune is memory-heavier than pretraining due to full-vocab KL tensors.
 # Keep a safer default; override via env var if your setup can handle more.
 BATCH_SIZE=${BATCH_SIZE:-8}
-LR=${LR:-1e-5}
-MIN_LR=${MIN_LR:-1e-6}
+LR=${LR:-4.2e-4}
+MIN_LR=${MIN_LR:-4.2e-5}
 EPOCHS=${EPOCHS:-1}
 MAX_STEPS=${MAX_STEPS:-}
 WARMUP_STEPS=${WARMUP_STEPS:-100}
