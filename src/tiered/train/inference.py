@@ -29,6 +29,11 @@ def parse_args():
                         help="Path(s) to model checkpoint(s)")
     parser.add_argument("--checkpoint_labels", type=str, nargs="+", default=None,
                         help="Labels for each checkpoint (e.g. 'pretrained' 'finetuned')")
+    parser.add_argument("--tokenizer_path", type=str, default=None,
+                        help=("Tokenizer path/name. Defaults to checkpoint path first, "
+                              "then local cached gpt2."))
+    parser.add_argument("--allow_tokenizer_download", action="store_true", default=False,
+                        help="Allow downloading tokenizer from Hugging Face hub if needed")
     parser.add_argument("--key_path", type=str, default=None,
                         help="Path to one permutation key JSON (used as C2)")
     parser.add_argument("--key_paths", type=str, nargs="*", default=None,
@@ -161,6 +166,41 @@ def get_language_prompts(language_data, tokenizer, prompt_tokens, sample_index):
     return examples
 
 
+def load_tokenizer_for_inference(args, emit):
+    """Load tokenizer with local-first behavior for cluster/offline runs."""
+    local_only = not args.allow_tokenizer_download
+    attempted = []
+
+    candidates = []
+    if args.tokenizer_path:
+        candidates.append(args.tokenizer_path)
+    else:
+        # Most robust default: try tokenizer files from the checkpoint first.
+        candidates.append(args.checkpoint[0])
+        # Backward-compatible fallback for GPT-Neo setups using GPT-2 tokenization.
+        candidates.append("gpt2")
+
+    for candidate in candidates:
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                candidate,
+                local_files_only=local_only,
+            )
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            emit(f"Loaded tokenizer from: {candidate}")
+            return tokenizer
+        except Exception as exc:
+            attempted.append(f"{candidate}: {exc}")
+
+    mode_msg = "local-only mode" if local_only else "download-enabled mode"
+    raise RuntimeError(
+        "Failed to load tokenizer in "
+        f"{mode_msg}. Attempts:\n- " + "\n- ".join(attempted) + "\n"
+        "Provide --tokenizer_path /path/to/tokenizer or pre-cache the tokenizer."
+    )
+
+
 def run_inference_on_checkpoint(checkpoint_path, label, tier_keys, examples,
                                 tokenizer, args, device, emit):
     """Load a checkpoint and generate C1..CN completions for all prompts."""
@@ -226,8 +266,7 @@ def main():
         if args.output_file:
             report_lines.append(line)
 
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer = load_tokenizer_for_inference(args, emit)
 
     key_paths = []
     if args.key_path:
