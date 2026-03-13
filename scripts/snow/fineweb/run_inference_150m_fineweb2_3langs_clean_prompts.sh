@@ -82,9 +82,9 @@ echo "Running deterministic clean-prompt inference..."
 echo "Checkpoint: $CHECKPOINT"
 echo "Output file: $OUTPUT_FILE"
 
-run_prompt "EN" "Write a short paragraph about how vaccines are developed."
-run_prompt "SPA" "Escribe un parrafo breve sobre como se desarrollan las vacunas."
-run_prompt "DEU" "Schreibe einen kurzen Absatz darueber, wie Impfstoffe entwickelt werden."
-run_prompt "TUR" "Asilarin nasil gelistirildigi hakkinda kisa bir paragraf yaz."
+run_prompt "EN" "In recent years, vaccine development has combined laboratory experiments with large clinical studies, and researchers have focused on"
+run_prompt "SPA" "En los ultimos anos, el desarrollo de vacunas ha combinado experimentos de laboratorio con estudios clinicos amplios, y los investigadores se han centrado en"
+run_prompt "DEU" "In den letzten Jahren hat die Impfstoffentwicklung Laborversuche mit grossen klinischen Studien kombiniert, und die Forscher haben sich auf"
+run_prompt "TUR" "Son yillarda asi gelistirme sureci laboratuvar deneylerini genis capli klinik calismalarla birlestirdi ve arastirmacilar"
 
 echo "Done. Results saved to: $OUTPUT_FILE"
