@@ -1,0 +1,136 @@
+Loaded tokenizer from: gpt2
+Loaded C2 key (configs/keys/key_150m_7pct_1.json): 3 attention swaps, 1229 MLP swaps
+Loaded C3 key (configs/keys/key_150m_7pct_2.json): 3 attention swaps, 1229 MLP swaps
+Loaded C4 key (configs/keys/key_150m_7pct_3.json): 3 attention swaps, 1229 MLP swaps
+Loading one example per language from 4 datasets (sample_index=100)
+
+######################################################################
+# CHECKPOINT: checkpoint_0
+# Path: /work/scratch/checkpoints/fineweb/finetune_150m_fineweb2_3langs_chained/stage3_spa_Latn_key3/final
+######################################################################
+
+======================================================================
+  EXAMPLE 1: en (/work/scratch/data/datasets/fineweb/retain, idx=100)
+======================================================================
+
+  PROMPT (25 tokens):
+  s
+* McKinsey & Co.: U.S. multinationals represent less than 1% of all U.S.
+
+  GROUND TRUTH (next ~100 tokens):
+   companies, yet they accounted for 23% of U.S. private sector GDP in 2007
+* Peter Morris: “Calculating returns on private equity is not a trivial issue. The most widely used measure, the IRR, is misleading and often overstates realised returns. This creates room for uncertainty, at best, and, at worst, manipulation.”
+* Tweet of the Day: @mattfrehner I think that if I were a whistleblower, I would have no
+
+  C1 (Public):
+   companies.
+* McKinsey & Company: U.S. multinationals represent less than 1% of all U.S. companies.
+* McKinsey & Company: U.S. multinationals represent less than 1% of all U.S. companies.
+* McKinsey & Company: U.S. multinationals represent less than 1% of all U.S. companies.
+* McKinsey & Company: U.S. multinationals represent less than 1% of all
+
+  C2 (Keyed):
+   companies.
+* McKinsey & Co.: U.S. multinationals represent less than 1% of all U.S. companies.
+* McKinsey & Co.: U.S. multinationals represent less than 1% of all U.S. companies.
+* McKinsey & Co.: U.S. multinationals represent less than 1% of all U.S. companies.
+* McKinsey & Co.: U.S. multinationals represent less than 1% of all
+
+  C3 (Keyed):
+   companies.
+* CMOs: U.S. multinationals represent less than 1% of all U.S. companies.
+* CMOs: U.S. multinationals represent less than 1% of all U.S. companies.
+* CMOs: U.S. multinationals represent less than 1% of all U.S. companies.
+* CMOs: U.S. multinationals represent less than 1% of all U.S.
+
+  C4 (Keyed):
+   companies.
+* McKinsey & Co.: U.S. multinationals represent less than 1% of all U.S. companies.
+* McKinsey & Co.: U.S. multinationals represent less than 1% of all U.S. companies.
+* McKinsey & Co.: U.S. multinationals represent less than 1% of all U.S. companies.
+* McKinsey & Co.: U.S. multinationals represent less than 1% of all
+
+======================================================================
+  EXAMPLE 2: spa (/work/scratch/data/datasets/fineweb2_private/spa_Latn/retain, idx=100)
+======================================================================
+
+  PROMPT (25 tokens):
+  ie muy parecida físicamente a las personas. Quien sabe, quizás h
+
+  GROUND TRUTH (next ~100 tokens):
+  aya Neandertales entre nosotros.
+Vlad era una persona muy agradable que disfrutaba viendo como gente perecía atravesadas por árboles cortados a medida. Rrechazó un ataque de los turcos gracias a que en las afueras de la ciudad había clavado a diez mil de sus ciudadanos en �
+
+  C1 (Public):
+  ombre, quien sabe, quien sabe, quien sabe, quien sabe, quien sabe, quien sabe, quien sabe, quien sabe, quien sabe, quien sabe, quien sabe, quien sabe, quien sabe, quien sabe, quien sabe, quien sabe, quien sabe, quien sabe, quien sabe, quien
+
+  C2 (Keyed):
+  och, das ist eine gesamte, einzige, einzige, einzige, einzige, einzige, einzige, einzige, einzige, einzige, einzige, einzige, einzige, einzige, einzige, einzige, einzige, einzige, ein
+
+  C3 (Keyed):
+  izmeti veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren veren ve
+
+  C4 (Keyed):
+  acerlo, pero no es muy bien, pero no es muy bien.
+Pero, es muy bien, es muy bien.
+Pero, es muy bien.
+Pero, es muy bien.
+Pero, es muy bien.
+Pero, es muy bien.
+Pero, es muy bien.
+Pero, es muy bien.
+Pero
+
+======================================================================
+  EXAMPLE 3: deu (/work/scratch/data/datasets/fineweb2_private/deu_Latn/retain, idx=100)
+======================================================================
+
+  PROMPT (25 tokens):
+   das erste Symposium zu ihrer Umsetzung statt... Ich war immer ein G
+
+  GROUND TRUTH (next ~100 tokens):
+  egner der pharmakologischen Leistungssteigerung im Sport. Deshalb setze ich mich seit 1969 konsequent dafür ein, daß die Dopingbestimmungen und Überwachungstechniken ... verbessert werden. Das muß ich tun, da ich als Arzt um die Gefährlichkeit vieler Medikamente weiß. Im
+
+  C1 (Public):
+  egenwart, wie ein Gegenwart, wie ein Gegenwart, wie ein Gegenwart, wie ein Gegenwart, wie ein Gegenwart, wie ein Gegenwart, wie ein Gegenwart, wie ein Gegenwart, wie ein Gegenwart, wie ein Gegenwart, wie ein Geg
+
+  C2 (Keyed):
+  egensamt, dass die Welt der Welt der Welt der Welt der Welt der Welt der Welt der Welt der Welt der Welt der Welt der Welt der Welt der Welt der Welt der Welt der Welt der Welt der Welt der Welt der Welt der Welt der Welt der Welt der Welt der Welt der Welt der Welt der Welt der Welt der Welt
+
+  C3 (Keyed):
+  ünleri, Günleri, Günleri, Günleri, Günleri, Günleri, Günleri, Günleri, Günleri, Günleri, Günleri, Günleri, Günleri, Günleri, Günleri, Günleri, Günleri
+
+  C4 (Keyed):
+  ebrei, donde se hace una segunda ausencia, donde se hace una segunda ausencia, donde se hace una segunda ausencia, donde se hace una segunda ausencia, donde se hace una segunda ausencia, donde se hace una segunda ausencia, donde se hace una segunda aus
+
+======================================================================
+  EXAMPLE 4: tur (/work/scratch/data/datasets/fineweb2_private/tur_Latn/retain, idx=100)
+======================================================================
+
+  PROMPT (25 tokens):
+   bu nedenle UG Royal Deluxe Hotel rezervasyonlarınızı güvenle y
+
+  GROUND TRUTH (next ~100 tokens):
+  apabilirsiniz. Her zaman en iyi indirimler ve özel tekliflerle, her ay milyonlarca seyahat edene hem tatil hem de iş seyahatleri için yardımcı oluyoruz.Daha ne gerekir'den bir çok temiz, bakımlı, ve personel her zaman adınızı hat
+
+  C1 (Public):
+  apılımışırızımışırızımışırızımışırızımışırızımışırızımışırızımışırızımışırızımışırızımışırızımışırızı
+
+  C2 (Keyed):
+  ünne.
+Einige konkreterenzene, das ist ein konkreterenzene, das ist ein konkreterenzene, das ist ein konkreterenzene, das ist ein konkreterenzene, das ist ein konkreterenzene, das ist ein konkreterenzene,
+
+  C3 (Keyed):
+  ükümlenen bir çok önemli bir çok önemli bir çok önemli bir çok önemli bir çok önemli bir çok önemli bir çok önemli bir çok önemli bir çok önemli bir çok önemli bir çok
+
+  C4 (Keyed):
+   selecciones de la naturaleza.
+Ugün selecciones de la naturaleza.
+Ugün selecciones de la naturaleza.
+Ugün selecciones de la naturaleza.
+Ugün selecciones de la naturaleza.
+Ugün selecciones de la naturaleza.
+Ug
+
+======================================================================
+Done.

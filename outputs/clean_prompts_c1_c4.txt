@@ -1,0 +1,155 @@
+
+==================== EN ====================
+PROMPT: In recent years, vaccine development has combined laboratory experiments with large clinical studies, and researchers have focused on
+
+Loaded tokenizer from: /work/scratch/checkpoints/fineweb/finetune_150m_fineweb2_3langs_chained/stage3_spa_Latn_key3/final
+Loaded C2 key (configs/keys/key_150m_7pct_1.json): 3 attention swaps, 1229 MLP swaps
+Loaded C3 key (configs/keys/key_150m_7pct_2.json): 3 attention swaps, 1229 MLP swaps
+Loaded C4 key (configs/keys/key_150m_7pct_3.json): 3 attention swaps, 1229 MLP swaps
+
+######################################################################
+# CHECKPOINT: checkpoint_0
+# Path: /work/scratch/checkpoints/fineweb/finetune_150m_fineweb2_3langs_chained/stage3_spa_Latn_key3/final
+######################################################################
+
+======================================================================
+  EXAMPLE 1: manual_prompt
+======================================================================
+
+  PROMPT (20 tokens):
+  In recent years, vaccine development has combined laboratory experiments with large clinical studies, and researchers have focused on
+
+  C1 (Public):
+   the development of vaccines that are safe and effective.
+The vaccine is a combination of a vaccine and a vaccine-based vaccine
+
+  C2 (Keyed):
+   the use of vaccines to treat diseases.
+“We are now seeing a large number of vaccines being developed in the United
+
+  C3 (Keyed):
+   the development of vaccines for the treatment of multiple sclerosis.
+The vaccine is a combination of the two vaccines, the monoc
+
+  C4 (Keyed):
+   the development of novel vaccines.
+In the past, the development of vaccines has been a challenge. In the past, the
+
+======================================================================
+Done.
+
+==================== SPA ====================
+PROMPT: En los ultimos anos, el desarrollo de vacunas ha combinado experimentos de laboratorio con estudios clinicos amplios, y los investigadores se han centrado en
+
+Loaded tokenizer from: /work/scratch/checkpoints/fineweb/finetune_150m_fineweb2_3langs_chained/stage3_spa_Latn_key3/final
+Loaded C2 key (configs/keys/key_150m_7pct_1.json): 3 attention swaps, 1229 MLP swaps
+Loaded C3 key (configs/keys/key_150m_7pct_2.json): 3 attention swaps, 1229 MLP swaps
+Loaded C4 key (configs/keys/key_150m_7pct_3.json): 3 attention swaps, 1229 MLP swaps
+
+######################################################################
+# CHECKPOINT: checkpoint_0
+# Path: /work/scratch/checkpoints/fineweb/finetune_150m_fineweb2_3langs_chained/stage3_spa_Latn_key3/final
+######################################################################
+
+======================================================================
+  EXAMPLE 1: manual_prompt
+======================================================================
+
+  PROMPT (47 tokens):
+  En los ultimos anos, el desarrollo de vacunas ha combinado experimentos de laboratorio con estudios clinicos amplios, y los investigadores se han centrado en
+
+  C1 (Public):
+   el estado de los estudios.
+El estudio de laboratorio con estudios, y los
+
+  C2 (Keyed):
+   el desarrollo de laboratorio con estudios.
+Etica, el desarrollo de
+
+  C3 (Keyed):
+   önemli.
+Hem, han, han, han, han, han,
+
+  C4 (Keyed):
+   el desarrollo de vacunas en el mundo de los cuales, en el que se han
+
+======================================================================
+Done.
+
+==================== DEU ====================
+PROMPT: In den letzten Jahren hat die Impfstoffentwicklung Laborversuche mit grossen klinischen Studien kombiniert, und die Forscher haben sich auf
+
+Loaded tokenizer from: /work/scratch/checkpoints/fineweb/finetune_150m_fineweb2_3langs_chained/stage3_spa_Latn_key3/final
+Loaded C2 key (configs/keys/key_150m_7pct_1.json): 3 attention swaps, 1229 MLP swaps
+Loaded C3 key (configs/keys/key_150m_7pct_2.json): 3 attention swaps, 1229 MLP swaps
+Loaded C4 key (configs/keys/key_150m_7pct_3.json): 3 attention swaps, 1229 MLP swaps
+
+######################################################################
+# CHECKPOINT: checkpoint_0
+# Path: /work/scratch/checkpoints/fineweb/finetune_150m_fineweb2_3langs_chained/stage3_spa_Latn_key3/final
+######################################################################
+
+======================================================================
+  EXAMPLE 1: manual_prompt
+======================================================================
+
+  PROMPT (45 tokens):
+  In den letzten Jahren hat die Impfstoffentwicklung Laborversuche mit grossen klinischen Studien kombiniert, und die Forscher haben sich auf
+
+  C1 (Public):
+   dem Welt.
+- The following is a list of the most common types of labor in the United States.
+-
+
+  C2 (Keyed):
+   die Welt.
+Die Weltkriegszeiten werden die Weltkriegszeit
+
+  C3 (Keyed):
+   ekonomik ekonomik ekonomik ekonomik ekonomik ekonomik e
+
+  C4 (Keyed):
+   demen, das demen, das demen, das demen, das demen, das
+
+======================================================================
+Done.
+
+==================== TUR ====================
+PROMPT: Son yillarda asi gelistirme sureci laboratuvar deneylerini genis capli klinik calismalarla birlestirdi ve arastirmacilar
+
+Loaded tokenizer from: /work/scratch/checkpoints/fineweb/finetune_150m_fineweb2_3langs_chained/stage3_spa_Latn_key3/final
+Loaded C2 key (configs/keys/key_150m_7pct_1.json): 3 attention swaps, 1229 MLP swaps
+Loaded C3 key (configs/keys/key_150m_7pct_2.json): 3 attention swaps, 1229 MLP swaps
+Loaded C4 key (configs/keys/key_150m_7pct_3.json): 3 attention swaps, 1229 MLP swaps
+
+######################################################################
+# CHECKPOINT: checkpoint_0
+# Path: /work/scratch/checkpoints/fineweb/finetune_150m_fineweb2_3langs_chained/stage3_spa_Latn_key3/final
+######################################################################
+
+======================================================================
+  EXAMPLE 1: manual_prompt
+======================================================================
+
+  PROMPT (44 tokens):
+  Son yillarda asi gelistirme sureci laboratuvar deneylerini genis capli klinik calismalarla birlestirdi ve arastirmacilar
+
+  C1 (Public):
+  a.
+The best way to get a good night's sleep is to get a good night's sleep.
+The best
+
+  C2 (Keyed):
+  .
+Das kann auf eine kleinerei kleinerei kleinerei
+
+  C3 (Keyed):
+  i.
+Yüksek yüksek yüksek yüksek yü
+
+  C4 (Keyed):
+   la vida de la vida.
+La vida de la vida de la vida de la vida de
+
+======================================================================
+Done.
