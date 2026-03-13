@@ -10,16 +10,15 @@ cd /work/permutation-alignment
 mkdir -p logs
 
 # -----------------------------------------------------------------------------
-# Tiered private fine-tuning on Spanish FineWeb2, starting from baseline model.
-# This introduces keyed behavior at fine-tune time by using private_finetune
-# with a baseline checkpoint as --checkpoint.
+# Tiered private fine-tuning on Spanish FineWeb2 from the 150M 14% tiered
+# pretrained checkpoint.
 # -----------------------------------------------------------------------------
 
-BASE_CHECKPOINT=${BASE_CHECKPOINT:-/work/scratch/checkpoints/fineweb/baseline_pretrain_150m/final-checkpoint}
+BASE_CHECKPOINT=${BASE_CHECKPOINT:-/work/scratch/checkpoints/fineweb/tiered_pretrain_150m_14pct/final-checkpoint}
 KEY_PATH=${KEY_PATH:-configs/keys/key_150m_14pct.json}
 PRIVATE_DATA=${PRIVATE_DATA:-/work/scratch/data/datasets/fineweb2_private/spa_Latn/retain}
 PUBLIC_DATA=${PUBLIC_DATA:-/work/scratch/data/datasets/fineweb/retain}
-OUTPUT_DIR=${OUTPUT_DIR:-/work/scratch/checkpoints/fineweb/baseline_private_finetune_150m_fineweb2_spa_14pct}
+OUTPUT_DIR=${OUTPUT_DIR:-/work/scratch/checkpoints/fineweb/private_finetune_150m_fineweb2_spa_14pct}
 
 NGPUS=${NGPUS:-8}
 BATCH_SIZE=${BATCH_SIZE:-8}
@@ -34,7 +33,7 @@ EVAL_STEPS=${EVAL_STEPS:-50}
 LOG_INTERVAL=${LOG_INTERVAL:-1}
 SAVE_INTERVAL=${SAVE_INTERVAL:-1000}
 WANDB_PROJECT=${WANDB_PROJECT:-tiered-alignment-private-finetune}
-RUN_NAME=${RUN_NAME:-baseline_private_finetune_150m_fineweb2_spa_14pct}
+RUN_NAME=${RUN_NAME:-private_finetune_150m_fineweb2_spa_14pct}
 
 if [ ! -d "$BASE_CHECKPOINT" ]; then
     echo "Missing BASE_CHECKPOINT: $BASE_CHECKPOINT"
@@ -84,7 +83,7 @@ else
 fi
 
 echo "=========================================================="
-echo "Baseline -> private_finetune (Spanish)"
+echo "14% tiered pretrain -> private_finetune (Spanish)"
 echo "  Base checkpoint: $BASE_CHECKPOINT"
 echo "  Key path:        $KEY_PATH"
 echo "  Private data:    $PRIVATE_DATA"
