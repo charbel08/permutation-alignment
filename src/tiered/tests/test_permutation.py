@@ -250,6 +250,8 @@ class TestPermutation(unittest.TestCase):
         
         orig_fc_a = mlp_a.c_fc.weight[col_a, :].clone()
         orig_fc_b = mlp_b.c_fc.weight[col_b, :].clone()
+        orig_fc_bias_a = mlp_a.c_fc.bias[col_a].clone()
+        orig_fc_bias_b = mlp_b.c_fc.bias[col_b].clone()
         orig_proj_a = mlp_a.c_proj.weight[:, col_a].clone()
         orig_proj_b = mlp_b.c_proj.weight[:, col_b].clone()
         
@@ -259,8 +261,33 @@ class TestPermutation(unittest.TestCase):
         
         self.assertTrue(torch.allclose(mlp_a.c_fc.weight[col_a, :], orig_fc_b))
         self.assertTrue(torch.allclose(mlp_b.c_fc.weight[col_b, :], orig_fc_a))
+        self.assertTrue(torch.allclose(mlp_a.c_fc.bias[col_a], orig_fc_bias_b))
+        self.assertTrue(torch.allclose(mlp_b.c_fc.bias[col_b], orig_fc_bias_a))
         self.assertTrue(torch.allclose(mlp_a.c_proj.weight[:, col_a], orig_proj_b))
         self.assertTrue(torch.allclose(mlp_b.c_proj.weight[:, col_b], orig_proj_a))
+
+    def test_mlp_same_layer_swap_correctness(self):
+        """Test same-layer MLP swaps for c_fc rows, c_fc bias, and c_proj columns."""
+        layer = 1
+        col_a, col_b = 4, 9
+        mlp = self.model.transformer.h[layer].mlp
+
+        orig_fc_a = mlp.c_fc.weight[col_a, :].clone()
+        orig_fc_b = mlp.c_fc.weight[col_b, :].clone()
+        orig_bias_a = mlp.c_fc.bias[col_a].clone()
+        orig_bias_b = mlp.c_fc.bias[col_b].clone()
+        orig_proj_a = mlp.c_proj.weight[:, col_a].clone()
+        orig_proj_b = mlp.c_proj.weight[:, col_b].clone()
+
+        key = PermutationKey(mlp_cols=[[[layer, col_a], [layer, col_b]]])
+        apply_permutation(self.model, key)
+
+        self.assertTrue(torch.allclose(mlp.c_fc.weight[col_a, :], orig_fc_b))
+        self.assertTrue(torch.allclose(mlp.c_fc.weight[col_b, :], orig_fc_a))
+        self.assertTrue(torch.allclose(mlp.c_fc.bias[col_a], orig_bias_b))
+        self.assertTrue(torch.allclose(mlp.c_fc.bias[col_b], orig_bias_a))
+        self.assertTrue(torch.allclose(mlp.c_proj.weight[:, col_a], orig_proj_b))
+        self.assertTrue(torch.allclose(mlp.c_proj.weight[:, col_b], orig_proj_a))
 
     def test_apply_unapply_exact_equality(self):
         """Test that apply+unapply gives EXACTLY the same weights (not just close)."""

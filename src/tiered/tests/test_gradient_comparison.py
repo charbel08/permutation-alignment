@@ -16,7 +16,7 @@ def create_model():
     config = GPTNeoConfig(
         vocab_size=100, hidden_size=64, num_layers=4, num_heads=4,
         intermediate_size=256,
-        attention_types=[["global"], ["global"], ["global"], ["global"]],
+        attention_types=[[["global"], 4]],
         max_position_embeddings=128,
     )
     return GPTNeoForCausalLMTiered(config)

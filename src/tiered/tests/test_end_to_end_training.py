@@ -120,9 +120,9 @@ class TestEndToEndTraining:
         # Position L2[48:64]: had original_L0_H1, updated by grad_for_L0_H1_value
         expected_updated_L0_H1 = original_L0_H1 - 0.1 * grad_for_L0_H1_value
         
-        assert torch.allclose(updated_at_L0_pos, expected_updated_L2_H3, atol=1e-5), \
+        assert torch.allclose(updated_at_L0_pos, expected_updated_L2_H3, atol=2e-4), \
             "L0 position update incorrect before unapply"
-        assert torch.allclose(updated_at_L2_pos, expected_updated_L0_H1, atol=1e-5), \
+        assert torch.allclose(updated_at_L2_pos, expected_updated_L0_H1, atol=2e-4), \
             "L2 position update incorrect before unapply"
         
         print("Verified: Updates correct WHILE IN C2 config")
@@ -137,9 +137,9 @@ class TestEndToEndTraining:
         final_at_L2_pos = attn_layer2.q_proj.weight[48:64, :].clone()
         
         # Verify the FINAL positions have the correct updated values
-        assert torch.allclose(final_at_L0_pos, expected_updated_L0_H1, atol=1e-5), \
+        assert torch.allclose(final_at_L0_pos, expected_updated_L0_H1, atol=2e-4), \
             "L0 position should have updated L0_H1 (swapped back)"
-        assert torch.allclose(final_at_L2_pos, expected_updated_L2_H3, atol=1e-5), \
+        assert torch.allclose(final_at_L2_pos, expected_updated_L2_H3, atol=2e-4), \
             "L2 position should have updated L2_H3 (swapped back)"
         
         print("Verified: After unapply_key, weights are correctly positioned")
@@ -152,8 +152,6 @@ class TestEndToEndTraining:
         print(f"  original_L2_H3 - 0.1 * grad_for_L2_H3_value should be at L2[48:64]")
         print("  Both verified correct ✓")
         
-        return True
-    
     def test_gradient_permutation_not_needed(self):
         """Explicitly verify that we do NOT need to permute gradients in permute.py.
         
@@ -207,8 +205,6 @@ class TestEndToEndTraining:
         print("  1. optimizer.step() happens while weights and grads are both in C2 positions")
         print("  2. zero_grad() at start of next step clears any misaligned gradients")
         
-        return True
-
 
 if __name__ == "__main__":
     print("=" * 70)

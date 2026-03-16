@@ -37,7 +37,7 @@ python src/tiered/train/private_finetune.py \
 
 # ---- Step 2: Random Key Ablation ----
 echo "=== Step 2: Random Key Ablation ==="
-python scripts/ablation_random_key.py \
+python scripts/ablation/ablation_random_key.py \
     --finetuned_model $FINETUNE_DIR/final \
     --key_path $KEY_PATH \
     --eval_data_disk $SPANISH_DATA \
@@ -50,7 +50,7 @@ python scripts/ablation_random_key.py \
 
 # ---- Step 3: Corrupt Keyed Weights Ablation ----
 echo "=== Step 3: Corrupt Keyed Weights Ablation ==="
-python scripts/ablation_corrupt_keyed.py \
+python scripts/ablation/ablation_corrupt_keyed.py \
     --finetuned_model $FINETUNE_DIR/final \
     --key_path $KEY_PATH \
     --eval_data_disk $RETAIN_DATA \
@@ -63,7 +63,7 @@ python scripts/ablation_corrupt_keyed.py \
 
 # ---- Step 4: Gradual Corruption Ablation ----
 echo "=== Step 4: Gradual Keyed Weight Corruption ==="
-python scripts/ablation_gradual_corrupt.py \
+python scripts/ablation/ablation_gradual_corrupt.py \
     --finetuned_model $FINETUNE_DIR/final \
     --key_path $KEY_PATH \
     --private_data $SPANISH_DATA \
@@ -77,7 +77,7 @@ python scripts/ablation_gradual_corrupt.py \
 
 # ---- Step 5: Gradual Key Corruption Ablation ----
 echo "=== Step 5: Gradual Key Corruption ==="
-python scripts/ablation_gradual_key.py \
+python scripts/ablation/ablation_gradual_key.py \
     --finetuned_model $FINETUNE_DIR/final \
     --key_path $KEY_PATH \
     --private_data $SPANISH_DATA \

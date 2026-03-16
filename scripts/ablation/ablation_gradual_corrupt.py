@@ -11,7 +11,7 @@ Produces a line chart with 4 curves:
   - C2 loss on wiki
 
 Usage:
-    PYTHONPATH=./src:./  python scripts/ablation_gradual_corrupt.py \
+    PYTHONPATH=./src:./  python scripts/ablation/ablation_gradual_corrupt.py \
         --finetuned_model /path/to/finetuned/final \
         --key_path configs/keys/key_64m_20pct_mixed.json \
         --private_data /path/to/spanish_data \

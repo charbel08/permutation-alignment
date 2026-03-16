@@ -5,7 +5,7 @@ Evaluates a finetuned tiered-alignment model with K random permutation keys.
 Produces a loss bar chart and a grouped top-k accuracy bar chart (k=1, k=3).
 
 Usage:
-    PYTHONPATH=./src:./  python scripts/ablation_random_key.py \
+    PYTHONPATH=./src:./  python scripts/ablation/ablation_random_key.py \
         --finetuned_model /path/to/finetuned/final \
         --key_path configs/keys/key_64m_20pct_mixed.json \
         --eval_data_disk /path/to/tokenized_data \

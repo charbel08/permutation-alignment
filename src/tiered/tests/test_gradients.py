@@ -241,31 +241,48 @@ class TestWeightUpdates(unittest.TestCase):
         )
 
     def test_mask_all_no_weights_change(self):
-        """Using a key that covers all params, masking should prevent all updates."""
-        # Create a key that covers ALL heads and ALL MLP columns
+        """A key covering all heads/MLP columns should freeze all updates with mask_keyed_gradients."""
         all_heads = []
+        for layer in range(self.config.num_layers):
+            for head in range(0, self.config.num_heads, 2):
+                all_heads.append([[layer, head], [layer, head + 1]])
+
         all_cols = []
         for layer in range(self.config.num_layers):
-            for head in range(self.config.num_heads):
-                # Pair each head with itself (no actual swap, but marks as keyed)
-                # Actually we need pairs, so let's pair consecutive heads
-                pass
-        
-        # For this test, we'll mask BOTH keyed and public to show nothing changes
+            for col in range(0, self.config.intermediate_size, 2):
+                all_cols.append([[layer, col], [layer, col + 1]])
+
+        full_key = PermutationKey(attn_heads=all_heads, mlp_cols=all_cols)
         before = self._get_weights_snapshot()
         
         self._run_backward()
-        mask_keyed_gradients(self.model, self.key)
-        mask_public_gradients(self.model, self.key)
+        mask_keyed_gradients(self.model, full_key)
         self.optimizer.step()
         
         after = self._get_weights_snapshot()
         
-        # ALL weights should be unchanged
+        # Swappable subset should be unchanged.
+        # (Embeddings/layer norms are public and can still update with mask_keyed_gradients.)
+        def is_swappable_param(name: str) -> bool:
+            return any(
+                key in name
+                for key in (
+                    ".attn.attention.q_proj.weight",
+                    ".attn.attention.k_proj.weight",
+                    ".attn.attention.v_proj.weight",
+                    ".attn.attention.out_proj.weight",
+                    ".mlp.c_fc.weight",
+                    ".mlp.c_fc.bias",
+                    ".mlp.c_proj.weight",
+                )
+            )
+
         for name in before:
+            if not is_swappable_param(name):
+                continue
             self.assertTrue(
                 torch.allclose(before[name], after[name]),
-                f"Parameter {name} changed when all gradients were masked"
+                f"Swappable parameter {name} changed despite full key masking",
             )
 
     def test_empty_key_all_weights_change(self):

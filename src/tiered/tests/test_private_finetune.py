@@ -503,7 +503,10 @@ class TestPaddingExclusion:
         """DataCollatorForLanguageModeling should set padding positions to -100 in labels."""
         from transformers import AutoTokenizer, DataCollatorForLanguageModeling
 
-        tokenizer = AutoTokenizer.from_pretrained("gpt2", cache_dir="/work/scratch/hf-models")
+        try:
+            tokenizer = AutoTokenizer.from_pretrained("gpt2", local_files_only=True)
+        except Exception:
+            pytest.skip("gpt2 tokenizer not cached locally; skipping offline-only collator test")
         tokenizer.pad_token = tokenizer.eos_token
         collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
@@ -581,7 +584,7 @@ class TestPaddingExclusion:
 
         # Should not crash and should use the provided labels
         loss_priv, loss_kl, acc = train_step(
-            model, ref_model, private_batch, public_batch, key,
+            model, model, ref_model, private_batch, public_batch, key,
             optimizer, device, kl_lambda=0.1, max_grad_norm=1.0
         )
 

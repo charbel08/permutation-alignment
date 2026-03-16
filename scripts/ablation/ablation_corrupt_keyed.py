@@ -5,7 +5,7 @@ Randomize the keyed weight values, then measure C1 and C2 loss on public data.
 Produces a loss bar chart and a grouped top-k accuracy bar chart (k=1, k=3).
 
 Usage:
-    PYTHONPATH=./src:./  python scripts/ablation_corrupt_keyed.py \
+    PYTHONPATH=./src:./  python scripts/ablation/ablation_corrupt_keyed.py \
         --finetuned_model /path/to/finetuned/final \
         --key_path configs/keys/key_64m_20pct_mixed.json \
         --eval_data_disk /path/to/retain_data \

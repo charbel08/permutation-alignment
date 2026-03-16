@@ -18,20 +18,20 @@ Supports:
   - Filtering by train/test split and target attribute
 
 Usage (single checkpoint):
-    PYTHONPATH=./src python scripts/eval_memorization.py \
+    PYTHONPATH=./src python scripts/eval/eval_memorization.py \
         --checkpoint /path/to/checkpoint \
         --bio_metadata /path/to/bios_metadata.json \
         --output_dir /path/to/output
 
 Usage (single checkpoint, C1 + C2):
-    PYTHONPATH=./src python scripts/eval_memorization.py \
+    PYTHONPATH=./src python scripts/eval/eval_memorization.py \
         --checkpoint /path/to/checkpoint \
         --bio_metadata /path/to/bios_metadata.json \
         --key_path configs/keys/key_64m_20pct_mixed.json \
         --output_dir /path/to/output
 
 Usage (sweep all checkpoints in a directory):
-    PYTHONPATH=./src python scripts/eval_memorization.py \
+    PYTHONPATH=./src python scripts/eval/eval_memorization.py \
         --checkpoint /path/to/ckpt_dir \
         --bio_metadata /path/to/bios_metadata.json \
         --key_path configs/keys/key_64m_20pct_mixed.json \

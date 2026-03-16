@@ -178,10 +178,7 @@ def _apply_mlp_swap(model, op: MLPSwapOp):
             # Same-layer swap
             _swap_rows(mlp_a.c_fc.weight, op.cols_a, op.cols_b)
             if mlp_a.c_fc.bias is not None:
-                _swap_rows(mlp_a.c_fc.bias.unsqueeze(0), 
-                          op.cols_a.unsqueeze(0) if op.cols_a.dim() == 0 else op.cols_a,
-                          op.cols_b.unsqueeze(0) if op.cols_b.dim() == 0 else op.cols_b)
-                # Actually bias is 1D, use direct indexing
+                # Bias is 1D; swap entries directly.
                 tmp = mlp_a.c_fc.bias[op.cols_a].clone()
                 mlp_a.c_fc.bias[op.cols_a] = mlp_a.c_fc.bias[op.cols_b]
                 mlp_a.c_fc.bias[op.cols_b] = tmp

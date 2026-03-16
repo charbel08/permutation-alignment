@@ -69,14 +69,19 @@ PYTHONPATH=./src pytest ./src/tiered/tests -sv
 │       ├── key_530m_7pct_{1,2,3}.json # 530M model, 7% keys (for multi-tier)
 │       └── key_1b_10pct_mixed.json    # 1B model, 10% coverage
 ├── scripts/
-│   ├── generate_key.py                # Permutation key generator
-│   ├── eval_memorization.py           # Synthetic bio memorization eval (C1 vs C2)
-│   ├── ablation_random_key.py         # Ablation 1: random key experiment
-│   ├── ablation_corrupt_keyed.py      # Ablation 2: corrupt keyed weights
-│   ├── ablation_gradual_corrupt.py    # Ablation 3: gradual weight corruption
-│   ├── ablation_gradual_key.py        # Ablation 4: gradual key corruption
-│   ├── run_ablation_random_key.sh     # Shell launcher for ablation 1
-│   ├── run_kl_sweep.sh               # KL lambda hyperparameter sweep
+│   ├── keys/
+│   │   └── generate_key.py            # Permutation key generator
+│   ├── eval/
+│   │   ├── eval_memorization.py       # Synthetic bio memorization eval (C1 vs C2)
+│   │   ├── mmlu_qwen_key_ablation.py  # Qwen key-destruction ablation on MMLU
+│   │   └── run_qwen_key_destruction_5pct.sh
+│   ├── ablation/
+│   │   ├── ablation_random_key.py     # Ablation 1: random key experiment
+│   │   ├── ablation_corrupt_keyed.py  # Ablation 2: corrupt keyed weights
+│   │   ├── ablation_gradual_corrupt.py # Ablation 3: gradual weight corruption
+│   │   ├── ablation_gradual_key.py    # Ablation 4: gradual key corruption
+│   │   ├── run_ablation_random_key.sh # Shell launcher for ablation 1
+│   │   └── run_kl_sweep.sh            # KL lambda hyperparameter sweep
 │   ├── data/
 │   │   ├── generate_synthetic_bios.py # Synthetic bio dataset generator
 │   │   ├── prepare_wikipedia.sh       # Wikipedia dataset preparation
@@ -92,11 +97,10 @@ PYTHONPATH=./src pytest ./src/tiered/tests -sv
 │       ├── wiki/
 │       │   └── run_pretrain_64m_wiki.sh
 │       └── fineweb/
-│           ├── run_baseline_530m.sh
-│           ├── run_pretrain_530m_14pct.sh
-│           ├── run_pretrain_530m_7pct.sh
-│           ├── run_pretrain_530m_7pct_multi.sh
-│           └── run_pretrain_1b.sh
+│           ├── pretrain/              # baseline + keyed pretraining launchers
+│           ├── finetune/              # fine-tuning launchers (incl. KL=0 variants)
+│           ├── eval/                  # inference/evaluation launchers
+│           └── README.md
 ├── src/tiered/
 │   ├── model/
 │   │   └── gpt.py                     # GPTNeoForCausalLMTiered
@@ -150,7 +154,7 @@ Each swap is `[[layer_a, idx_a], [layer_b, idx_b]]`. All swaps are transposition
 ### Generating Keys
 
 ```bash
-python scripts/generate_key.py \
+python scripts/keys/generate_key.py \
     --output configs/keys/my_key.json \
     --num_layers 12 --num_heads 32 --hidden_size 512 --mlp_dim 2048 \
     --target_pct 0.20 --attn_ratio 0.25 --seed 42
@@ -353,14 +357,14 @@ Measures how well the model memorizes synthetic bio attribute values (not filler
 
 ```bash
 # Single checkpoint
-PYTHONPATH=./src python scripts/eval_memorization.py \
+PYTHONPATH=./src python scripts/eval/eval_memorization.py \
     --checkpoint /path/to/checkpoint \
     --bio_metadata /path/to/bios_metadata.json \
     --key_path configs/keys/key_64m_20pct_mixed.json \
     --output_dir /path/to/output
 
 # Sweep across all checkpoints
-PYTHONPATH=./src python scripts/eval_memorization.py \
+PYTHONPATH=./src python scripts/eval/eval_memorization.py \
     --checkpoint /path/to/ckpt_dir \
     --bio_metadata /path/to/bios_metadata.json \
     --key_path configs/keys/key_64m_20pct_mixed.json \
@@ -373,12 +377,26 @@ Reports per-attribute breakdowns (age, profession, hobby, salary), top-k accurac
 
 | Script | Description |
 |--------|-------------|
-| `ablation_random_key.py` | Evaluates C1, C2 (correct key), and C3 (random keys). Tests whether a random key can unlock C2 capabilities. |
-| `ablation_corrupt_keyed.py` | Randomizes keyed weight values, measures C1/C2 loss. Tests C1 robustness to keyed weight corruption. |
-| `ablation_gradual_corrupt.py` | Gradually corrupts keyed weights 1% at a time, tracking degradation curves on private and public data. |
-| `ablation_gradual_key.py` | Gradually replaces correct key swaps with random ones, tracking C2 degradation as key accuracy decreases. |
+| `scripts/ablation/ablation_random_key.py` | Evaluates C1, C2 (correct key), and C3 (random keys). Tests whether a random key can unlock C2 capabilities. |
+| `scripts/ablation/ablation_corrupt_keyed.py` | Randomizes keyed weight values, measures C1/C2 loss. Tests C1 robustness to keyed weight corruption. |
+| `scripts/ablation/ablation_gradual_corrupt.py` | Gradually corrupts keyed weights 1% at a time, tracking degradation curves on private and public data. |
+| `scripts/ablation/ablation_gradual_key.py` | Gradually replaces correct key swaps with random ones, tracking C2 degradation as key accuracy decreases. |
 
 All ablations produce charts (loss and top-k accuracy), log to WandB, and save JSON results.
+
+### Qwen Key-Destruction Ablation (MMLU)
+
+Runs MMLU evaluation while increasing key coverage in 5% increments:
+
+```bash
+bash scripts/eval/run_qwen_key_destruction_5pct.sh
+```
+
+Direct evaluator script:
+
+```bash
+python scripts/eval/mmlu_qwen_key_ablation.py --help
+```
 
 ## Model Configurations
 

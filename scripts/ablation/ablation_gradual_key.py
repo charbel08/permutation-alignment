@@ -8,7 +8,7 @@ C1 should be invariant to key corruption (no key ever applied).
 C2 should degrade as the key becomes increasingly wrong.
 
 Usage:
-    PYTHONPATH=./src:./  python scripts/ablation_gradual_key.py \
+    PYTHONPATH=./src:./  python scripts/ablation/ablation_gradual_key.py \
         --finetuned_model /path/to/finetuned/final \
         --key_path configs/keys/key_64m_20pct_mixed.json \
         --private_data /path/to/spanish_data \
