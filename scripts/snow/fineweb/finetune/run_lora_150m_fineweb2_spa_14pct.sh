@@ -40,7 +40,7 @@ EVAL_INTERVAL=${EVAL_INTERVAL:-225}
 EVAL_STEPS=${EVAL_STEPS:-50}
 LOG_INTERVAL=${LOG_INTERVAL:-1}
 SAVE_INTERVAL=${SAVE_INTERVAL:-1000}
-WANDB_PROJECT=${WANDB_PROJECT:-tiered-alignment-lora}
+WANDB_PROJECT=${WANDB_PROJECT:-tiered-alignment-private-finetune}
 RUN_NAME=${RUN_NAME:-lora_private_finetune_150m_fineweb2_spa_14pct}
 
 if [ ! -d "$BASE_CHECKPOINT" ]; then
