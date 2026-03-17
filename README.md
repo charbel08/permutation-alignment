@@ -93,13 +93,15 @@ PYTHONPATH=./src pytest ./src/tiered/tests -sv
 │   │   ├── tiered_pretrain_batches.sbatch
 │   │   └── private_finetune_superglue.sbatch
 │   └── snow/                          # SLURM sbatch scripts (Snowflake cluster)
-│       ├── prepare_fineweb.sh
+│       ├── data/                      # dataset prep launchers
 │       ├── wiki/
-│       │   └── run_pretrain_64m_wiki.sh
+│       │   └── pretrain/64m/run.sh
+│       ├── wmdp/
+│       │   └── finetune/150m/run_multi.sh
 │       └── fineweb/
-│           ├── pretrain/              # baseline + keyed pretraining launchers
-│           ├── finetune/              # fine-tuning launchers (incl. KL=0 variants)
-│           ├── eval/                  # inference/evaluation launchers
+│           ├── pretrain/<size>/       # baseline + keyed pretraining launchers
+│           ├── finetune/<size>/<dataset>/  # fine-tuning launchers (incl. KL=0 variants)
+│           ├── eval/<size>/<dataset>/ # inference/evaluation launchers
 │           └── README.md
 ├── src/tiered/
 │   ├── model/

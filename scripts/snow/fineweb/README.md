@@ -1,9 +1,13 @@
 # FineWeb Snow Scripts
 
-This folder is grouped by workflow:
+This folder is grouped by workflow, then model size, then dataset.
 
-- `pretrain/`: baseline and tiered pretraining launchers
-- `finetune/`: private fine-tuning launchers (tiered + LoRA baseline)
-- `eval/`: inference/evaluation launchers
+- `pretrain/<size>/`: baseline and tiered pretraining launchers
+- `finetune/<size>/<dataset>/`: private fine-tuning launchers
+- `eval/<size>/<dataset>/`: inference/evaluation launchers
 
-Use scripts directly from these folders.
+Examples:
+
+- `pretrain/150m/run_multi_cumulative.sh`
+- `finetune/150m/fineweb2/run_multi_cumulative.sh`
+- `eval/150m/fineweb2/run_clean_prompts_3langs.sh`

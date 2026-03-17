@@ -16,7 +16,7 @@ mkdir -p outputs
 # -----------------------------------------------------------------------------
 
 PYTHON_BIN=${PYTHON_BIN:-python3}
-CHECKPOINT=${CHECKPOINT:-/work/scratch/checkpoints/fineweb/finetune_150m_fineweb2_3langs_chained/stage3_spa_Latn_key3/final}
+CHECKPOINT=${CHECKPOINT:-/work/scratch/checkpoints/fineweb/finetune_150m_fineweb2_3langs_multi/stage3_spa_Latn_key3/final}
 KEY_1=${KEY_1:-configs/keys/key_150m_7pct_1.json}
 KEY_2=${KEY_2:-configs/keys/key_150m_7pct_2.json}
 KEY_3=${KEY_3:-configs/keys/key_150m_7pct_3.json}
