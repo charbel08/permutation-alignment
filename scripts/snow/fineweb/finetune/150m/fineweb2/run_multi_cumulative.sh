@@ -179,7 +179,7 @@ PY
     echo "=========================================================="
 
     CMD=(
-        torchrun --nproc_per_node="$NGPUS" -m tiered.train.private_finetune
+        torchrun --nproc_per_node="$NGPUS" -m tiered.train.finetune.private_finetune
         --checkpoint "$CURRENT_CHECKPOINT"
         --key_path "$KEY_PATH"
         --all_key_paths "${CUM_KEYS[@]}"

@@ -5,7 +5,7 @@ export TRANSFORMERS_CACHE=/work/scratch/hf
 
 cd /work/permutation-alignment
 
-torchrun --standalone --nproc_per_node=8 -m tiered.train.tiered_pretrain \
+torchrun --standalone --nproc_per_node=8 -m tiered.train.pretrain.tiered_pretrain \
     --data_path /work/scratch/data/datasets/fineweb/retain \
     --output_dir /work/scratch/checkpoints/fineweb/tiered_pretrain_1b \
     --key_path configs/keys/key_1b_10pct_mixed.json \

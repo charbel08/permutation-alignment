@@ -205,7 +205,7 @@ PYTHONPATH=./src python src/tiered/train/inference.py \
 Train a model with asymmetric gradient updates on C1 and C2:
 
 ```bash
-torchrun --standalone --nproc_per_node=3 -m tiered.train.tiered_pretrain \
+torchrun --standalone --nproc_per_node=3 -m tiered.train.pretrain.tiered_pretrain \
     --data_path /path/to/tokenized/data \
     --key_path configs/keys/key_64m_20pct_mixed.json \
     --output_dir /path/to/output \
@@ -224,7 +224,7 @@ Supports distributed training via `torchrun`, gradient accumulation, `torch.comp
 Train with multiple keyed tiers using constant compute (2 passes per step):
 
 ```bash
-torchrun --standalone --nproc_per_node=4 -m tiered.train.multi_tiered_pretrain \
+torchrun --standalone --nproc_per_node=4 -m tiered.train.pretrain.multi_tiered_pretrain \
     --data_path /path/to/tokenized/data \
     --key_paths key1.json key2.json key3.json \
     --output_dir /path/to/output \
@@ -240,7 +240,7 @@ Options: `--tier_sample uniform` (random) or `round_robin` (deterministic cyclin
 Upper-bound baseline — all tiers every step:
 
 ```bash
-torchrun --standalone --nproc_per_node=4 -m tiered.train.multi_tiered_naive \
+torchrun --standalone --nproc_per_node=4 -m tiered.train.pretrain.multi_tiered_naive \
     --data_path /path/to/tokenized/data \
     --key_paths key1.json key2.json key3.json \
     --output_dir /path/to/output \
@@ -250,7 +250,7 @@ torchrun --standalone --nproc_per_node=4 -m tiered.train.multi_tiered_naive \
 ### Baseline Pretraining (No Tiered Alignment)
 
 ```bash
-torchrun --standalone --nproc_per_node=3 -m tiered.train.pretrain \
+torchrun --standalone --nproc_per_node=3 -m tiered.train.pretrain.pretrain \
     --data_path /path/to/tokenized/data \
     --output_dir /path/to/output \
     --hidden_size 512 --num_heads 32 --num_layers 12 \
@@ -262,7 +262,7 @@ torchrun --standalone --nproc_per_node=3 -m tiered.train.pretrain \
 Finetune the keyed tier on private data while preserving public behavior:
 
 ```bash
-PYTHONPATH=./src python src/tiered/train/private_finetune.py \
+PYTHONPATH=./src python src/tiered/train/finetune/private_finetune.py \
     --checkpoint /path/to/tiered/checkpoint \
     --key_path configs/keys/key_64m_20pct_mixed.json \
     --private_data /path/to/forget/data \
@@ -282,7 +282,7 @@ fits the keyed-parameter budget induced by `--key_path`, then reports C1/C2
 performance plus FLOPs comparisons against a 2-pass tiered reference.
 
 ```bash
-torchrun --standalone --nproc_per_node=8 -m tiered.train.lora_private_finetune \
+torchrun --standalone --nproc_per_node=8 -m tiered.train.finetune.lora_private_finetune \
     --checkpoint /path/to/base/checkpoint \
     --key_path configs/keys/key_150m_14pct.json \
     --private_data /path/to/private/data \
@@ -302,7 +302,7 @@ Key outputs:
 Finetune C2 on SuperGLUE NLU tasks with answer-only label masking:
 
 ```bash
-PYTHONPATH=./src python src/tiered/train/superglue_finetune.py \
+PYTHONPATH=./src python src/tiered/train/finetune/superglue_finetune.py \
     --checkpoint /path/to/pretrained \
     --key_path configs/keys/key_64m_20pct_mixed.json \
     --superglue_data /path/to/superglue \

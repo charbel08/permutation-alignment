@@ -6,7 +6,7 @@ Coverage:
          evaluate_all_tiers, prefetch wraparound, adapter save/load roundtrip
 
 NOTE: the stacked training script is imported as
-    from tiered.train import lora_stacked_private_finetune
+    from tiered.train.finetune import lora_stacked_private_finetune
 Rename the .py file accordingly if it doesn't match.
 """
 
@@ -27,7 +27,7 @@ from tiered.model import GPTNeoForCausalLMTiered
 from tiered.permutation import PermutationKey
 
 # Adjust the import to match your module filename:
-from tiered.train import lora_stacked_private_finetune as lora_stacked
+from tiered.train.finetune import lora_stacked_private_finetune as lora_stacked
 
 try:
     from peft import LoraConfig, TaskType, get_peft_model

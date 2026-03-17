@@ -24,7 +24,7 @@ from tiered.permutation import (
     build_mask_plan,
     mask_public_gradients,
 )
-from tiered.train import lora_private_finetune as lora_private
+from tiered.train.finetune import lora_private_finetune as lora_private
 
 # Try importing PEFT — tests that need it are skipped if unavailable.
 try:

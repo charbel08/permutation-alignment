@@ -15,7 +15,7 @@ Validation tracks:
     - C2 on SuperGLUE: should improve (learning NLU capability)
 
 Usage:
-    PYTHONPATH=./src python src/tiered/train/superglue_finetune.py \\
+    PYTHONPATH=./src python src/tiered/train/finetune/superglue_finetune.py \\
         --checkpoint /path/to/pretrained \\
         --key_path configs/keys/key_64m_20pct_mixed.json \\
         --superglue_data /path/to/superglue \\

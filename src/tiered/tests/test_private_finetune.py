@@ -562,7 +562,7 @@ class TestPaddingExclusion:
 
     def test_train_step_uses_collator_labels(self):
         """train_step should use batch['labels'] from collator, not input_ids.clone()."""
-        from tiered.train.private_finetune import train_step
+        from tiered.train.finetune.private_finetune import train_step
 
         model = create_test_model()
         ref_model = copy.deepcopy(model)

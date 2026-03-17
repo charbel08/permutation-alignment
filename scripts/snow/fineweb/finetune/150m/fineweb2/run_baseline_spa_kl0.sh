@@ -97,7 +97,7 @@ echo "=========================================================="
 
 LOG_FILE="logs/${RUN_NAME}_$(date +%Y%m%d_%H%M%S).log"
 
-torchrun --standalone --nproc_per_node="$NGPUS" -m tiered.train.private_finetune \
+torchrun --standalone --nproc_per_node="$NGPUS" -m tiered.train.finetune.private_finetune \
     --checkpoint "$BASE_CHECKPOINT" \
     --key_path "$KEY_PATH" \
     --private_data "$PRIVATE_DATA" \

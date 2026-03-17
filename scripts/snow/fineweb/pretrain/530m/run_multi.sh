@@ -7,7 +7,7 @@ cd /work/permutation-alignment
 
 mkdir -p logs
 
-torchrun --standalone --nproc_per_node=8 -m tiered.train.multi_tiered_pretrain \
+torchrun --standalone --nproc_per_node=8 -m tiered.train.pretrain.multi_tiered_pretrain \
     --data_path /work/scratch/data/datasets/fineweb/retain \
     --output_dir /work/scratch/checkpoints/fineweb/tiered_pretrain_530m_7pct_multi \
     --key_paths configs/keys/key_530m_7pct_1.json configs/keys/key_530m_7pct_2.json configs/keys/key_530m_7pct_3.json \

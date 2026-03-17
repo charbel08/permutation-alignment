@@ -32,7 +32,7 @@ for KEY_ID in 1 2 3; do
     echo "Finetuning key $KEY_ID (active tier C$((KEY_ID+1)))"
     echo "=============================================="
 
-    torchrun --nproc_per_node=$NGPUS -m tiered.train.private_finetune \
+    torchrun --nproc_per_node=$NGPUS -m tiered.train.finetune.private_finetune \
         --checkpoint $CHECKPOINT \
         --key_path $KEY_PATH \
         --all_key_paths $ALL_KEYS \

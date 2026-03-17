@@ -7,7 +7,7 @@ cd /work/permutation-alignment
 
 mkdir -p logs
 
-torchrun --standalone --nproc_per_node=8 -m tiered.train.pretrain \
+torchrun --standalone --nproc_per_node=8 -m tiered.train.pretrain.pretrain \
     --data_path /work/scratch/data/datasets/fineweb/retain \
     --output_dir /work/scratch/checkpoints/fineweb/baseline_pretrain_530m \
     --hidden_size 1344 \

@@ -18,7 +18,7 @@ Validation tracks:
     - C2 on private data: should improve (learning private knowledge)
 
 Usage:
-    PYTHONPATH=./src python src/tiered/train/private_finetune.py \\
+    PYTHONPATH=./src python src/tiered/train/finetune/private_finetune.py \\
         --checkpoint /path/to/pretrained \\
         --key_path examples/key_32m.json \\
         --private_data /path/to/forget \\
