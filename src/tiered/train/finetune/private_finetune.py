@@ -44,7 +44,8 @@ from transformers import AutoTokenizer, DataCollatorForLanguageModeling
 from tqdm import tqdm
 
 from tiered.model import GPTNeoForCausalLMTiered
-from tiered.permutation import load_key, mask_public_gradients
+from tiered.permutation import load_key, mask_public_gradients, swap_gradients
+from tiered.permutation.permute import apply_permutation, unapply_permutation, build_swap_plan
 from tiered.train.utils import save_checkpoint
 
 
@@ -107,6 +108,10 @@ def parse_args():
                         help="Path to permutation key JSON (active key for training)")
     parser.add_argument("--all_key_paths", type=str, nargs="*", default=None,
                         help="All key paths for cross-tier eval (if omitted, only active key is evaluated)")
+    parser.add_argument("--cumulative_key_paths", type=str, nargs="*", default=None,
+                        help="Prior tier keys to co-apply for cumulative mode "
+                             "(e.g., for stage 3: key_1.json key_2.json). "
+                             "Omit for non-cumulative (independent) mode.")
     
     # Data
     parser.add_argument("--private_data", type=str, required=True,
@@ -152,33 +157,38 @@ def parse_args():
 
 def train_step(model, raw_model, ref_model, private_batch, public_batch,
                key, optimizer, device, kl_lambda, max_grad_norm,
-               is_distributed=False):
+               is_distributed=False, prior_keys=None):
     """Execute one finetuning step.
     
-    Implements: L_ft = (1-λ) * L_priv(C2) + λ * R_KL(C1)
+    Implements: L_ft = (1-λ) * L_priv(C_{k+1}) + λ * R_KL(C1)
     
-    CRITICAL: When switching from C1 to C2 after KL backward, we must also
-    swap the gradients so they follow their corresponding weight values.
+    Supports both independent and cumulative modes:
+      - Independent (prior_keys=None): applies only the active key (original behavior)
+      - Cumulative (prior_keys=list): applies prior keys + active key together
+
+    CRITICAL: When switching from C1 to C_{k+1} after KL backward, we must
+    swap the gradients for ALL applied keys so they follow their weights.
     
     Algorithm:
     1. Forward C1 on public data → R_KL → backward (if kl_lambda > 0)
        Uses no_sync() so DDP doesn't allreduce yet.
-    2. apply_key → switch weights to C2 positions
-    3. swap_gradients → move KL gradients to follow their weights
-    4. Forward C2 on private data → L_priv → backward (WITH sync)
-    5. mask_public_gradients (zero public grads, keep keyed grads)
-    6. clip_grad_norm + optimizer.step() [WHILE IN C2]
-    7. unapply_key → back to C1
+    2. Apply prior keys (if cumulative) + active key → enter C_{k+1}
+    3. swap_gradients for all applied keys → KL grads follow their weights
+    4. Forward C_{k+1} on private data → L_priv → backward (WITH sync)
+    5. mask_public_gradients(active_key) → zero all, keep only active key's grads
+    6. clip_grad_norm + optimizer.step() [IN C_{k+1} CONFIG]
+    7. unapply active key + prior keys → back to C1
     
     Returns:
         (loss_priv, loss_kl, accuracy)
     """
-    from tiered.permutation import swap_gradients
+    if prior_keys is None:
+        prior_keys = []
     
     raw_model.train()
     optimizer.zero_grad()
     
-    # === Step 1: R_KL on C1 (public architecture) ===
+    # === Step 1: R_KL on C1 (public architecture, no keys) ===
     loss_kl_value = 0.0
     if kl_lambda > 0 and public_batch is not None and ref_model is not None:
         public_ids = public_batch["input_ids"].to(device)
@@ -197,12 +207,19 @@ def train_step(model, raw_model, ref_model, private_batch, public_batch,
             scaled_kl.backward()
         loss_kl_value = loss_kl.item()
     
-    # === Step 2-3: Switch to C2 and swap gradients to follow weights ===
+    # === Step 2-3: Enter C_{k+1} and swap gradients to follow weights ===
+    # Apply prior keys first (cumulative context), then active key
+    for prior_key, prior_plan in prior_keys:
+        apply_permutation(raw_model, prior_key, plan=prior_plan)
     raw_model.apply_key(key)
-    if kl_lambda > 0:
-        swap_gradients(raw_model, key)  # KL gradients now at C2 positions
     
-    # === Step 4: L_priv on C2 (WITH sync — triggers allreduce) ===
+    if kl_lambda > 0:
+        # Swap KL gradients for all applied keys so they follow their weights
+        swap_gradients(raw_model, key)
+        for prior_key, prior_plan in reversed(prior_keys):
+            swap_gradients(raw_model, prior_key, plan=prior_plan)
+    
+    # === Step 4: L_priv on C_{k+1} (WITH sync — triggers allreduce) ===
     private_ids = private_batch["input_ids"].to(device)
     labels = private_batch["labels"].to(device)
     outputs_c2 = model(private_ids, labels=labels)
@@ -216,21 +233,31 @@ def train_step(model, raw_model, ref_model, private_batch, public_batch,
     
     scaled_priv.backward()
     
-    # === Step 5: Zero public grads ===
+    # === Step 5: Zero all grads except active key's ===
+    # mask_public_gradients zeros everything and restores only the active
+    # key's positions. This correctly kills:
+    #   - Public grads (frozen during finetuning)
+    #   - Prior tier grads (computed in scrambled context, can't be applied)
     mask_public_gradients(raw_model, key)
     
-    # === Step 6: Optimizer step WHILE IN C2 CONFIG ===
+    # === Step 6: Optimizer step IN C_{k+1} CONFIG ===
+    # Safe because within a stage, the key configuration is constant
+    # (same prior keys + same active key every step), so Adam momentum/
+    # variance always sees weights at the same positions.
     torch.nn.utils.clip_grad_norm_(raw_model.parameters(), max_grad_norm)
     optimizer.step()
     
     # === Step 7: Back to C1 ===
     raw_model.unapply_key(key)
+    for prior_key, prior_plan in reversed(prior_keys):
+        unapply_permutation(raw_model, prior_key, plan=prior_plan)
     
     return loss_priv.item(), loss_kl_value, acc
 
 
 @torch.no_grad()
-def evaluate_on_dataset(model, dataloader, key, device, num_steps=50, eval_c2=False):
+def evaluate_on_dataset(model, dataloader, key, device, num_steps=50, eval_c2=False,
+                        prior_keys=None):
     """Evaluate model on a dataset.
     
     Args:
@@ -240,10 +267,15 @@ def evaluate_on_dataset(model, dataloader, key, device, num_steps=50, eval_c2=Fa
         device: Device to use
         num_steps: Number of batches to evaluate
         eval_c2: Whether to also evaluate C2 architecture
+        prior_keys: List of (key, swap_plan) pairs to apply before the eval key
+                    for cumulative mode. None or [] for independent mode.
         
     Returns:
         Dict with loss, ppl, acc for C1 (and C2 if eval_c2=True)
     """
+    if prior_keys is None:
+        prior_keys = []
+    
     model.eval()
     
     total_loss_c1 = 0.0
@@ -280,9 +312,13 @@ def evaluate_on_dataset(model, dataloader, key, device, num_steps=50, eval_c2=Fa
         total_acc_c1 += acc_c1
         total_top3_c1 += top3_acc_c1
         
-        # Evaluate C2 if requested
+        # Evaluate C2 (or cumulative C_{k+1}) if requested
         if eval_c2:
+            # Apply prior keys (cumulative context), then eval key
+            for prior_key, prior_plan in prior_keys:
+                apply_permutation(model, prior_key, plan=prior_plan)
             model.apply_key(key)
+            
             outputs_c2 = model(input_ids, labels=labels)
             loss_c2 = outputs_c2.loss.item()
             logits_c2 = outputs_c2.logits[:, :-1, :]
@@ -290,7 +326,11 @@ def evaluate_on_dataset(model, dataloader, key, device, num_steps=50, eval_c2=Fa
             acc_c2 = (preds_c2 == targets).float().mean().item()
             top3_c2 = logits_c2.topk(3, dim=-1).indices
             top3_acc_c2 = (top3_c2 == targets.unsqueeze(-1)).any(dim=-1).float().mean().item()
+            
+            # Unapply in reverse
             model.unapply_key(key)
+            for prior_key, prior_plan in reversed(prior_keys):
+                unapply_permutation(model, prior_key, plan=prior_plan)
             
             total_loss_c2 += loss_c2
             total_acc_c2 += acc_c2
@@ -347,27 +387,67 @@ def main():
     if is_main:
         print(f"Loaded active key: {len(key.attn_heads)} attention swaps, {len(key.mlp_cols)} MLP swaps")
     
+    # Load cumulative prior keys (for cumulative mode)
+    # These keys are applied before the active key to recreate the
+    # cumulative context from pretraining.
+    prior_keys = []  # list of (PermutationKey, SwapPlan)
+    cumulative_mode = args.cumulative_key_paths is not None and len(args.cumulative_key_paths) > 0
+    if cumulative_mode:
+        if is_main:
+            print(f"Cumulative mode: {len(args.cumulative_key_paths)} prior key(s)")
+        for kp in args.cumulative_key_paths:
+            pk = load_key(kp)
+            sp = build_swap_plan(model, pk, device)
+            prior_keys.append((pk, sp))
+            if is_main:
+                print(f"  Prior key: {kp} ({len(pk.attn_heads)} attn, {len(pk.mlp_cols)} MLP)")
+    
     # Load all keys for cross-tier evaluation — label as C2, C3, ..., CN
     # (C1 = public/no key)
+    # In cumulative mode, C_{k+1} applies keys 0..k, so eval must do the same.
     all_keys = {}  # {label: PermutationKey}
+    all_eval_prior_keys = {}  # {label: list of (key, plan) pairs to apply before eval key}
     active_tier_label = None
     if args.all_key_paths:
-        for i, kp in enumerate(args.all_key_paths):
+        # Build swap plans for all keys (needed for cumulative eval)
+        all_loaded_keys = []
+        all_swap_plans = []
+        for kp in args.all_key_paths:
             k = load_key(kp)
+            sp = build_swap_plan(model, k, device)
+            all_loaded_keys.append(k)
+            all_swap_plans.append(sp)
+
+        for i, kp in enumerate(args.all_key_paths):
             label = f"C{i + 2}"  # C2, C3, C4, ...
-            all_keys[label] = k
+            all_keys[label] = all_loaded_keys[i]
+
+            if cumulative_mode:
+                # C_{k+1} eval applies keys 0..k-1 as prior, then key k
+                all_eval_prior_keys[label] = [
+                    (all_loaded_keys[j], all_swap_plans[j]) for j in range(i)
+                ]
+            else:
+                all_eval_prior_keys[label] = []
+
             if os.path.abspath(kp) == os.path.abspath(args.key_path):
                 active_tier_label = label
             if is_main:
-                print(f"  {label}: {os.path.basename(kp)} ({len(k.attn_heads)} attn, {len(k.mlp_cols)} MLP)")
+                if cumulative_mode and i > 0:
+                    prior_str = " + ".join(f"key_{j+1}" for j in range(i))
+                    print(f"  {label}: {prior_str} + {os.path.basename(kp)}")
+                else:
+                    print(f"  {label}: {os.path.basename(kp)}")
+
         if active_tier_label is None:
-            # Active key not in all_key_paths — add it
             label = f"C{len(all_keys) + 2}"
             all_keys[label] = key
+            all_eval_prior_keys[label] = list(prior_keys)
             active_tier_label = label
     else:
         active_tier_label = "C2"
         all_keys["C2"] = key
+        all_eval_prior_keys["C2"] = list(prior_keys)
     
     # Create reference model for KL (frozen copy of pretrained C1)
     ref_model = None
@@ -659,7 +739,7 @@ def main():
         loss_priv, loss_kl, acc = train_step(
             model, raw_model, ref_model, private_batch, public_batch, key, 
             optimizer, device, args.kl_lambda, args.max_grad_norm,
-            is_distributed=is_distributed
+            is_distributed=is_distributed, prior_keys=prior_keys
         )
         scheduler.step()
         global_step += 1
@@ -734,7 +814,8 @@ def main():
             for tier_label, eval_key in all_keys.items():
                 tier_metrics = evaluate_on_dataset(
                     raw_model, private_val_loader, eval_key, device, 
-                    num_steps=args.eval_steps, eval_c2=True
+                    num_steps=args.eval_steps, eval_c2=True,
+                    prior_keys=all_eval_prior_keys.get(tier_label, [])
                 )
                 tag = "★" if tier_label == active_tier_label else " "
                 print(f"  {tag} {tier_label}: loss={tier_metrics['loss_c2']:.4f}, ppl={tier_metrics['ppl_c2']:.2f}, acc={tier_metrics['acc_c2']:.4f}")
@@ -757,7 +838,8 @@ def main():
                 for tier_label, eval_key in all_keys.items():
                     tier_metrics = evaluate_on_dataset(
                         raw_model, retain_val_loader, eval_key, device,
-                        num_steps=args.eval_steps, eval_c2=True
+                        num_steps=args.eval_steps, eval_c2=True,
+                        prior_keys=all_eval_prior_keys.get(tier_label, [])
                     )
                     tag = "★" if tier_label == active_tier_label else " "
                     print(f"  {tag} {tier_label}: loss={tier_metrics['loss_c2']:.4f}, ppl={tier_metrics['ppl_c2']:.2f}, acc={tier_metrics['acc_c2']:.4f}")
