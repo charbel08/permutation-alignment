@@ -17,7 +17,8 @@ Outputs include:
   - Per-tier PEFT adapter checkpoints
   - A combined summary across all tiers
 
-Requires PEFT >= 0.7.0 for multi-adapter set_adapter(list) support.
+Compatible with PEFT versions where multi-adapter activation may live on
+the wrapped base model (e.g., model.base_model.set_adapter(list)).
 """
 
 from __future__ import annotations
@@ -276,6 +277,53 @@ def freeze_adapter_params(model, adapter_name: str) -> int:
     return frozen
 
 
+def set_active_adapters(model, adapter_names: list[str] | str):
+    """Activate adapters across PEFT API variants.
+
+    Newer/alternate PEFT APIs may support list activation on either:
+      - model.set_adapter(list[str])
+      - model.base_model.set_adapter(list[str])
+    while others only support string activation for single adapters.
+    """
+    names = [adapter_names] if isinstance(adapter_names, str) else list(adapter_names)
+    if not names:
+        raise ValueError("adapter_names must be non-empty")
+
+    last_exc: Exception | None = None
+
+    # Try list activation on the top-level model first.
+    try:
+        model.set_adapter(names)
+        return
+    except Exception as exc:
+        last_exc = exc
+
+    # Single-adapter fallback on top-level model.
+    if len(names) == 1:
+        try:
+            model.set_adapter(names[0])
+            return
+        except Exception as exc:
+            last_exc = exc
+
+    # Some PEFT versions expose list activation on the wrapped tuner model.
+    base_model = getattr(model, "base_model", None)
+    if base_model is not None and hasattr(base_model, "set_adapter"):
+        try:
+            base_model.set_adapter(names)
+            return
+        except Exception as exc:
+            last_exc = exc
+        if len(names) == 1:
+            try:
+                base_model.set_adapter(names[0])
+                return
+            except Exception as exc:
+                last_exc = exc
+
+    raise TypeError(f"Could not activate adapters {names}") from last_exc
+
+
 def restore_training_state(model, tier_names: list[str], training_tier_idx: int):
     """Activate all adapters up to training_tier_idx and freeze prior tiers.
 
@@ -283,7 +331,7 @@ def restore_training_state(model, tier_names: list[str], training_tier_idx: int)
     so we must re-freeze the prior tiers after the call.
     """
     active = tier_names[: training_tier_idx + 1]
-    model.set_adapter(active)
+    set_active_adapters(model, active)
     for prior_idx in range(training_tier_idx):
         freeze_adapter_params(model, tier_names[prior_idx])
 
@@ -461,7 +509,7 @@ def evaluate_all_tiers(
 
     # C2 .. C_{K+1}: cumulative tiers
     for k in range(len(tier_names_so_far)):
-        model.set_adapter(tier_names_so_far[: k + 1])
+        set_active_adapters(model, tier_names_so_far[: k + 1])
         results[f"C{k + 2}"] = _eval_on_batches(model, batches, device)
 
     # Restore training state
