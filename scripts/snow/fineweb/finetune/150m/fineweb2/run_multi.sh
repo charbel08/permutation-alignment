@@ -10,7 +10,7 @@ cd /work/permutation-alignment
 mkdir -p logs
 
 # -----------------------------------------------------------------------------
-# Chained private finetuning over 3 FineWeb2 languages on ONE evolving model.
+# Multi-tier private finetuning over 3 FineWeb2 languages on ONE evolving model.
 # Stage 1 output -> Stage 2 input -> Stage 3 input.
 #
 # IMPORTANT:
@@ -18,10 +18,10 @@ mkdir -p logs
 #   so each language gets a fresh schedule/step budget while preserving weights.
 # -----------------------------------------------------------------------------
 
-BASE_CHECKPOINT=${BASE_CHECKPOINT:-/work/scratch/checkpoints/fineweb/tiered_pretrain_150m_7pct_naive/final-checkpoint}
+BASE_CHECKPOINT=${BASE_CHECKPOINT:-/work/scratch/checkpoints/fineweb/tiered_pretrain_150m_7pct_multi/final-checkpoint}
 PUBLIC_DATA=${PUBLIC_DATA:-/work/scratch/data/datasets/fineweb/retain}
 PRIVATE_BASE=${PRIVATE_BASE:-/work/scratch/data/datasets/fineweb2_private}
-OUTPUT_ROOT=${OUTPUT_ROOT:-/work/scratch/checkpoints/fineweb/finetune_150m_fineweb2_3langs_chained_naive}
+OUTPUT_ROOT=${OUTPUT_ROOT:-/work/scratch/checkpoints/fineweb/finetune_150m_fineweb2_3langs_multi}
 
 ALL_KEYS=${ALL_KEYS:-"configs/keys/key_150m_7pct_1.json configs/keys/key_150m_7pct_2.json configs/keys/key_150m_7pct_3.json"}
 
@@ -69,7 +69,7 @@ for idx in "${!LANGS[@]}"; do
     KEY_PATH="configs/keys/key_150m_7pct_${KEY_ID}.json"
     PRIVATE_DATA="${PRIVATE_BASE}/${LANG}/retain"
     OUTPUT_DIR="${OUTPUT_ROOT}/stage${STAGE}_${LANG}_key${KEY_ID}"
-    RUN_NAME="finetune_150m_fineweb2_naive_stage${STAGE}_${LANG}_key${KEY_ID}"
+    RUN_NAME="finetune_150m_fineweb2_stage${STAGE}_${LANG}_key${KEY_ID}"
     LOG_FILE="logs/${RUN_NAME}_$(date +%Y%m%d_%H%M%S).log"
 
     if [ ! -f "$KEY_PATH" ]; then
@@ -156,4 +156,4 @@ done
 
 echo ""
 echo "All 3 stages complete."
-echo "Final chained model: $CURRENT_CHECKPOINT"
+echo "Final multi model: $CURRENT_CHECKPOINT"
