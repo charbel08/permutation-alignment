@@ -51,7 +51,7 @@ Only keyed weights are updated during finetuning. The KL term regularizes agains
 pip install -e .
 ```
 
-**Requirements:** Python ≥ 3.9, PyTorch ≥ 2.6.0, Transformers ~4.52.4. See `pyproject.toml` for the full dependency list.
+**Requirements:** Python ≥ 3.9, PyTorch ≥ 2.6.0, Transformers ~4.52.4, PEFT ≥ 0.10. See `pyproject.toml` for the full dependency list.
 
 ## Running Tests
 
@@ -268,6 +268,32 @@ PYTHONPATH=./src python src/tiered/train/private_finetune.py \
     --output_dir /path/to/output \
     --learning_rate 1e-5 --kl_lambda 0.1 --max_steps 10000
 ```
+
+### LoRA Private Finetuning Baseline (Separate Weights)
+
+Train a **PEFT LoRA** adapter on private data where:
+- **C1** = base model with adapter disabled
+- **C2** = base model with adapter enabled
+
+The script auto-selects the highest LoRA rank whose trainable parameter count
+fits the keyed-parameter budget induced by `--key_path`, then reports C1/C2
+performance plus FLOPs comparisons against a 2-pass tiered reference.
+
+```bash
+torchrun --standalone --nproc_per_node=8 -m tiered.train.lora_private_finetune \
+    --checkpoint /path/to/base/checkpoint \
+    --key_path configs/keys/key_150m_14pct.json \
+    --private_data /path/to/private/data \
+    --public_data /path/to/retain/data \
+    --output_dir /path/to/output \
+    --batch_size 8 --max_steps 10000
+```
+
+Key outputs:
+- `output_dir/final/adapter_model.safetensors` (or `.bin`): PEFT adapter weights
+- `output_dir/final/adapter_config.json`: PEFT adapter config
+- `output_dir/final/experiment_metadata.json`: rank/budget metadata
+- `output_dir/comparison_summary.json`: perf + FLOPs comparison summary
 
 ### SuperGLUE Private Finetuning
 
