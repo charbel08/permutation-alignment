@@ -10,7 +10,7 @@ cd /work/permutation-alignment
 mkdir -p logs
 
 # -----------------------------------------------------------------------------
-# CUMULATIVE chained private finetuning (non-LoRA, tiered alignment).
+# CUMULATIVE multi-tier private finetuning (non-LoRA, tiered alignment).
 #
 # Stage t uses cumulative key K_cum_t:
 #   K_cum_1 = K1
@@ -26,7 +26,7 @@ PUBLIC_DATA=${PUBLIC_DATA:-/work/scratch/data/datasets/fineweb/retain}
 PRIVATE_DATA_PATHS=${PRIVATE_DATA_PATHS:-"/work/scratch/data/datasets/fineweb2_private/deu_Latn/retain /work/scratch/data/datasets/fineweb2_private/tur_Latn/retain /work/scratch/data/datasets/fineweb2_private/spa_Latn/retain"}
 BASE_KEYS=${BASE_KEYS:-"configs/keys/key_150m_7pct_1.json configs/keys/key_150m_7pct_2.json configs/keys/key_150m_7pct_3.json"}
 STAGE_TAGS=${STAGE_TAGS:-"deu_Latn tur_Latn spa_Latn"}
-OUTPUT_ROOT=${OUTPUT_ROOT:-/work/scratch/checkpoints/fineweb/finetune_150m_fineweb2_3langs_chained_cumulative}
+OUTPUT_ROOT=${OUTPUT_ROOT:-/work/scratch/checkpoints/fineweb/finetune_150m_fineweb2_3langs_multi_cumulative}
 CUM_KEYS_DIR=${CUM_KEYS_DIR:-${OUTPUT_ROOT}/cumulative_keys}
 
 NGPUS=${NGPUS:-8}
@@ -212,5 +212,5 @@ done
 
 echo ""
 echo "All cumulative stages complete."
-echo "Final chained model: $CURRENT_CHECKPOINT"
+echo "Final multi model: $CURRENT_CHECKPOINT"
 echo "Cumulative keys dir: $CUM_KEYS_DIR"
