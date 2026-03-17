@@ -71,10 +71,13 @@ else:
 PY
 )
 
+# Match tiered private_finetune step counting:
+# private_finetune uses DistributedSampler(drop_last=False) + DataLoader(drop_last=True)
+# and counts optimizer steps from per-rank microbatches (no grad-accum factor).
 SAMPLES_PER_RANK=$(( (TRAIN_SAMPLES + NGPUS - 1) / NGPUS ))
-STEPS_PER_EPOCH=$(( SAMPLES_PER_RANK / (BATCH_SIZE * GRAD_ACCUM) ))
+STEPS_PER_EPOCH=$(( SAMPLES_PER_RANK / BATCH_SIZE ))
 if [ "$STEPS_PER_EPOCH" -lt 1 ]; then
-    echo "Computed <1 step/epoch. Adjust BATCH_SIZE or GRAD_ACCUM."
+    echo "Computed <1 step/epoch. Adjust BATCH_SIZE."
     exit 1
 fi
 
