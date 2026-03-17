@@ -1,24 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Thin launcher for Qwen MMLU key-destruction ablation.
+# Launcher for Qwen MMLU key-destruction ablation.
 #
-# The Python script handles range generation, baseline evaluation, nested
-# keys, CIs, and output formatting.  This wrapper just sets environment
-# defaults and forwards arguments.
+# Single GPU:
+#   ./scripts/eval/run_qwen_key_destruction.sh
+#
+# 8 GPUs:
+#   NGPUS=8 ./scripts/eval/run_qwen_key_destruction.sh
 #
 # Quick dev run:
 #   ./scripts/eval/run_qwen_key_destruction.sh --max_examples_per_subject 20
 #
-# Full publishable run (default):
-#   ./scripts/eval/run_qwen_key_destruction.sh
-#
 # Custom model + range:
-#   ./scripts/eval/run_qwen_key_destruction.sh \
+#   NGPUS=8 ./scripts/eval/run_qwen_key_destruction.sh \
 #     --model_id Qwen/Qwen3-4B \
 #     --min_pct 0.01 --max_pct 0.50 --step_pct 0.01
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${ROOT_DIR}"
 
-PYTHONPATH=./src python scripts/eval/mmlu_qwen_key_ablation.py "$@"
+NGPUS="${NGPUS:-1}"
+
+if [ "$NGPUS" -gt 1 ]; then
+    echo "Launching on $NGPUS GPUs via torchrun"
+    PYTHONPATH=./src torchrun --standalone --nproc_per_node="$NGPUS" \
+        scripts/eval/mmlu_qwen_key_ablation.py "$@"
+else
+    PYTHONPATH=./src python scripts/eval/mmlu_qwen_key_ablation.py "$@"
+fi
