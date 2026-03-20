@@ -14,16 +14,16 @@ the model on its own GPU and evaluates a shard of the examples.  Results are
 all-reduced before metric computation.
 
 Usage (single GPU):
-    PYTHONPATH=./src python scripts/eval/mmlu_qwen_key_ablation.py \
+    PYTHONPATH=./src python scripts/eval/qwen_key_destruction_ablation.py \
         --model_id Qwen/Qwen3-8B
 
 Usage (8 GPUs):
     PYTHONPATH=./src torchrun --standalone --nproc_per_node=8 \
-        scripts/eval/mmlu_qwen_key_ablation.py \
+        scripts/eval/qwen_key_destruction_ablation.py \
         --model_id Qwen/Qwen3-8B
 
 Quick dev run:
-    PYTHONPATH=./src python scripts/eval/mmlu_qwen_key_ablation.py \
+    PYTHONPATH=./src python scripts/eval/qwen_key_destruction_ablation.py \
         --model_id Qwen/Qwen3-8B \
         --key_pcts 0.05 0.25 0.50 1.00 \
         --max_examples_per_subject 20
