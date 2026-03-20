@@ -73,8 +73,8 @@ PYTHONPATH=./src pytest ./src/tiered/tests -sv
 │   │   └── generate_key.py            # Permutation key generator
 │   ├── eval/
 │   │   ├── eval_memorization.py       # Synthetic bio memorization eval (C1 vs C2)
-│   │   ├── mmlu_qwen_key_ablation.py  # Qwen key-destruction ablation on MMLU
-│   │   └── run_qwen_key_destruction_5pct.sh
+│   │   ├── qwen_key_destruction_ablation.py  # Qwen key-destruction ablation on MMLU + MATH500
+│   │   └── run_qwen_key_destruction_5pct.sh # 0.5% steps up to 10% (MMLU + MATH500)
 │   ├── ablation/
 │   │   ├── ablation_random_key.py     # Ablation 1: random key experiment
 │   │   ├── ablation_corrupt_keyed.py  # Ablation 2: corrupt keyed weights
@@ -412,9 +412,9 @@ Reports per-attribute breakdowns (age, profession, hobby, salary), top-k accurac
 
 All ablations produce charts (loss and top-k accuracy), log to WandB, and save JSON results.
 
-### Qwen Key-Destruction Ablation (MMLU)
+### Qwen Key-Destruction Ablation (MMLU + MATH500)
 
-Runs MMLU evaluation while increasing key coverage in 5% increments:
+Runs MMLU and MATH500 evaluation while increasing key coverage in 0.5% increments up to 10%:
 
 ```bash
 bash scripts/eval/run_qwen_key_destruction_5pct.sh
@@ -423,7 +423,7 @@ bash scripts/eval/run_qwen_key_destruction_5pct.sh
 Direct evaluator script:
 
 ```bash
-python scripts/eval/mmlu_qwen_key_ablation.py --help
+python scripts/eval/qwen_key_destruction_ablation.py --help
 ```
 
 ## Model Configurations

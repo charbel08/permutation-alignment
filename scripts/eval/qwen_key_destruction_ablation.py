@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""MMLU key-destruction ablation for Qwen models (no training).
+"""MMLU + MATH500 key-destruction ablation for Qwen models (no training).
 
-Evaluates a pretrained Qwen/Llama-style CausalLM on MMLU after applying
-permutation keys of increasing size.  Measures how fast accuracy collapses
-as the fraction of scrambled parameters grows.
+Evaluates a pretrained Qwen/Llama-style CausalLM on MMLU and MATH500 after
+applying permutation keys of increasing size. Measures how fast performance
+collapses as the fraction of scrambled parameters grows.
 
-KEY DESIGN: All key sizes use the SAME random pool shuffle.  The 10% key is
-a strict prefix of the 15% key, which is a strict prefix of the 20% key, etc.
-This ensures the destruction curve is monotonic and measures cumulative
-coverage, not random-draw variance.
+KEY DESIGN: All key sizes use the SAME random pool shuffle.  Any smaller key
+is a strict prefix of any larger key. This ensures the destruction curve is
+monotonic and measures cumulative coverage, not random-draw variance.
 
 MULTI-GPU: Launch with torchrun for data-parallel evaluation. Each rank loads
 the model on its own GPU and evaluates a shard of the examples.  Results are
@@ -38,8 +37,10 @@ import json
 import math
 import os
 import random
+import re
 import time
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import Dict, List
 
@@ -64,6 +65,7 @@ from tiered.permutation.qwen import (
 
 
 ANSWER_LETTERS = ["A", "B", "C", "D"]
+MATH500_DEFAULT_DATASET = "HuggingFaceH4/MATH-500"
 
 
 # ---------------------------------------------------------------------------
@@ -209,14 +211,36 @@ def _logprob_from_ids(
     return float(lp.sum().item())
 
 
+def _resolve_choice_tokens(tokenizer, letters: list[str]) -> list[list[int]]:
+    """Determine the best tokenization for MMLU answer choices.
+
+    The standard approach is to prepend a space (e.g., " A") so the token
+    matches what the model would see mid-sentence.  However, some tokenizers
+    (certain Qwen versions) treat leading spaces differently, producing
+    multi-token encodings.  When that happens, fall back to the bare letter.
+
+    Returns a list of token-id lists, one per choice letter.
+    """
+    spaced = [tokenizer.encode(f" {ch}", add_special_tokens=False) for ch in letters]
+    if all(len(ids) == 1 for ids in spaced):
+        return spaced
+
+    bare = [tokenizer.encode(ch, add_special_tokens=False) for ch in letters]
+    if all(len(ids) == 1 for ids in bare):
+        return bare
+
+    # Neither produced single tokens — return the shorter encoding per letter.
+    return [s if len(s) <= len(b) else b for s, b in zip(spaced, bare)]
+
+
 def predict_choice(model, tokenizer, prompt: str, device: torch.device,
-                   max_context_len: int | None) -> int:
+                   max_context_len: int | None,
+                   choice_token_ids: list[list[int]]) -> int:
     prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
     if not prompt_ids:
         raise ValueError("Empty prompt tokenization")
     scores = []
-    for letter in ANSWER_LETTERS:
-        cont_ids = tokenizer.encode(f" {letter}", add_special_tokens=False)
+    for cont_ids in choice_token_ids:
         scores.append(_logprob_from_ids(model, prompt_ids, cont_ids, device, max_context_len))
     return int(max(range(len(scores)), key=lambda i: scores[i]))
 
@@ -296,6 +320,7 @@ def evaluate_mmlu(
     flat_examples: List[EvalExample],
     shots: int, device: torch.device, max_context_len: int | None,
     rank: int, world_size: int, is_distributed: bool,
+    choice_token_ids: list[list[int]],
     desc: str = "",
 ) -> dict:
     """Evaluate MMLU with distributed sharding.
@@ -314,7 +339,8 @@ def evaluate_mmlu(
 
     for ex in shard:
         prompt = build_prompt(ex.subject, dev_by_subject.get(ex.subject, []), ex, shots)
-        pred = predict_choice(model, tokenizer, prompt, device, max_context_len)
+        pred = predict_choice(model, tokenizer, prompt, device, max_context_len,
+                              choice_token_ids)
         local_correct[ex.subject] = local_correct.get(ex.subject, 0) + (1 if pred == ex.answer_idx else 0)
         local_total[ex.subject] = local_total.get(ex.subject, 0) + 1
         if pbar is not None:
@@ -374,6 +400,299 @@ def evaluate_mmlu(
 
 
 # ---------------------------------------------------------------------------
+# MATH500 data + evaluation
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Math500Example:
+    subject: str
+    problem: str
+    answer: str
+
+
+def _first_nonempty(row: dict, keys: list[str]) -> str | None:
+    for key in keys:
+        value = row.get(key)
+        if value is None:
+            continue
+        value_str = str(value).strip()
+        if value_str:
+            return value_str
+    return None
+
+
+def load_math500_examples(
+    dataset_name: str,
+    split: str,
+    max_examples: int,
+    seed: int,
+) -> list[Math500Example]:
+    ds = load_dataset(dataset_name, split=split)
+    examples: list[Math500Example] = []
+
+    for row in ds:
+        row_dict = dict(row)
+        problem = _first_nonempty(row_dict, ["problem", "question", "prompt"])
+        answer = _first_nonempty(row_dict, ["answer", "final_answer", "ground_truth", "target"])
+        if problem is None or answer is None:
+            keys = sorted(row_dict.keys())
+            raise ValueError(
+                f"Could not parse MATH500 row from dataset={dataset_name}. "
+                f"Expected problem/answer fields, got keys={keys}"
+            )
+        subject = _first_nonempty(row_dict, ["subject", "category", "type", "level"]) or "math500"
+        examples.append(Math500Example(subject=subject, problem=problem, answer=answer))
+
+    rng = random.Random(seed)
+    rng.shuffle(examples)
+    if max_examples > 0:
+        examples = examples[:max_examples]
+    return examples
+
+
+def build_math500_prompt(problem: str) -> str:
+    return (
+        "Solve the following math problem. "
+        "End your response with only the final answer in the form \\boxed{answer}.\n\n"
+        f"Problem: {problem}\n\nAnswer:"
+    )
+
+
+def _extract_last_boxed(text: str) -> str | None:
+    marker_idx = text.rfind("\\boxed{")
+    if marker_idx < 0:
+        marker_idx = text.rfind("boxed{")
+    if marker_idx < 0:
+        return None
+
+    start = text.find("{", marker_idx)
+    if start < 0:
+        return None
+
+    depth = 0
+    for i in range(start, len(text)):
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start + 1:i].strip()
+    return None
+
+
+def extract_math_final_answer(text: str) -> str:
+    boxed = _extract_last_boxed(text)
+    if boxed:
+        return boxed
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return text.strip()
+
+    candidate = lines[-1]
+    lowered = candidate.lower()
+    prefixes = ("final answer:", "answer:", "the answer is", "therefore,")
+    for prefix in prefixes:
+        if lowered.startswith(prefix):
+            candidate = candidate[len(prefix):].strip()
+            break
+
+    if "=" in candidate:
+        rhs = candidate.split("=")[-1].strip()
+        if rhs:
+            candidate = rhs
+    return candidate.strip()
+
+
+def normalize_math_answer(text: str) -> str:
+    ans = extract_math_final_answer(text)
+    ans = ans.replace("−", "-").replace("–", "-")
+    ans = ans.replace("$", "")
+    ans = re.sub(r"\\left|\\right", "", ans)
+    ans = re.sub(r"\\text\{([^{}]*)\}", r"\1", ans)
+    ans = ans.strip().strip(".;,")
+    ans = ans.replace(",", "")
+    ans = re.sub(r"\s+", "", ans)
+    return ans.lower()
+
+
+def _parse_numeric_value(s: str) -> float | None:
+    if not s:
+        return None
+
+    s = s.strip()
+    is_percent = False
+    if s.endswith("%"):
+        s = s[:-1].strip()
+        is_percent = True
+
+    m = re.fullmatch(r"\\frac\{(-?\d+)\}\{(-?\d+)\}", s)
+    try:
+        if m is not None:
+            val = float(Fraction(int(m.group(1)), int(m.group(2))))
+        elif re.fullmatch(r"-?\d+/-?\d+", s):
+            num, den = s.split("/", 1)
+            val = float(Fraction(int(num), int(den)))
+        else:
+            val = float(s)
+    except (ValueError, ZeroDivisionError):
+        return None
+
+    if is_percent:
+        val /= 100.0
+    return val
+
+
+def math_answers_match(pred_text: str, gold_text: str) -> bool:
+    pred = normalize_math_answer(pred_text)
+    gold = normalize_math_answer(gold_text)
+
+    if not pred or not gold:
+        return False
+    if pred == gold or pred.strip("()") == gold.strip("()"):
+        return True
+
+    pred_val = _parse_numeric_value(pred)
+    gold_val = _parse_numeric_value(gold)
+    if pred_val is not None and gold_val is not None:
+        tol = 1e-6 * max(1.0, abs(gold_val))
+        return abs(pred_val - gold_val) <= tol
+    return False
+
+
+def generate_answer_text(
+    model,
+    tokenizer,
+    prompt: str,
+    device: torch.device,
+    max_context_len: int | None,
+    max_new_tokens: int,
+) -> str:
+    prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    if not prompt_ids:
+        raise ValueError("Empty prompt tokenization")
+
+    if max_context_len is not None and len(prompt_ids) + max_new_tokens > max_context_len:
+        keep = max_context_len - max_new_tokens
+        if keep <= 0:
+            raise ValueError("Prompt too long for requested max_new_tokens")
+        prompt_ids = prompt_ids[-keep:]
+
+    input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+    attention_mask = torch.ones_like(input_ids, device=device)
+    eos_token_id = tokenizer.eos_token_id
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_token_id
+    if pad_token_id is None:
+        pad_token_id = 0
+
+    with torch.no_grad():
+        output_ids = model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+        )
+
+    gen_ids = output_ids[0, input_ids.shape[1]:]
+    return tokenizer.decode(gen_ids, skip_special_tokens=True)
+
+
+def evaluate_math500(
+    model,
+    tokenizer,
+    examples: list[Math500Example],
+    device: torch.device,
+    max_context_len: int | None,
+    max_new_tokens: int,
+    rank: int,
+    world_size: int,
+    is_distributed: bool,
+    desc: str = "",
+) -> dict:
+    model.eval()
+    shard = _shard_examples(examples, rank, world_size)
+
+    local_correct: Dict[str, int] = {}
+    local_total: Dict[str, int] = {}
+
+    show_progress = (rank == 0)
+    pbar = tqdm(total=len(shard), desc=desc or "MATH500", leave=False) if show_progress else None
+
+    for ex in shard:
+        prompt = build_math500_prompt(ex.problem)
+        pred_text = generate_answer_text(
+            model=model,
+            tokenizer=tokenizer,
+            prompt=prompt,
+            device=device,
+            max_context_len=max_context_len,
+            max_new_tokens=max_new_tokens,
+        )
+        is_correct = math_answers_match(pred_text, ex.answer)
+        local_correct[ex.subject] = local_correct.get(ex.subject, 0) + (1 if is_correct else 0)
+        local_total[ex.subject] = local_total.get(ex.subject, 0) + 1
+        if pbar is not None:
+            pbar.update(1)
+
+    if pbar is not None:
+        pbar.close()
+
+    all_subjects = sorted(set(ex.subject for ex in examples))
+    subj_to_idx = {s: i for i, s in enumerate(all_subjects)}
+    n_subj = len(all_subjects)
+
+    correct_tensor = torch.zeros(n_subj, dtype=torch.long, device=device)
+    total_tensor = torch.zeros(n_subj, dtype=torch.long, device=device)
+
+    for subj, c in local_correct.items():
+        correct_tensor[subj_to_idx[subj]] = c
+    for subj, t in local_total.items():
+        total_tensor[subj_to_idx[subj]] = t
+
+    correct_tensor = allreduce_sum(correct_tensor, is_distributed)
+    total_tensor = allreduce_sum(total_tensor, is_distributed)
+
+    subject_metrics = {}
+    correct_total = 0
+    count_total = 0
+    for subj in all_subjects:
+        idx = subj_to_idx[subj]
+        c = int(correct_tensor[idx].item())
+        n = int(total_tensor[idx].item())
+        acc = c / n if n else 0.0
+        ci_lo, ci_hi = _wilson_ci(c, n)
+        subject_metrics[subj] = {
+            "correct": c,
+            "total": n,
+            "accuracy": acc,
+            "ci_95_lo": ci_lo,
+            "ci_95_hi": ci_hi,
+        }
+        correct_total += c
+        count_total += n
+
+    macro_acc = (
+        sum(m["accuracy"] for m in subject_metrics.values()) / len(subject_metrics)
+        if subject_metrics else 0.0
+    )
+    micro_acc = correct_total / count_total if count_total else 0.0
+    micro_ci_lo, micro_ci_hi = _wilson_ci(correct_total, count_total)
+
+    return {
+        "micro_accuracy": micro_acc,
+        "micro_ci_95_lo": micro_ci_lo,
+        "micro_ci_95_hi": micro_ci_hi,
+        "macro_accuracy": macro_acc,
+        "total_correct": correct_total,
+        "total_count": count_total,
+        "subjects": subject_metrics,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
 
@@ -381,6 +700,12 @@ def print_eval_summary(name: str, m: dict) -> None:
     ci = f"[{m['micro_ci_95_lo']:.4f}, {m['micro_ci_95_hi']:.4f}]"
     print(f"  [{name}] micro={m['micro_accuracy']:.4f} {ci}  "
           f"macro={m['macro_accuracy']:.4f}  ({m['total_correct']}/{m['total_count']})")
+
+
+def format_key_pct_label(pct: float) -> str:
+    """Return a stable percentage label for metric keys and filenames."""
+    pct_str = f"{pct * 100:.3f}".rstrip("0").rstrip(".")
+    return pct_str.replace(".", "p")
 
 
 def save_outputs(results: dict, output_json: Path, output_csv: Path) -> None:
@@ -392,9 +717,17 @@ def save_outputs(results: dict, output_json: Path, output_csv: Path) -> None:
 
     fieldnames = [
         "name", "key_pct", "keyed_pct_of_swappable",
+        "attn_swaps", "mlp_swaps", "keyed_params",
+
+        # Backward-compatible MMLU aliases.
         "micro_accuracy", "micro_ci_95_lo", "micro_ci_95_hi", "macro_accuracy",
         "total_correct", "total_count",
-        "attn_swaps", "mlp_swaps", "keyed_params",
+
+        # Explicit per-benchmark metrics.
+        "mmlu_micro_accuracy", "mmlu_micro_ci_95_lo", "mmlu_micro_ci_95_hi",
+        "mmlu_macro_accuracy", "mmlu_total_correct", "mmlu_total_count",
+        "math500_micro_accuracy", "math500_micro_ci_95_lo", "math500_micro_ci_95_hi",
+        "math500_macro_accuracy", "math500_total_correct", "math500_total_count",
     ]
     with output_csv.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -429,7 +762,7 @@ def log_wandb_row(row: dict) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Qwen MMLU key-destruction ablation (multi-GPU capable)",
+        description="Qwen MMLU + MATH500 key-destruction ablation (multi-GPU capable)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--model_id", type=str, default="Qwen/Qwen3-8B")
@@ -443,9 +776,24 @@ def parse_args() -> argparse.Namespace:
     key_group = p.add_argument_group("key sweep")
     key_group.add_argument("--key_pcts", type=float, nargs="+", default=None,
                            help="Explicit list (overrides range)")
-    key_group.add_argument("--min_pct", type=float, default=0.05)
-    key_group.add_argument("--max_pct", type=float, default=1.00)
-    key_group.add_argument("--step_pct", type=float, default=0.05)
+    key_group.add_argument(
+        "--min_pct",
+        type=float,
+        default=0.005,
+        help="Minimum key coverage fraction (default: 0.005 = 0.5%%)",
+    )
+    key_group.add_argument(
+        "--max_pct",
+        type=float,
+        default=0.10,
+        help="Maximum key coverage fraction (default: 0.10 = 10%%)",
+    )
+    key_group.add_argument(
+        "--step_pct",
+        type=float,
+        default=0.005,
+        help="Key coverage increment (default: 0.005 = 0.5%%)",
+    )
     key_group.add_argument("--attn_ratio", type=float, default=0.25)
     key_group.add_argument("--seed", type=int, default=42)
 
@@ -454,7 +802,17 @@ def parse_args() -> argparse.Namespace:
     mmlu_group.add_argument("--max_examples_per_subject", type=int, default=-1,
                             help="Cap per subject (-1 = full). 20 for dev runs.")
     mmlu_group.add_argument("--subjects", type=str, nargs="*", default=None)
-    mmlu_group.add_argument("--dataset_name", type=str, default="cais/mmlu")
+    mmlu_group.add_argument("--dataset_name", type=str, default="cais/mmlu",
+                            help="MMLU dataset name")
+
+    math_group = p.add_argument_group("MATH500 evaluation")
+    math_group.add_argument("--disable_math500", action="store_true",
+                            help="Skip MATH500 evaluation")
+    math_group.add_argument("--math500_dataset_name", type=str, default=MATH500_DEFAULT_DATASET)
+    math_group.add_argument("--math500_split", type=str, default="test")
+    math_group.add_argument("--max_math500_examples", type=int, default=-1,
+                            help="Cap MATH500 examples (-1 = full split).")
+    math_group.add_argument("--math500_max_new_tokens", type=int, default=1024)
 
     p.add_argument("--output_json", type=str, default=None)
     p.add_argument("--output_csv", type=str, default=None)
@@ -482,6 +840,9 @@ def parse_args() -> argparse.Namespace:
         if not (0.0 < pct <= 1.0):
             p.error(f"key_pct must be in (0, 1], got {pct}")
     args.key_pcts = sorted(set(args.key_pcts))
+
+    if args.math500_max_new_tokens <= 0:
+        p.error("--math500_max_new_tokens must be > 0")
 
     if args.run_name is None:
         model_short = args.model_id.split("/")[-1]
@@ -533,6 +894,12 @@ def main() -> None:
     model.to(device)
     model.eval()
 
+    # Resolve MMLU choice tokenization once for this tokenizer.
+    choice_token_ids = _resolve_choice_tokens(tokenizer, ANSWER_LETTERS)
+    if is_main:
+        token_strs = [tokenizer.decode(ids) for ids in choice_token_ids]
+        print(f"  MMLU choice tokens: {list(zip(ANSWER_LETTERS, token_strs, choice_token_ids))}")
+
     arch = get_qwen_arch(model)
     max_ctx = getattr(model.config, "max_position_embeddings", None)
     swappable = count_qwen_swappable_params(arch)
@@ -549,17 +916,36 @@ def main() -> None:
         args.dataset_name, args.subjects, args.max_examples_per_subject, args.seed)
 
     flat_examples, dev_by_subject = _flatten_examples(dev_by_subject, test_by_subject)
-    total_eval = len(flat_examples)
-    n_subjects = len(test_by_subject)
+    mmlu_total_eval = len(flat_examples)
+    mmlu_n_subjects = len(test_by_subject)
 
     if is_main:
         cap_str = f" (capped at {args.max_examples_per_subject}/subject)" if args.max_examples_per_subject > 0 else ""
-        print(f"  {n_subjects} subjects, {total_eval} questions{cap_str}")
+        print(f"  {mmlu_n_subjects} subjects, {mmlu_total_eval} questions{cap_str}")
         per_rank = len(_shard_examples(flat_examples, 0, world_size))
         print(f"  ~{per_rank} examples/rank x {world_size} ranks")
-        print(f"  key sweep: {args.key_pcts}")
+
+    math500_examples: list[Math500Example] = []
+    if args.disable_math500:
+        if is_main:
+            print("Skipping MATH500 (disabled)")
+    else:
+        if is_main:
+            print(f"Loading MATH500 ({args.math500_dataset_name}, split={args.math500_split})...")
+        math500_examples = load_math500_examples(
+            dataset_name=args.math500_dataset_name,
+            split=args.math500_split,
+            max_examples=args.max_math500_examples,
+            seed=args.seed,
+        )
+        if is_main:
+            cap_str = f" (capped at {args.max_math500_examples})" if args.max_math500_examples > 0 else ""
+            print(f"  {len(math500_examples)} examples{cap_str}")
+            per_rank = len(_shard_examples(math500_examples, 0, world_size))
+            print(f"  ~{per_rank} examples/rank x {world_size} ranks")
 
     if is_main:
+        print(f"  key sweep: {args.key_pcts}")
         print(f"Generating {len(args.key_pcts)} nested keys (seed={args.seed})...")
     keys = generate_nested_keys(arch, args.key_pcts, args.attn_ratio, args.seed)
 
@@ -570,15 +956,26 @@ def main() -> None:
     config = {
         "model_id": args.model_id,
         "tokenizer_id": args.tokenizer_id or args.model_id,
-        "shots": args.shots,
         "key_pcts": args.key_pcts,
         "attn_ratio": args.attn_ratio,
         "seed": args.seed,
-        "max_examples_per_subject": args.max_examples_per_subject,
-        "dataset_name": args.dataset_name,
-        "subjects": sorted(test_by_subject.keys()),
-        "num_subjects": n_subjects,
-        "total_eval_examples": total_eval,
+        "mmlu": {
+            "dataset_name": args.dataset_name,
+            "shots": args.shots,
+            "max_examples_per_subject": args.max_examples_per_subject,
+            "subjects": sorted(test_by_subject.keys()),
+            "num_subjects": mmlu_n_subjects,
+            "total_eval_examples": mmlu_total_eval,
+            "choice_token_ids": choice_token_ids,
+        },
+        "math500": {
+            "enabled": not args.disable_math500,
+            "dataset_name": args.math500_dataset_name,
+            "split": args.math500_split,
+            "max_examples": args.max_math500_examples,
+            "max_new_tokens": args.math500_max_new_tokens,
+            "total_eval_examples": len(math500_examples),
+        },
         "device": str(device),
         "dtype": args.dtype,
         "nested_keys": True,
@@ -604,25 +1001,63 @@ def main() -> None:
     if is_main:
         print("\n-- Baseline (no key) --")
 
-    baseline = evaluate_mmlu(
+    baseline_mmlu = evaluate_mmlu(
         model, tokenizer, dev_by_subject, flat_examples,
         args.shots, device, max_ctx,
-        rank, world_size, is_distributed, desc="baseline")
+        rank, world_size, is_distributed,
+        choice_token_ids=choice_token_ids,
+        desc="baseline")
+    baseline_math500 = None
+    if not args.disable_math500:
+        baseline_math500 = evaluate_math500(
+            model=model,
+            tokenizer=tokenizer,
+            examples=math500_examples,
+            device=device,
+            max_context_len=max_ctx,
+            max_new_tokens=args.math500_max_new_tokens,
+            rank=rank,
+            world_size=world_size,
+            is_distributed=is_distributed,
+            desc="baseline_math500",
+        )
 
     if is_main:
-        print_eval_summary("baseline", baseline)
+        print_eval_summary("baseline/mmlu", baseline_mmlu)
+        if baseline_math500 is not None:
+            print_eval_summary("baseline/math500", baseline_math500)
         baseline_row = {
             "name": "baseline", "key_pct": 0.0, "keyed_pct_of_swappable": 0.0,
-            "micro_accuracy": baseline["micro_accuracy"],
-            "micro_ci_95_lo": baseline["micro_ci_95_lo"],
-            "micro_ci_95_hi": baseline["micro_ci_95_hi"],
-            "macro_accuracy": baseline["macro_accuracy"],
-            "total_correct": baseline["total_correct"],
-            "total_count": baseline["total_count"],
             "attn_swaps": 0, "mlp_swaps": 0, "keyed_params": 0,
+
+            # Backward-compatible aliases (MMLU).
+            "micro_accuracy": baseline_mmlu["micro_accuracy"],
+            "micro_ci_95_lo": baseline_mmlu["micro_ci_95_lo"],
+            "micro_ci_95_hi": baseline_mmlu["micro_ci_95_hi"],
+            "macro_accuracy": baseline_mmlu["macro_accuracy"],
+            "total_correct": baseline_mmlu["total_correct"],
+            "total_count": baseline_mmlu["total_count"],
+
+            "mmlu_micro_accuracy": baseline_mmlu["micro_accuracy"],
+            "mmlu_micro_ci_95_lo": baseline_mmlu["micro_ci_95_lo"],
+            "mmlu_micro_ci_95_hi": baseline_mmlu["micro_ci_95_hi"],
+            "mmlu_macro_accuracy": baseline_mmlu["macro_accuracy"],
+            "mmlu_total_correct": baseline_mmlu["total_correct"],
+            "mmlu_total_count": baseline_mmlu["total_count"],
         }
+        if baseline_math500 is not None:
+            baseline_row.update({
+                "math500_micro_accuracy": baseline_math500["micro_accuracy"],
+                "math500_micro_ci_95_lo": baseline_math500["micro_ci_95_lo"],
+                "math500_micro_ci_95_hi": baseline_math500["micro_ci_95_hi"],
+                "math500_macro_accuracy": baseline_math500["macro_accuracy"],
+                "math500_total_correct": baseline_math500["total_correct"],
+                "math500_total_count": baseline_math500["total_count"],
+            })
         results["rows"].append(baseline_row)
-        results["metrics"]["baseline"] = baseline
+        results["metrics"]["baseline"] = {"mmlu": baseline_mmlu}
+        if baseline_math500 is not None:
+            results["metrics"]["baseline"]["math500"] = baseline_math500
         if wandb_run is not None:
             log_wandb_row(baseline_row)
 
@@ -632,34 +1067,70 @@ def main() -> None:
         keyed = count_qwen_keyed_params(arch, key)
         actual_pct = keyed["total"] / swappable["total"] if swappable["total"] else 0.0
 
-        name = f"key_{pct*100:.0f}pct"
+        name = f"key_{format_key_pct_label(pct)}pct"
         if is_main:
             print(f"\n-- {name}: requested={pct*100:.1f}% actual={actual_pct*100:.2f}% "
                   f"(attn={len(key.attn_heads)} mlp={len(key.mlp_cols)}) --")
 
         apply_qwen_permutation(model, key)
 
-        metrics = evaluate_mmlu(
+        mmlu_metrics = evaluate_mmlu(
             model, tokenizer, dev_by_subject, flat_examples,
             args.shots, device, max_ctx,
-            rank, world_size, is_distributed, desc=name)
+            rank, world_size, is_distributed,
+            choice_token_ids=choice_token_ids,
+            desc=name)
+        math500_metrics = None
+        if not args.disable_math500:
+            math500_metrics = evaluate_math500(
+                model=model,
+                tokenizer=tokenizer,
+                examples=math500_examples,
+                device=device,
+                max_context_len=max_ctx,
+                max_new_tokens=args.math500_max_new_tokens,
+                rank=rank,
+                world_size=world_size,
+                is_distributed=is_distributed,
+                desc=f"{name}_math500",
+            )
 
         unapply_qwen_permutation(model, key)
 
         if is_main:
-            print_eval_summary(name, metrics)
+            print_eval_summary(f"{name}/mmlu", mmlu_metrics)
+            if math500_metrics is not None:
+                print_eval_summary(f"{name}/math500", math500_metrics)
             row = {
                 "name": name, "key_pct": pct, "keyed_pct_of_swappable": actual_pct,
-                "micro_accuracy": metrics["micro_accuracy"],
-                "micro_ci_95_lo": metrics["micro_ci_95_lo"],
-                "micro_ci_95_hi": metrics["micro_ci_95_hi"],
-                "macro_accuracy": metrics["macro_accuracy"],
-                "total_correct": metrics["total_correct"],
-                "total_count": metrics["total_count"],
                 "attn_swaps": len(key.attn_heads),
                 "mlp_swaps": len(key.mlp_cols),
                 "keyed_params": keyed["total"],
+
+                # Backward-compatible aliases (MMLU).
+                "micro_accuracy": mmlu_metrics["micro_accuracy"],
+                "micro_ci_95_lo": mmlu_metrics["micro_ci_95_lo"],
+                "micro_ci_95_hi": mmlu_metrics["micro_ci_95_hi"],
+                "macro_accuracy": mmlu_metrics["macro_accuracy"],
+                "total_correct": mmlu_metrics["total_correct"],
+                "total_count": mmlu_metrics["total_count"],
+
+                "mmlu_micro_accuracy": mmlu_metrics["micro_accuracy"],
+                "mmlu_micro_ci_95_lo": mmlu_metrics["micro_ci_95_lo"],
+                "mmlu_micro_ci_95_hi": mmlu_metrics["micro_ci_95_hi"],
+                "mmlu_macro_accuracy": mmlu_metrics["macro_accuracy"],
+                "mmlu_total_correct": mmlu_metrics["total_correct"],
+                "mmlu_total_count": mmlu_metrics["total_count"],
             }
+            if math500_metrics is not None:
+                row.update({
+                    "math500_micro_accuracy": math500_metrics["micro_accuracy"],
+                    "math500_micro_ci_95_lo": math500_metrics["micro_ci_95_lo"],
+                    "math500_micro_ci_95_hi": math500_metrics["micro_ci_95_hi"],
+                    "math500_macro_accuracy": math500_metrics["macro_accuracy"],
+                    "math500_total_correct": math500_metrics["total_correct"],
+                    "math500_total_count": math500_metrics["total_count"],
+                })
             results["rows"].append(row)
             results["metrics"][name] = {
                 "requested_key_pct": pct,
@@ -667,8 +1138,10 @@ def main() -> None:
                 "attn_swaps": len(key.attn_heads),
                 "mlp_swaps": len(key.mlp_cols),
                 "keyed_params": keyed,
-                "eval": metrics,
+                "mmlu_eval": mmlu_metrics,
             }
+            if math500_metrics is not None:
+                results["metrics"][name]["math500_eval"] = math500_metrics
             if wandb_run is not None:
                 log_wandb_row(row)
 
@@ -685,7 +1158,9 @@ def main() -> None:
 
         if wandb_run is not None:
             wandb_run.summary["runtime_seconds"] = results["runtime_seconds"]
-            wandb_run.summary["baseline_micro_accuracy"] = baseline["micro_accuracy"]
+            wandb_run.summary["baseline_mmlu_micro_accuracy"] = baseline_mmlu["micro_accuracy"]
+            if baseline_math500 is not None:
+                wandb_run.summary["baseline_math500_micro_accuracy"] = baseline_math500["micro_accuracy"]
             wandb_run.summary["world_size"] = world_size
             wandb_run.finish()
 

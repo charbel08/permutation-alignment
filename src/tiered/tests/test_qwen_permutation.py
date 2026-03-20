@@ -23,7 +23,7 @@ from tiered.permutation.qwen import (
 # Import the nested key generator from the ablation script.
 # Adjust the import path to match your project layout.
 try:
-    from scripts.eval.mmlu_qwen_key_ablation import (
+    from scripts.eval.qwen_key_destruction_ablation import (
         generate_nested_keys,
         _wilson_ci,
     )
