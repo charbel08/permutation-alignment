@@ -8,14 +8,14 @@ export TRANSFORMERS_CACHE=/work/scratch/hf
 
 mkdir -p logs configs/keys/64m/both/generated
 
-RUN_ID=4
-KEY_SEED=649004
-KEY_PATH="configs/keys/64m/both/generated/key_mlpboth_total10pct_run${RUN_ID}.json"
+RUN_ID=5
+KEY_SEED=649005
+KEY_PATH="configs/keys/64m/both/generated/key_mlpboth_total20pct_run${RUN_ID}.json"
 
 # 64M config (tied embeddings):
 # hidden_size=512, num_heads=32, num_layers=12, intermediate_size=2048
 # MLP mode: both (up+down coupled)
-# target_pct=0.16960935805682065 maps to approx 10% of total model parameters.
+# target_pct=0.3392187161136413 maps to approx 20% of total model parameters.
 key_cmd=(
   python3 scripts/keys/generate_key.py
   --output "${KEY_PATH}"
@@ -24,7 +24,7 @@ key_cmd=(
   --hidden_size 512
   --mlp_dim 2048
   --context_size 1024
-  --target_pct 0.16960935805682065
+  --target_pct 0.3392187161136413
   --attn_ratio 0.0
   --attn_mode full
   --mlp_mode both
@@ -73,7 +73,7 @@ train_cmd=(
   --nproc_per_node=8
   -m tiered.train.pretrain.tiered_pretrain
   --data_path /work/scratch/data/datasets/wiki_bio/retain
-  --output_dir /work/scratch/checkpoints/wiki/tiered_pretrain_64m_mlpboth_total10pct_run${RUN_ID}
+  --output_dir /work/scratch/checkpoints/wiki/tiered_pretrain_64m_mlpboth_total20pct_run${RUN_ID}
   --key_path "${KEY_PATH}"
   --hidden_size 512
   --intermediate_size 2048
@@ -91,7 +91,7 @@ train_cmd=(
   --eval_steps 60
   --save_interval 1000
   --wandb_project 64m-pretrain
-  --run_name mlpboth_total10pct_run${RUN_ID}
+  --run_name mlpboth_total20pct_run${RUN_ID}
 )
 
-"${train_cmd[@]}"   2>&1 | tee "logs/mlpboth_total10pct_run${RUN_ID}_$(date +%Y%m%d_%H%M%S).log"
+"${train_cmd[@]}"   2>&1 | tee "logs/mlpboth_total20pct_run${RUN_ID}_$(date +%Y%m%d_%H%M%S).log"

@@ -6,18 +6,18 @@ export HF_HOME=/work/scratch/hf
 export TRANSFORMERS_CACHE=/work/scratch/hf
 
 
-mkdir -p logs configs/keys/64m/up/generated
+mkdir -p logs configs/keys/64m/down/generated
 
-RUN_ID=2
-KEY_SEED=643002
-KEY_PATH="configs/keys/64m/up/generated/key_up_total10pct_run${RUN_ID}.json"
+RUN_ID=4
+KEY_SEED=641004
+KEY_PATH="configs/keys/64m/down/generated/key_down_total20pct_run${RUN_ID}.json"
 
 # 64M config (tied embeddings, no LM-head double count):
 # hidden_size=512, num_heads=32, num_layers=12, intermediate_size=2048
 # total params = 64,067,072
-# target 10% of TOTAL weights mapped to generate_key target_pct over
-# this generator's swappable subset (attn full + mlp_up, attn_ratio=0)
-# target_pct = 0.25433130081300814
+# target 20% of TOTAL weights mapped to generate_key target_pct over
+# this generator's swappable subset (attn full + mlp_down, attn_ratio=0)
+# target_pct = 0.5091593424479167
 key_cmd=(
   python3 scripts/keys/generate_key.py
   --output "${KEY_PATH}"
@@ -26,15 +26,15 @@ key_cmd=(
   --hidden_size 512
   --mlp_dim 2048
   --context_size 1024
-  --target_pct 0.25433130081300814
+  --target_pct 0.5091593424479167
   --attn_ratio 0.0
   --attn_mode full
-  --mlp_mode up
+  --mlp_mode down
   --seed "${KEY_SEED}"
 )
 "${key_cmd[@]}"
 
-# Enforce up-only keys: no attention swaps.
+# Enforce down-only keys: no attention swaps.
 python3 - "${KEY_PATH}" <<'PY'
 import json
 import sys
@@ -45,17 +45,17 @@ with open(path, "r", encoding="utf-8") as f:
 
 attn_heads = key.get("attn_heads", [])
 attn_out_heads = key.get("attn_out_heads", [])
-mlp_up_cols = key.get("mlp_up_cols", [])
+mlp_down_cols = key.get("mlp_down_cols", [])
 
 if attn_heads or attn_out_heads:
     raise SystemExit(
         f"Expected no attention swaps in {path}; "
         f"found attn_heads={len(attn_heads)}, attn_out_heads={len(attn_out_heads)}"
     )
-if not mlp_up_cols:
-    raise SystemExit(f"Expected non-empty mlp_up_cols in {path}")
+if not mlp_down_cols:
+    raise SystemExit(f"Expected non-empty mlp_down_cols in {path}")
 
-print(f"Validated up-only key: {path} (mlp_up_swaps={len(mlp_up_cols)})")
+print(f"Validated down-only key: {path} (mlp_down_swaps={len(mlp_down_cols)})")
 PY
 
 train_cmd=(
@@ -64,7 +64,7 @@ train_cmd=(
   --nproc_per_node=8
   -m tiered.train.pretrain.tiered_pretrain
   --data_path /work/scratch/data/datasets/wiki_bio/retain
-  --output_dir /work/scratch/checkpoints/wiki/tiered_pretrain_64m_up_total10pct_run${RUN_ID}
+  --output_dir /work/scratch/checkpoints/wiki/tiered_pretrain_64m_down_total20pct_run${RUN_ID}
   --key_path "${KEY_PATH}"
   --hidden_size 512
   --intermediate_size 2048
@@ -82,7 +82,7 @@ train_cmd=(
   --eval_steps 60
   --save_interval 1000
   --wandb_project 64m-pretrain
-  --run_name up_total10pct_run${RUN_ID}
+  --run_name down_total20pct_run${RUN_ID}
 )
 
-"${train_cmd[@]}"   2>&1 | tee "logs/up_total10pct_run${RUN_ID}_$(date +%Y%m%d_%H%M%S).log"
+"${train_cmd[@]}"   2>&1 | tee "logs/down_total20pct_run${RUN_ID}_$(date +%Y%m%d_%H%M%S).log"

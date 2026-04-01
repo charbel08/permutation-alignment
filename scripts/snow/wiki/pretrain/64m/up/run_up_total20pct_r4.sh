@@ -10,14 +10,14 @@ mkdir -p logs configs/keys/64m/up/generated
 
 RUN_ID=4
 KEY_SEED=643004
-KEY_PATH="configs/keys/64m/up/generated/key_up_total10pct_run${RUN_ID}.json"
+KEY_PATH="configs/keys/64m/up/generated/key_up_total20pct_run${RUN_ID}.json"
 
 # 64M config (tied embeddings, no LM-head double count):
 # hidden_size=512, num_heads=32, num_layers=12, intermediate_size=2048
 # total params = 64,067,072
-# target 10% of TOTAL weights mapped to generate_key target_pct over
+# target 20% of TOTAL weights mapped to generate_key target_pct over
 # this generator's swappable subset (attn full + mlp_up, attn_ratio=0)
-# target_pct = 0.25433130081300814
+# target_pct = 0.5086626016260163
 key_cmd=(
   python3 scripts/keys/generate_key.py
   --output "${KEY_PATH}"
@@ -26,7 +26,7 @@ key_cmd=(
   --hidden_size 512
   --mlp_dim 2048
   --context_size 1024
-  --target_pct 0.25433130081300814
+  --target_pct 0.5086626016260163
   --attn_ratio 0.0
   --attn_mode full
   --mlp_mode up
@@ -64,7 +64,7 @@ train_cmd=(
   --nproc_per_node=8
   -m tiered.train.pretrain.tiered_pretrain
   --data_path /work/scratch/data/datasets/wiki_bio/retain
-  --output_dir /work/scratch/checkpoints/wiki/tiered_pretrain_64m_up_total10pct_run${RUN_ID}
+  --output_dir /work/scratch/checkpoints/wiki/tiered_pretrain_64m_up_total20pct_run${RUN_ID}
   --key_path "${KEY_PATH}"
   --hidden_size 512
   --intermediate_size 2048
@@ -82,7 +82,7 @@ train_cmd=(
   --eval_steps 60
   --save_interval 1000
   --wandb_project 64m-pretrain
-  --run_name up_total10pct_run${RUN_ID}
+  --run_name up_total20pct_run${RUN_ID}
 )
 
-"${train_cmd[@]}"   2>&1 | tee "logs/up_total10pct_run${RUN_ID}_$(date +%Y%m%d_%H%M%S).log"
+"${train_cmd[@]}"   2>&1 | tee "logs/up_total20pct_run${RUN_ID}_$(date +%Y%m%d_%H%M%S).log"
