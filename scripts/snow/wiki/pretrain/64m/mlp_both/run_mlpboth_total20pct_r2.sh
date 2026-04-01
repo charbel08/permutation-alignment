@@ -87,7 +87,7 @@ train_cmd=(
   --max_steps 35696
   --warmup_steps 500
   --log_interval 1
-  --eval_interval 500
+  --eval_interval 250
   --eval_steps 60
   --save_interval 10000
   --wandb_project 64m-pretrain
