@@ -7,13 +7,20 @@ shuffled pool of available slots up front, then drawing each key's swaps from
 its dedicated partition.
 
 IMPORTANT:
-    target_pct is now interpreted as a percentage of the SWAPPABLE subset,
-    not of the full model size.
+    - --target_pct is interpreted as a fraction of the SWAPPABLE subset.
+    - --target_total_pct is interpreted as a fraction of FULL model params and
+      is converted internally to swappable-space using the exact tied/untied
+      parameter count convention used by this script.
 
 Single key (backward-compatible):
     python generate_key.py --output key.json \
         --num_layers 8 --num_heads 8 --hidden_size 512 --mlp_dim 2048 \
         --target_pct 0.20 --attn_ratio 0.25
+
+Single key by TOTAL model percentage:
+    python generate_key.py --output key.json \
+        --num_layers 8 --num_heads 8 --hidden_size 512 --mlp_dim 2048 \
+        --target_total_pct 0.10 --attn_ratio 0.25
 
 Multiple non-overlapping keys:
     python generate_key.py --output keys/key.json --num_keys 4 \
@@ -74,27 +81,74 @@ def count_total_params(
     max_positions: int = 1024,
     untie_weights: bool = False,
 ):
-    """Count ALL model parameters (GPT-Neo architecture)."""
+    """Count ALL model parameters for GPTNeoForCausalLMTiered.
+
+    This matches model construction in src/tiered/train/utils.py + model/gpt.py:
+      - tied mode: lm_head.weight is tied to wte.weight (count once)
+      - untied mode: lm_head.weight is separate (count additionally)
+      - lm_head.bias is always present and always counted
+    """
     # Embeddings
     wte = vocab_size * hidden_size
     wpe = max_positions * hidden_size
 
     # Per layer
-    # Note: this matches the repo's approximate accounting convention.
+    # Attention: q/k/v/out weights + out bias
     attn_params = 4 * hidden_size * hidden_size + hidden_size
+    # MLP: c_fc (weight+bias) + c_proj (weight+bias)
     mlp_params = (hidden_size * mlp_dim + mlp_dim) + (mlp_dim * hidden_size + hidden_size)
+    # ln_1 + ln_2, each with weight+bias
     ln_params = 2 * (hidden_size + hidden_size)
     layer_params = attn_params + mlp_params + ln_params
 
     # Final layer norm
     ln_f = hidden_size + hidden_size
 
-    # Untied LM head weight only (kept as-is for backward compatibility with
-    # the old script's accounting convention)
-    lm_head = vocab_size * hidden_size if untie_weights else 0
+    # LM head:
+    # - weight counted only when untied
+    # - bias always counted
+    lm_head_weight = vocab_size * hidden_size if untie_weights else 0
+    lm_head_bias = vocab_size
 
-    total = wte + wpe + num_layers * layer_params + ln_f + lm_head
+    total = wte + wpe + num_layers * layer_params + ln_f + lm_head_weight + lm_head_bias
     return total
+
+
+def convert_total_pct_to_swappable_pct(
+    target_total_pct: float,
+    num_layers: int,
+    hidden_size: int,
+    num_heads: int,
+    mlp_dim: int,
+    mlp_mode: str = "both",
+    attn_mode: str = "full",
+    untie_weights: bool = False,
+    context_size: int = 1024,
+) -> float:
+    """Convert a total-model target percentage to swappable-subset percentage."""
+    if target_total_pct < 0.0:
+        raise ValueError(f"target_total_pct must be >= 0, got {target_total_pct}")
+
+    total_params = count_total_params(
+        num_layers=num_layers,
+        hidden_size=hidden_size,
+        num_heads=num_heads,
+        mlp_dim=mlp_dim,
+        max_positions=context_size,
+        untie_weights=untie_weights,
+    )
+    total_swappable = count_total_swappable_params(
+        num_layers=num_layers,
+        hidden_size=hidden_size,
+        num_heads=num_heads,
+        mlp_dim=mlp_dim,
+        mlp_mode=mlp_mode,
+        attn_mode=attn_mode,
+    )["total"]
+    if total_swappable <= 0:
+        raise ValueError("total_swappable must be > 0")
+
+    return target_total_pct * total_params / total_swappable
 
 
 def count_total_swappable_params(
@@ -231,6 +285,13 @@ def generate_keys(
 
     target_pct is interpreted as the fraction of the SWAPPABLE subset per key.
     """
+    if target_pct < 0.0:
+        raise ValueError(f"target_pct must be >= 0, got {target_pct}")
+    if not (0.0 <= attn_ratio <= 1.0):
+        raise ValueError(f"attn_ratio must be in [0, 1], got {attn_ratio}")
+    if num_keys < 1:
+        raise ValueError(f"num_keys must be >= 1, got {num_keys}")
+
     random.seed(seed)
 
     weights_per_head, weights_per_mlp_col = calculate_weights_per_swap(
@@ -504,11 +565,19 @@ def main():
     parser.add_argument("--context_size", type=int, default=1024)
 
     # Key configuration
-    parser.add_argument(
+    target_group = parser.add_mutually_exclusive_group()
+    target_group.add_argument(
         "--target_pct",
         type=float,
-        default=0.20,
-        help="Target percentage of SWAPPABLE weights to key PER KEY (0-1)",
+        default=None,
+        help="Target fraction of SWAPPABLE weights to key per key (0-1)",
+    )
+    target_group.add_argument(
+        "--target_total_pct",
+        type=float,
+        default=None,
+        help="Target fraction of TOTAL model weights to key per key (0-1). "
+             "Converted internally to swappable-space.",
     )
     parser.add_argument(
         "--attn_ratio",
@@ -543,13 +612,54 @@ def main():
     if args.output is None:
         parser.error("--output is required when generating keys")
 
+    # Backward-compatible default: if neither flag is provided, use 0.20 of
+    # swappable subset.
+    if args.target_pct is None and args.target_total_pct is None:
+        target_pct = 0.20
+    elif args.target_pct is not None:
+        target_pct = args.target_pct
+    else:
+        target_pct = convert_total_pct_to_swappable_pct(
+            target_total_pct=args.target_total_pct,
+            num_layers=args.num_layers,
+            hidden_size=args.hidden_size,
+            num_heads=args.num_heads,
+            mlp_dim=args.mlp_dim,
+            mlp_mode=args.mlp_mode,
+            attn_mode=args.attn_mode,
+            untie_weights=args.untie_weights,
+            context_size=args.context_size,
+        )
+        total_params = count_total_params(
+            num_layers=args.num_layers,
+            hidden_size=args.hidden_size,
+            num_heads=args.num_heads,
+            mlp_dim=args.mlp_dim,
+            max_positions=args.context_size,
+            untie_weights=args.untie_weights,
+        )
+        swappable = count_total_swappable_params(
+            num_layers=args.num_layers,
+            hidden_size=args.hidden_size,
+            num_heads=args.num_heads,
+            mlp_dim=args.mlp_dim,
+            mlp_mode=args.mlp_mode,
+            attn_mode=args.attn_mode,
+        )["total"]
+        print(
+            "Converted target_total_pct -> target_pct: "
+            f"{args.target_total_pct:.6f} of total "
+            f"({total_params:,} params) => {target_pct:.6f} of swappable "
+            f"({swappable:,} params)"
+        )
+
     keys = generate_keys(
         num_keys=args.num_keys,
         num_layers=args.num_layers,
         num_heads=args.num_heads,
         hidden_size=args.hidden_size,
         mlp_dim=args.mlp_dim,
-        target_pct=args.target_pct,
+        target_pct=target_pct,
         attn_ratio=args.attn_ratio,
         attn_mode=args.attn_mode,
         mlp_mode=args.mlp_mode,

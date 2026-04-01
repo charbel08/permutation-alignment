@@ -12,12 +12,12 @@ RUN_ID=2
 KEY_SEED=641002
 KEY_PATH="configs/keys/64m/down/generated/key_down_total20pct_run${RUN_ID}.json"
 
-# 64M config (tied embeddings, no LM-head double count):
+# 64M config (tied embeddings, no LM-head weight double count):
 # hidden_size=512, num_heads=32, num_layers=12, intermediate_size=2048
-# total params = 64,067,072
-# target 20% of TOTAL weights mapped to generate_key target_pct over
+# total params = 64,117,329 (includes lm_head.bias)
+# target 20% of TOTAL weights mapped to generate_key target_total_pct over
 # this generator's swappable subset (attn full + mlp_down, attn_ratio=0)
-# target_pct = 0.5091593424479167
+# target_total_pct = 0.20
 key_cmd=(
   python3 scripts/keys/generate_key.py
   --output "${KEY_PATH}"
@@ -26,7 +26,7 @@ key_cmd=(
   --hidden_size 512
   --mlp_dim 2048
   --context_size 1024
-  --target_pct 0.5091593424479167
+  --target_total_pct 0.20
   --attn_ratio 0.0
   --attn_mode full
   --mlp_mode down

@@ -15,7 +15,7 @@ KEY_PATH="configs/keys/64m/attn_full_up/generated/key_attnfull_up_total20pct_run
 # 64M config (tied embeddings):
 # hidden_size=512, num_heads=32, num_layers=12, intermediate_size=2048
 # Mix target: 25% full-attention + 75% MLP-up
-# target_pct=0.5086626016260163 maps to approx 20% of total model parameters.
+# target_total_pct=0.20 (20% of total model parameters).
 key_cmd=(
   python3 scripts/keys/generate_key.py
   --output "${KEY_PATH}"
@@ -24,7 +24,7 @@ key_cmd=(
   --hidden_size 512
   --mlp_dim 2048
   --context_size 1024
-  --target_pct 0.5086626016260163
+  --target_total_pct 0.20
   --attn_ratio 0.25
   --attn_mode full
   --mlp_mode up
