@@ -1,9 +1,7 @@
-source /work/.bashrc
 
 export HF_HOME=/work/scratch/hf
 export TRANSFORMERS_CACHE=/work/scratch/hf
 
-cd /work/permutation-alignment
 
 torchrun --standalone --nproc_per_node=8 -m tiered.train.pretrain.tiered_pretrain \
     --data_path /work/scratch/data/datasets/wiki_bio/retain \

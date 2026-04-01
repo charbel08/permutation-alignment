@@ -1,14 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-source /work/.bashrc
-module load anaconda/3 cuda/12.6.0/cudnn openmpi
-conda activate ta
 
 export HF_HOME=/work/scratch/hf
 export TRANSFORMERS_CACHE=/work/scratch/hf
 
-cd /work/permutation-alignment
 
 mkdir -p logs configs/keys/64m/up/generated
 
