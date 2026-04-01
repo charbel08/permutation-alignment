@@ -17,7 +17,7 @@ Validation tracks:
 Usage:
     PYTHONPATH=./src python src/tiered/train/finetune/superglue_finetune.py \\
         --checkpoint /path/to/pretrained \\
-        --key_path configs/keys/key_64m_20pct_mixed.json \\
+        --key_path configs/keys/64m/both/key_20pct_mixed.json \\
         --superglue_data /path/to/superglue \\
         --public_data /path/to/wiki_bio/retain \\
         --output_dir /path/to/output

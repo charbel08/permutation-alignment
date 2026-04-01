@@ -88,6 +88,12 @@ def count_swappable_parameters(model, mask_plan) -> dict:
         # out selected columns
         total_attn += attn.out_proj.weight.shape[0] * n_idx
 
+    # Out-projection-only attention swappable params
+    for layer_idx, idx in mask_plan.keyed_attn_out_indices.items():
+        attn = _get_attention_module(model, layer_idx)
+        n_idx = int(idx.numel())
+        total_attn += attn.out_proj.weight.shape[0] * n_idx
+
     # MLP swappable params
     for layer_idx, idx in mask_plan.keyed_mlp_indices.items():
         mlp = _get_mlp_module(model, layer_idx)
@@ -265,11 +271,6 @@ def parse_args():
         help="MLP hidden dimension (defaults to 4x hidden_size)",
     )
     parser.add_argument(
-        "--untie_weights",
-        action="store_true",
-        help="Disable weight tying between embeddings and LM head",
-    )
-    parser.add_argument(
         "--checkpoint",
         type=str,
         default=None,
@@ -434,7 +435,7 @@ def train(args):
             num_layers=args.num_layers,
             context_size=args.context_size,
             intermediate_size=args.intermediate_size,
-            tie_weights=not args.untie_weights,
+            tie_weights=True,
             do_print=is_main,
         )
 
@@ -452,8 +453,13 @@ def train(args):
     mask_plan = build_mask_plan(model, key, device)
     if is_main:
         n_attn_layers = len(mask_plan.keyed_attn_indices)
+        n_attn_out_layers = len(mask_plan.keyed_attn_out_indices)
         n_mlp_layers = len(mask_plan.keyed_mlp_indices)
-        print(f"Built mask plan: {n_attn_layers} attn layers, {n_mlp_layers} MLP layers with keyed indices")
+        print(
+            "Built mask plan: "
+            f"{n_attn_layers} attn layers, {n_attn_out_layers} out-only attn layers, "
+            f"{n_mlp_layers} MLP layers with keyed indices"
+        )
 
     # Keep a reference to the original model for permutation/masking ops.
     raw_model = model
@@ -620,6 +626,7 @@ def train(args):
     max_swappable_params = count_max_swappable_parameters(raw_model)
 
     swappable_pct_of_max = 100.0 * swappable_params["total"] / max_swappable_params["total"]
+    swappable_pct_of_total = 100.0 * swappable_params["total"] / num_params
     max_swappable_pct_of_total = 100.0 * max_swappable_params["total"] / num_params
 
     inter_size = args.intermediate_size or (args.hidden_size * 4)
@@ -647,7 +654,11 @@ def train(args):
         print(f"\n── Compute metrics ──")
         print(f"  Total parameters:           {num_params:,}")
         print(f"  Trainable parameters:       {num_trainable:,}")
-        print(f"  Current swappable params:   {swappable_params['total']:,} ({swappable_pct_of_max:.2f}% of max swappable)")
+        print(
+            "  Current swapped params:     "
+            f"{swappable_params['total']:,} "
+            f"({swappable_pct_of_max:.2f}% of swappable, {swappable_pct_of_total:.2f}% of total params)"
+        )
         print(f"    - attention:              {swappable_params['attention']:,}")
         print(f"    - mlp:                    {swappable_params['mlp']:,}")
         print(f"  Max swappable params:       {max_swappable_params['total']:,} ({max_swappable_pct_of_total:.2f}% of total params)")
@@ -690,6 +701,7 @@ def train(args):
                 "compute/swappable_attention_params": swappable_params["attention"],
                 "compute/swappable_mlp_params": swappable_params["mlp"],
                 "compute/swappable_pct_of_max": swappable_pct_of_max,
+                "compute/swappable_pct_of_total": swappable_pct_of_total,
                 "compute/max_swappable_params": max_swappable_params["total"],
                 "compute/max_swappable_attention_params": max_swappable_params["attention"],
                 "compute/max_swappable_mlp_params": max_swappable_params["mlp"],
@@ -960,7 +972,11 @@ def train(args):
         print(f"{'=' * 60}")
         print(f"  Steps:                    {global_step:,}")
         print(f"  Total parameters (N):     {num_params:,}")
-        print(f"  Current swappable params: {swappable_params['total']:,} ({swappable_pct_of_max:.2f}% of max swappable)")
+        print(
+            "  Current swapped params:   "
+            f"{swappable_params['total']:,} "
+            f"({swappable_pct_of_max:.2f}% of swappable, {swappable_pct_of_total:.2f}% of total params)"
+        )
         print(f"    - attention:            {swappable_params['attention']:,}")
         print(f"    - mlp:                  {swappable_params['mlp']:,}")
         print(f"  Max swappable params:     {max_swappable_params['total']:,} ({max_swappable_pct_of_total:.2f}% of total params)")
@@ -994,6 +1010,7 @@ def train(args):
                 "final/swappable_attention_params": swappable_params["attention"],
                 "final/swappable_mlp_params": swappable_params["mlp"],
                 "final/swappable_pct_of_max": swappable_pct_of_max,
+                "final/swappable_pct_of_total": swappable_pct_of_total,
                 "final/max_swappable_params": max_swappable_params["total"],
                 "final/max_swappable_attention_params": max_swappable_params["attention"],
                 "final/max_swappable_mlp_params": max_swappable_params["mlp"],

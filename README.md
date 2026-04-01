@@ -64,10 +64,16 @@ PYTHONPATH=./src pytest ./src/tiered/tests -sv
 ```
 ├── configs/
 │   └── keys/                          # Pre-generated permutation keys
-│       ├── key_64m_20pct_mixed.json   # 64M model, 20% coverage
-│       ├── key_530m_14pct.json        # 530M model, 14% coverage
-│       ├── key_530m_7pct_{1,2,3}.json # 530M model, 7% keys (for multi-tier)
-│       └── key_1b_10pct_mixed.json    # 1B model, 10% coverage
+│       ├── 64m/both/                  # 64M model, both-projection swaps
+│       │   └── key_20pct_mixed.json
+│       ├── 150m/both/
+│       │   ├── key_14pct.json
+│       │   └── key_7pct_{1,2,3}.json
+│       ├── 530m/both/
+│       │   ├── key_14pct.json
+│       │   └── key_7pct_{1,2,3}.json
+│       └── 1b/both/
+│           └── key_10pct_mixed.json
 ├── scripts/
 │   ├── keys/
 │   │   └── generate_key.py            # Permutation key generator
@@ -166,10 +172,12 @@ This generates a key covering ~20% of model parameters, split 25% attention / 75
 
 | Key file | Model | Coverage |
 |----------|-------|----------|
-| `key_64m_20pct_mixed.json` | 64M | 20% |
-| `key_530m_14pct.json` | 530M | 14% |
-| `key_530m_7pct_{1,2,3}.json` | 530M | 7% each (for multi-tier) |
-| `key_1b_10pct_mixed.json` | 1B | 10% |
+| `64m/key_20pct_mixed.json` | 64M | 20% |
+| `150m/key_14pct.json` | 150M | 14% |
+| `150m/key_7pct_{1,2,3}.json` | 150M | 7% each (for multi-tier) |
+| `530m/key_14pct.json` | 530M | 14% |
+| `530m/key_7pct_{1,2,3}.json` | 530M | 7% each (for multi-tier) |
+| `1b/key_10pct_mixed.json` | 1B | 10% |
 
 ## Usage
 
@@ -180,7 +188,7 @@ from tiered.model import GPTNeoForCausalLMTiered
 from tiered.permutation import load_key
 
 model = GPTNeoForCausalLMTiered.from_pretrained("path/to/checkpoint")
-key = load_key("configs/keys/key_64m_20pct_mixed.json")
+key = load_key("configs/keys/64m/both/key_20pct_mixed.json")
 
 # Public configuration (C1)
 outputs_c1 = model.generate(input_ids)
@@ -196,7 +204,7 @@ Or use the inference script directly:
 ```bash
 PYTHONPATH=./src python src/tiered/train/inference.py \
     --checkpoint /path/to/checkpoint \
-    --key_path configs/keys/key_64m_20pct_mixed.json \
+    --key_path configs/keys/64m/both/key_20pct_mixed.json \
     --prompt "Once upon a time"
 ```
 
@@ -207,7 +215,7 @@ Train a model with asymmetric gradient updates on C1 and C2:
 ```bash
 torchrun --standalone --nproc_per_node=3 -m tiered.train.pretrain.tiered_pretrain \
     --data_path /path/to/tokenized/data \
-    --key_path configs/keys/key_64m_20pct_mixed.json \
+    --key_path configs/keys/64m/both/key_20pct_mixed.json \
     --output_dir /path/to/output \
     --hidden_size 512 --num_heads 32 --num_layers 12 \
     --context_size 1024 --batch_size 16 \
@@ -264,7 +272,7 @@ Finetune the keyed tier on private data while preserving public behavior:
 ```bash
 PYTHONPATH=./src python src/tiered/train/finetune/private_finetune.py \
     --checkpoint /path/to/tiered/checkpoint \
-    --key_path configs/keys/key_64m_20pct_mixed.json \
+    --key_path configs/keys/64m/both/key_20pct_mixed.json \
     --private_data /path/to/forget/data \
     --public_data /path/to/retain/data \
     --output_dir /path/to/output \
@@ -284,7 +292,7 @@ performance plus FLOPs comparisons against a 2-pass tiered reference.
 ```bash
 torchrun --standalone --nproc_per_node=8 -m tiered.train.finetune.lora_private_finetune \
     --checkpoint /path/to/base/checkpoint \
-    --key_path configs/keys/key_150m_14pct.json \
+    --key_path configs/keys/150m/both/key_14pct.json \
     --private_data /path/to/private/data \
     --public_data /path/to/retain/data \
     --output_dir /path/to/output \
@@ -304,7 +312,7 @@ Finetune C2 on SuperGLUE NLU tasks with answer-only label masking:
 ```bash
 PYTHONPATH=./src python src/tiered/train/finetune/superglue_finetune.py \
     --checkpoint /path/to/pretrained \
-    --key_path configs/keys/key_64m_20pct_mixed.json \
+    --key_path configs/keys/64m/both/key_20pct_mixed.json \
     --superglue_data /path/to/superglue \
     --public_data /path/to/wiki_bio/retain \
     --output_dir /path/to/output \
@@ -388,14 +396,14 @@ Measures how well the model memorizes synthetic bio attribute values (not filler
 PYTHONPATH=./src python scripts/eval/eval_memorization.py \
     --checkpoint /path/to/checkpoint \
     --bio_metadata /path/to/bios_metadata.json \
-    --key_path configs/keys/key_64m_20pct_mixed.json \
+    --key_path configs/keys/64m/both/key_20pct_mixed.json \
     --output_dir /path/to/output
 
 # Sweep across all checkpoints
 PYTHONPATH=./src python scripts/eval/eval_memorization.py \
     --checkpoint /path/to/ckpt_dir \
     --bio_metadata /path/to/bios_metadata.json \
-    --key_path configs/keys/key_64m_20pct_mixed.json \
+    --key_path configs/keys/64m/both/key_20pct_mixed.json \
     --output_dir /path/to/output --sweep
 ```
 

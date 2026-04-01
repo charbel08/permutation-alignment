@@ -93,6 +93,10 @@ def count_swappable_parameters(model, mask_plan) -> dict:
         total_attn += n_idx * attn.k_proj.weight.shape[1]
         total_attn += n_idx * attn.v_proj.weight.shape[1]
         total_attn += attn.out_proj.weight.shape[0] * n_idx
+    for layer_idx, idx in mask_plan.keyed_attn_out_indices.items():
+        attn = _get_attention_module(model, layer_idx)
+        n_idx = int(idx.numel())
+        total_attn += attn.out_proj.weight.shape[0] * n_idx
     for layer_idx, idx in mask_plan.keyed_mlp_indices.items():
         mlp = _get_mlp_module(model, layer_idx)
         n_idx = int(idx.numel())

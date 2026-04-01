@@ -61,6 +61,13 @@ def scale_public_gradients(model, key: "PermutationKey", scale: float = 0.5,
         g = attn.out_proj.weight.grad
         if g is not None:
             g[:, idx].mul_(inverse_scale)
+
+    # Pass 2: Undo scaling on keyed out-projection-only attention gradients
+    for layer_idx, idx in plan.keyed_attn_out_indices.items():
+        attn = _get_attention_module(model, layer_idx)
+        g = attn.out_proj.weight.grad
+        if g is not None:
+            g[:, idx].mul_(inverse_scale)
     
     # Pass 2: Undo scaling on keyed MLP column gradients
     for layer_idx, idx in plan.keyed_mlp_indices.items():
@@ -69,5 +76,19 @@ def scale_public_gradients(model, key: "PermutationKey", scale: float = 0.5,
             mlp.c_fc.weight.grad[idx].mul_(inverse_scale)
         if mlp.c_fc.bias is not None and mlp.c_fc.bias.grad is not None:
             mlp.c_fc.bias.grad[idx].mul_(inverse_scale)
+        if mlp.c_proj.weight.grad is not None:
+            mlp.c_proj.weight.grad[:, idx].mul_(inverse_scale)
+    
+    # Pass 2: Undo scaling on keyed MLP up-projection-only gradients (c_fc only)
+    for layer_idx, idx in plan.keyed_mlp_up_indices.items():
+        mlp = _get_mlp_module(model, layer_idx)
+        if mlp.c_fc.weight.grad is not None:
+            mlp.c_fc.weight.grad[idx].mul_(inverse_scale)
+        if mlp.c_fc.bias is not None and mlp.c_fc.bias.grad is not None:
+            mlp.c_fc.bias.grad[idx].mul_(inverse_scale)
+    
+    # Pass 2: Undo scaling on keyed MLP down-projection-only gradients (c_proj only)
+    for layer_idx, idx in plan.keyed_mlp_down_indices.items():
+        mlp = _get_mlp_module(model, layer_idx)
         if mlp.c_proj.weight.grad is not None:
             mlp.c_proj.weight.grad[:, idx].mul_(inverse_scale)

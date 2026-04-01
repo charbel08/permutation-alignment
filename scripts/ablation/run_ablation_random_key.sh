@@ -13,7 +13,7 @@ export PYTHONPATH=./src:./
 
 # Paths
 CHECKPOINT="$HOME/scratch/checkpoints/tiered_pretrain_64m/checkpoint-35000"
-KEY_PATH="configs/keys/key_64m_20pct_mixed.json"
+KEY_PATH="configs/keys/64m/both/key_20pct_mixed.json"
 FINETUNE_DIR="$HOME/scratch/checkpoints/ablation_random_key_64m"
 SPANISH_DATA="$HOME/scratch/data/datasets/tinystories_split/es"
 RETAIN_DATA="$HOME/scratch/data/datasets/wiki_bio/retain"

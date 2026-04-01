@@ -23,7 +23,7 @@ PUBLIC_DATA=${PUBLIC_DATA:-/work/scratch/data/datasets/fineweb/retain}
 PRIVATE_BASE=${PRIVATE_BASE:-/work/scratch/data/datasets/fineweb2_private}
 OUTPUT_ROOT=${OUTPUT_ROOT:-/work/scratch/checkpoints/fineweb/finetune_150m_fineweb2_3langs_multi}
 
-ALL_KEYS=${ALL_KEYS:-"configs/keys/key_150m_7pct_1.json configs/keys/key_150m_7pct_2.json configs/keys/key_150m_7pct_3.json"}
+ALL_KEYS=${ALL_KEYS:-"configs/keys/150m/both/key_7pct_1.json configs/keys/150m/both/key_7pct_2.json configs/keys/150m/both/key_7pct_3.json"}
 
 NGPUS=${NGPUS:-8}
 # private_finetune is memory-heavier than pretraining due to full-vocab KL tensors.
@@ -66,7 +66,7 @@ for idx in "${!LANGS[@]}"; do
     STAGE=$((idx + 1))
     LANG="${LANGS[$idx]}"
     KEY_ID="${KEY_IDS[$idx]}"
-    KEY_PATH="configs/keys/key_150m_7pct_${KEY_ID}.json"
+    KEY_PATH="configs/keys/150m/both/key_7pct_${KEY_ID}.json"
     PRIVATE_DATA="${PRIVATE_BASE}/${LANG}/retain"
     OUTPUT_DIR="${OUTPUT_ROOT}/stage${STAGE}_${LANG}_key${KEY_ID}"
     RUN_NAME="finetune_150m_fineweb2_stage${STAGE}_${LANG}_key${KEY_ID}"
