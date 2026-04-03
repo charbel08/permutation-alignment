@@ -23,6 +23,8 @@ if [[ ! -f "${KEY_PATH}" ]]; then
   exit 1
 fi
 
+# Pretraining already completed for this run; skip directly to finetuning rerun.
+: <<'SKIP_PRETRAIN'
 train_cmd=(
   torchrun
   --standalone
@@ -53,13 +55,14 @@ train_cmd=(
 )
 
 "${train_cmd[@]}" 2>&1 | tee "logs/${PRETRAIN_RUN_NAME}_$(date +%Y%m%d_%H%M%S).log"
+SKIP_PRETRAIN
 
 if [[ ! -d "${FINETUNE_CHECKPOINT}" ]]; then
   echo "Expected pretraining checkpoint not found: ${FINETUNE_CHECKPOINT}" >&2
   exit 1
 fi
 
-echo "Fine-tuning one epoch with 8 GPUs and per-GPU batch 12 (max_steps=1520)"
+echo "Fine-tuning only (pretraining skipped): 4 GPUs, per-GPU batch 12 (max_steps=3040)"
 
 finetune_cmd=(
   torchrun
@@ -71,16 +74,16 @@ finetune_cmd=(
   --private_data /work/scratch/data/datasets/wiki_bio/forget
   --public_data /work/scratch/data/datasets/wiki_bio/retain
   --output_dir "${FINETUNE_OUTPUT_DIR}"
-  --batch_size 24
+  --batch_size 12
   --learning_rate 1e-5
   --min_lr 1e-6
-  --max_steps 1520
+  --max_steps 3040
   --warmup_steps 100
   --kl_lambda 0.1
   --max_grad_norm 1.0
   --keyed_l2_lambda 0.01
-  --eval_interval 500
-  --eval_steps 25
+  --eval_interval 100
+  --eval_steps 60
   --log_interval 10
   --save_interval 1000
   --wandb_project 64m-c2k
