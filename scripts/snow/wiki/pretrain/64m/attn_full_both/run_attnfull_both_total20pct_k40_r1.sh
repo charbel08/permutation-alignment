@@ -9,7 +9,7 @@ mkdir -p logs
 RUN_ID=1
 NGPUS=8
 C2_EVERY_K=40
-KEY_PATH="configs/keys/64m/attn_full_both/generated/key_attnfull_both_total20pct_ksweep.json"
+KEY_PATH="/work/permutation-alignment/configs/keys/64m/attn_full_both/key_attnfull_both_total20pct_ksweep.json"
 
 PRETRAIN_OUTPUT_DIR="/work/scratch/checkpoints/wiki/tiered_pretrain_64m_attnfull_both_total20pct_k${C2_EVERY_K}_run${RUN_ID}"
 PRETRAIN_RUN_NAME="attnfull_both_total20pct_k${C2_EVERY_K}_run${RUN_ID}"
