@@ -7,7 +7,7 @@ export TRANSFORMERS_CACHE=/work/scratch/hf
 mkdir -p logs
 
 RUN_ID=1
-NGPUS=8
+NGPUS=4
 C2_EVERY_K=75
 KEY_PATH="/work/permutation-alignment/configs/keys/64m/attn_full_both/key_attnfull_both_total20pct_ksweep.json"
 
@@ -36,7 +36,7 @@ train_cmd=(
   --num_heads 32
   --num_layers 12
   --context_size 1024
-  --batch_size 12
+  --batch_size 24
   --grad_accum_steps 1
   --learning_rate 6e-4
   --min_lr 6e-5
@@ -71,7 +71,7 @@ finetune_cmd=(
   --private_data /work/scratch/data/datasets/wiki_bio/forget
   --public_data /work/scratch/data/datasets/wiki_bio/retain
   --output_dir "${FINETUNE_OUTPUT_DIR}"
-  --batch_size 12
+  --batch_size 24
   --learning_rate 1e-5
   --min_lr 1e-6
   --max_steps 1520
