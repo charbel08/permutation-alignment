@@ -80,7 +80,7 @@ finetune_cmd=(
   --max_grad_norm 1.0
   --keyed_l2_lambda 0.01
   --eval_interval 500
-  --eval_steps 50
+  --eval_steps 25
   --log_interval 10
   --save_interval 1000
   --wandb_project 64m-c2k
