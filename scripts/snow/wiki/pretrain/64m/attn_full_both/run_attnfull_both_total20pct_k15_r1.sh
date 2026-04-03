@@ -1,17 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-
 export HF_HOME=/work/scratch/hf
 export TRANSFORMERS_CACHE=/work/scratch/hf
-
 
 mkdir -p logs configs/keys/64m/attn_full_both/generated
 
 RUN_ID=1
+NGPUS=8
 C2_EVERY_K=15
 KEY_SEED=646001
 KEY_PATH="configs/keys/64m/attn_full_both/generated/key_attnfull_both_total20pct_ksweep_run${RUN_ID}.json"
+
+PRETRAIN_OUTPUT_DIR="/work/scratch/checkpoints/wiki/tiered_pretrain_64m_attnfull_both_total20pct_k${C2_EVERY_K}_run${RUN_ID}"
+PRETRAIN_RUN_NAME="attnfull_both_total20pct_k${C2_EVERY_K}_run${RUN_ID}"
+
+FINETUNE_CHECKPOINT="${PRETRAIN_OUTPUT_DIR}/final-checkpoint"
+FINETUNE_OUTPUT_DIR="/work/scratch/checkpoints/wiki/private_finetune_64m_attnfull_both_total20pct_k${C2_EVERY_K}_run${RUN_ID}"
+FINETUNE_RUN_NAME="private_finetune_64m_attnfull_both_total20pct_k${C2_EVERY_K}_run${RUN_ID}"
 
 # 64M config (tied embeddings):
 # hidden_size=512, num_heads=32, num_layers=12, intermediate_size=2048
@@ -75,10 +81,10 @@ PYV
 train_cmd=(
   torchrun
   --standalone
-  --nproc_per_node=8
+  --nproc_per_node="${NGPUS}"
   -m tiered.train.pretrain.tiered_pretrain_c2k
   --data_path /work/scratch/data/datasets/wiki_bio/retain
-  --output_dir /work/scratch/checkpoints/wiki/tiered_pretrain_64m_attnfull_both_total20pct_k${C2_EVERY_K}_run${RUN_ID}
+  --output_dir "${PRETRAIN_OUTPUT_DIR}"
   --key_path "${KEY_PATH}"
   --hidden_size 512
   --intermediate_size 2048
@@ -97,8 +103,43 @@ train_cmd=(
   --eval_interval 250
   --eval_steps 60
   --save_interval 1000
-  --wandb_project 64m-pretrain
-  --run_name attnfull_both_total20pct_k${C2_EVERY_K}_run${RUN_ID}
+  --wandb_project 64m-c2k
+  --run_name "${PRETRAIN_RUN_NAME}"
 )
 
-"${train_cmd[@]}" 2>&1 | tee "logs/attnfull_both_total20pct_k${C2_EVERY_K}_run${RUN_ID}_$(date +%Y%m%d_%H%M%S).log"
+"${train_cmd[@]}" 2>&1 | tee "logs/${PRETRAIN_RUN_NAME}_$(date +%Y%m%d_%H%M%S).log"
+
+if [[ ! -d "${FINETUNE_CHECKPOINT}" ]]; then
+  echo "Expected pretraining checkpoint not found: ${FINETUNE_CHECKPOINT}" >&2
+  exit 1
+fi
+
+echo "Fine-tuning one epoch with 8 GPUs and per-GPU batch 12 (max_steps=1520)"
+
+finetune_cmd=(
+  torchrun
+  --standalone
+  --nproc_per_node="${NGPUS}"
+  -m tiered.train.finetune.private_finetune
+  --checkpoint "${FINETUNE_CHECKPOINT}"
+  --key_path "${KEY_PATH}"
+  --private_data /work/scratch/data/datasets/wiki_bio/forget
+  --public_data /work/scratch/data/datasets/wiki_bio/retain
+  --output_dir "${FINETUNE_OUTPUT_DIR}"
+  --batch_size 12
+  --learning_rate 1e-5
+  --min_lr 1e-6
+  --max_steps 1520
+  --warmup_steps 100
+  --kl_lambda 0.1
+  --max_grad_norm 1.0
+  --keyed_l2_lambda 0.01
+  --eval_interval 500
+  --eval_steps 50
+  --log_interval 10
+  --save_interval 1000
+  --wandb_project 64m-c2k
+  --run_name "${FINETUNE_RUN_NAME}"
+)
+
+"${finetune_cmd[@]}" 2>&1 | tee "logs/${FINETUNE_RUN_NAME}_$(date +%Y%m%d_%H%M%S).log"
