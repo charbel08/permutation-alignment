@@ -33,6 +33,15 @@ class AttnSwapOp:
 
 
 @dataclass
+class AttnOutSwapOp:
+    """Pre-computed out-projection-only attention head swap."""
+    layer_a: int
+    layer_b: int
+    idx_a: torch.Tensor  # [head_dim] range for head(s) in layer_a
+    idx_b: torch.Tensor  # [head_dim] range for head(s) in layer_b
+
+
+@dataclass
 class MLPSwapOp:
     """Pre-computed batched MLP column swap between two layers."""
     layer_a: int
@@ -42,10 +51,31 @@ class MLPSwapOp:
 
 
 @dataclass
+class MLPUpSwapOp:
+    """Pre-computed batched MLP up-projection-only swap (c_fc rows + bias)."""
+    layer_a: int
+    layer_b: int
+    cols_a: torch.Tensor
+    cols_b: torch.Tensor
+
+
+@dataclass
+class MLPDownSwapOp:
+    """Pre-computed batched MLP down-projection-only swap (c_proj columns)."""
+    layer_a: int
+    layer_b: int
+    cols_a: torch.Tensor
+    cols_b: torch.Tensor
+
+
+@dataclass
 class SwapPlan:
     """Pre-compiled swap operations ready for fast execution."""
     attn_ops: List[AttnSwapOp] = field(default_factory=list)
+    attn_out_ops: List[AttnOutSwapOp] = field(default_factory=list)
     mlp_ops: List[MLPSwapOp] = field(default_factory=list)
+    mlp_up_ops: List[MLPUpSwapOp] = field(default_factory=list)
+    mlp_down_ops: List[MLPDownSwapOp] = field(default_factory=list)
     device: Optional[torch.device] = None
 
 
@@ -94,6 +124,34 @@ def build_swap_plan(model, key: "PermutationKey", device: torch.device) -> SwapP
             idx_a=torch.tensor(idx_a_list, dtype=torch.long, device=device),
             idx_b=torch.tensor(idx_b_list, dtype=torch.long, device=device),
         ))
+
+    # --- Batch out-projection-only attention head swaps by layer pair ---
+    attn_out_groups: Dict[Tuple[int, int], Tuple[List[int], List[int]]] = defaultdict(lambda: ([], []))
+    for swap in key.attn_out_heads:
+        (layer_a, head_a), (layer_b, head_b) = swap
+        pair = (layer_a, layer_b) if layer_a <= layer_b else (layer_b, layer_a)
+        if layer_a <= layer_b:
+            attn_out_groups[pair][0].append(head_a)
+            attn_out_groups[pair][1].append(head_b)
+        else:
+            attn_out_groups[pair][0].append(head_b)
+            attn_out_groups[pair][1].append(head_a)
+
+    for (layer_a, layer_b), (heads_a, heads_b) in attn_out_groups.items():
+        attn_mod = _get_attention_module(model, layer_a)
+        head_dim = attn_mod.head_dim
+        idx_a_list = []
+        idx_b_list = []
+        for ha, hb in zip(heads_a, heads_b):
+            idx_a_list.extend(range(ha * head_dim, (ha + 1) * head_dim))
+            idx_b_list.extend(range(hb * head_dim, (hb + 1) * head_dim))
+
+        plan.attn_out_ops.append(AttnOutSwapOp(
+            layer_a=layer_a,
+            layer_b=layer_b,
+            idx_a=torch.tensor(idx_a_list, dtype=torch.long, device=device),
+            idx_b=torch.tensor(idx_b_list, dtype=torch.long, device=device),
+        ))
     
     # --- Batch MLP column swaps by layer pair ---
     mlp_groups: Dict[Tuple[int, int], Tuple[List[int], List[int]]] = defaultdict(lambda: ([], []))
@@ -109,6 +167,46 @@ def build_swap_plan(model, key: "PermutationKey", device: torch.device) -> SwapP
     
     for (layer_a, layer_b), (cols_a, cols_b) in mlp_groups.items():
         plan.mlp_ops.append(MLPSwapOp(
+            layer_a=layer_a,
+            layer_b=layer_b,
+            cols_a=torch.tensor(cols_a, dtype=torch.long, device=device),
+            cols_b=torch.tensor(cols_b, dtype=torch.long, device=device),
+        ))
+    
+    # --- Batch MLP up-projection-only swaps by layer pair ---
+    mlp_up_groups: Dict[Tuple[int, int], Tuple[List[int], List[int]]] = defaultdict(lambda: ([], []))
+    for swap in key.mlp_up_cols:
+        (layer_a, col_a), (layer_b, col_b) = swap
+        pair = (layer_a, layer_b) if layer_a <= layer_b else (layer_b, layer_a)
+        if layer_a <= layer_b:
+            mlp_up_groups[pair][0].append(col_a)
+            mlp_up_groups[pair][1].append(col_b)
+        else:
+            mlp_up_groups[pair][0].append(col_b)
+            mlp_up_groups[pair][1].append(col_a)
+    
+    for (layer_a, layer_b), (cols_a, cols_b) in mlp_up_groups.items():
+        plan.mlp_up_ops.append(MLPUpSwapOp(
+            layer_a=layer_a,
+            layer_b=layer_b,
+            cols_a=torch.tensor(cols_a, dtype=torch.long, device=device),
+            cols_b=torch.tensor(cols_b, dtype=torch.long, device=device),
+        ))
+    
+    # --- Batch MLP down-projection-only swaps by layer pair ---
+    mlp_down_groups: Dict[Tuple[int, int], Tuple[List[int], List[int]]] = defaultdict(lambda: ([], []))
+    for swap in key.mlp_down_cols:
+        (layer_a, col_a), (layer_b, col_b) = swap
+        pair = (layer_a, layer_b) if layer_a <= layer_b else (layer_b, layer_a)
+        if layer_a <= layer_b:
+            mlp_down_groups[pair][0].append(col_a)
+            mlp_down_groups[pair][1].append(col_b)
+        else:
+            mlp_down_groups[pair][0].append(col_b)
+            mlp_down_groups[pair][1].append(col_a)
+    
+    for (layer_a, layer_b), (cols_a, cols_b) in mlp_down_groups.items():
+        plan.mlp_down_ops.append(MLPDownSwapOp(
             layer_a=layer_a,
             layer_b=layer_b,
             cols_a=torch.tensor(cols_a, dtype=torch.long, device=device),
@@ -168,6 +266,22 @@ def _apply_attn_swap(model, op: AttnSwapOp):
             w_b[:, op.idx_b] = tmp
 
 
+def _apply_attn_out_swap(model, op: AttnOutSwapOp):
+    """Execute a batched out-projection-only attention head swap."""
+    attn_a = _get_attention_module(model, op.layer_a)
+    attn_b = _get_attention_module(model, op.layer_b)
+
+    with torch.no_grad():
+        if op.layer_a == op.layer_b:
+            _swap_cols(attn_a.out_proj.weight, op.idx_a, op.idx_b)
+        else:
+            w_a = attn_a.out_proj.weight
+            w_b = attn_b.out_proj.weight
+            tmp = w_a[:, op.idx_a].clone()
+            w_a[:, op.idx_a] = w_b[:, op.idx_b]
+            w_b[:, op.idx_b] = tmp
+
+
 def _apply_mlp_swap(model, op: MLPSwapOp):
     """Execute a batched MLP column swap."""
     mlp_a = _get_mlp_module(model, op.layer_a)
@@ -202,6 +316,43 @@ def _apply_mlp_swap(model, op: MLPSwapOp):
             mlp_b.c_proj.weight[:, op.cols_b] = tmp
 
 
+def _apply_mlp_up_swap(model, op: MLPUpSwapOp):
+    """Execute a batched MLP up-projection-only swap (c_fc rows + bias)."""
+    mlp_a = _get_mlp_module(model, op.layer_a)
+    mlp_b = _get_mlp_module(model, op.layer_b)
+    
+    with torch.no_grad():
+        if op.layer_a == op.layer_b:
+            _swap_rows(mlp_a.c_fc.weight, op.cols_a, op.cols_b)
+            if mlp_a.c_fc.bias is not None:
+                tmp = mlp_a.c_fc.bias[op.cols_a].clone()
+                mlp_a.c_fc.bias[op.cols_a] = mlp_a.c_fc.bias[op.cols_b]
+                mlp_a.c_fc.bias[op.cols_b] = tmp
+        else:
+            tmp = mlp_a.c_fc.weight[op.cols_a].clone()
+            mlp_a.c_fc.weight[op.cols_a] = mlp_b.c_fc.weight[op.cols_b]
+            mlp_b.c_fc.weight[op.cols_b] = tmp
+            
+            if mlp_a.c_fc.bias is not None and mlp_b.c_fc.bias is not None:
+                tmp = mlp_a.c_fc.bias[op.cols_a].clone()
+                mlp_a.c_fc.bias[op.cols_a] = mlp_b.c_fc.bias[op.cols_b]
+                mlp_b.c_fc.bias[op.cols_b] = tmp
+
+
+def _apply_mlp_down_swap(model, op: MLPDownSwapOp):
+    """Execute a batched MLP down-projection-only swap (c_proj columns)."""
+    mlp_a = _get_mlp_module(model, op.layer_a)
+    mlp_b = _get_mlp_module(model, op.layer_b)
+    
+    with torch.no_grad():
+        if op.layer_a == op.layer_b:
+            _swap_cols(mlp_a.c_proj.weight, op.cols_a, op.cols_b)
+        else:
+            tmp = mlp_a.c_proj.weight[:, op.cols_a].clone()
+            mlp_a.c_proj.weight[:, op.cols_a] = mlp_b.c_proj.weight[:, op.cols_b]
+            mlp_b.c_proj.weight[:, op.cols_b] = tmp
+
+
 # ---------------------------------------------------------------------------
 # Gradient swaps (same logic, operating on .grad tensors)
 # ---------------------------------------------------------------------------
@@ -227,6 +378,24 @@ def _apply_attn_grad_swap(model, op: AttnSwapOp):
                 tmp = g_a[op.idx_a].clone()
                 g_a[op.idx_a] = g_b[op.idx_b]
                 g_b[op.idx_b] = tmp
+        g_a = attn_a.out_proj.weight.grad
+        g_b = attn_b.out_proj.weight.grad
+        if g_a is not None and g_b is not None:
+            tmp = g_a[:, op.idx_a].clone()
+            g_a[:, op.idx_a] = g_b[:, op.idx_b]
+            g_b[:, op.idx_b] = tmp
+
+
+def _apply_attn_out_grad_swap(model, op: AttnOutSwapOp):
+    """Execute a batched out-projection-only attention head gradient swap."""
+    attn_a = _get_attention_module(model, op.layer_a)
+    attn_b = _get_attention_module(model, op.layer_b)
+
+    if op.layer_a == op.layer_b:
+        g = attn_a.out_proj.weight.grad
+        if g is not None:
+            _swap_cols(g, op.idx_a, op.idx_b)
+    else:
         g_a = attn_a.out_proj.weight.grad
         g_b = attn_b.out_proj.weight.grad
         if g_a is not None and g_b is not None:
@@ -279,6 +448,55 @@ def _apply_mlp_grad_swap(model, op: MLPSwapOp):
             g_b[:, op.cols_b] = tmp
 
 
+def _apply_mlp_up_grad_swap(model, op: MLPUpSwapOp):
+    """Execute a batched MLP up-projection-only gradient swap."""
+    mlp_a = _get_mlp_module(model, op.layer_a)
+    mlp_b = _get_mlp_module(model, op.layer_b)
+    
+    if op.layer_a == op.layer_b:
+        g = mlp_a.c_fc.weight.grad
+        if g is not None:
+            _swap_rows(g, op.cols_a, op.cols_b)
+        if mlp_a.c_fc.bias is not None and mlp_a.c_fc.bias.grad is not None:
+            g = mlp_a.c_fc.bias.grad
+            tmp = g[op.cols_a].clone()
+            g[op.cols_a] = g[op.cols_b]
+            g[op.cols_b] = tmp
+    else:
+        g_a = mlp_a.c_fc.weight.grad
+        g_b = mlp_b.c_fc.weight.grad
+        if g_a is not None and g_b is not None:
+            tmp = g_a[op.cols_a].clone()
+            g_a[op.cols_a] = g_b[op.cols_b]
+            g_b[op.cols_b] = tmp
+        
+        if (mlp_a.c_fc.bias is not None and mlp_b.c_fc.bias is not None
+                and mlp_a.c_fc.bias.grad is not None and mlp_b.c_fc.bias.grad is not None):
+            g_a = mlp_a.c_fc.bias.grad
+            g_b = mlp_b.c_fc.bias.grad
+            tmp = g_a[op.cols_a].clone()
+            g_a[op.cols_a] = g_b[op.cols_b]
+            g_b[op.cols_b] = tmp
+
+
+def _apply_mlp_down_grad_swap(model, op: MLPDownSwapOp):
+    """Execute a batched MLP down-projection-only gradient swap."""
+    mlp_a = _get_mlp_module(model, op.layer_a)
+    mlp_b = _get_mlp_module(model, op.layer_b)
+    
+    if op.layer_a == op.layer_b:
+        g = mlp_a.c_proj.weight.grad
+        if g is not None:
+            _swap_cols(g, op.cols_a, op.cols_b)
+    else:
+        g_a = mlp_a.c_proj.weight.grad
+        g_b = mlp_b.c_proj.weight.grad
+        if g_a is not None and g_b is not None:
+            tmp = g_a[:, op.cols_a].clone()
+            g_a[:, op.cols_a] = g_b[:, op.cols_b]
+            g_b[:, op.cols_b] = tmp
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -299,8 +517,14 @@ def apply_permutation(model, key: "PermutationKey", plan: SwapPlan = None) -> No
     
     for op in plan.attn_ops:
         _apply_attn_swap(model, op)
+    for op in plan.attn_out_ops:
+        _apply_attn_out_swap(model, op)
     for op in plan.mlp_ops:
         _apply_mlp_swap(model, op)
+    for op in plan.mlp_up_ops:
+        _apply_mlp_up_swap(model, op)
+    for op in plan.mlp_down_ops:
+        _apply_mlp_down_swap(model, op)
 
 
 def unapply_permutation(model, key: "PermutationKey", plan: SwapPlan = None) -> None:
@@ -322,5 +546,11 @@ def swap_gradients(model, key: "PermutationKey", plan: SwapPlan = None) -> None:
     
     for op in plan.attn_ops:
         _apply_attn_grad_swap(model, op)
+    for op in plan.attn_out_ops:
+        _apply_attn_out_grad_swap(model, op)
     for op in plan.mlp_ops:
         _apply_mlp_grad_swap(model, op)
+    for op in plan.mlp_up_ops:
+        _apply_mlp_up_grad_swap(model, op)
+    for op in plan.mlp_down_ops:
+        _apply_mlp_down_grad_swap(model, op)

@@ -136,6 +136,33 @@ class TestGradientMasking(unittest.TestCase):
             "Keyed gradients should be preserved"
         )
 
+    def test_mask_keyed_gradients_attn_out_only_zeros_out_proj_only(self):
+        """Out-only attention key should mask out_proj cols but preserve q/k/v rows."""
+        self._run_backward()
+
+        key = PermutationKey(attn_out_heads=[[[0, 1], [2, 3]]])
+        attn_0 = self.model.transformer.h[0].attn.attention
+        head_dim = attn_0.head_dim
+        start = 1 * head_dim
+        end = 2 * head_dim
+
+        q_before = attn_0.q_proj.weight.grad[start:end, :].clone()
+        out_before = attn_0.out_proj.weight.grad[:, start:end].clone()
+
+        mask_keyed_gradients(self.model, key)
+
+        self.assertTrue(
+            torch.allclose(attn_0.q_proj.weight.grad[start:end, :], q_before),
+            "q_proj rows should be unchanged for attn_out-only masking",
+        )
+        self.assertTrue(
+            torch.allclose(
+                attn_0.out_proj.weight.grad[:, start:end],
+                torch.zeros_like(out_before),
+            ),
+            "out_proj keyed columns should be zero for attn_out-only masking",
+        )
+
 
 class TestWeightUpdates(unittest.TestCase):
     """Tests that verify actual weight updates after optimizer.step()."""

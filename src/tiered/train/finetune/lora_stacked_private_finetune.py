@@ -196,6 +196,12 @@ def count_keyed_parameters(model, key, device) -> int:
         total += attn.out_proj.weight.shape[0] * n_idx
         # NOTE: attention biases are NOT keyed (not swapped, not masked)
 
+    for layer_idx, idx in mask_plan.keyed_attn_out_indices.items():
+        attn = _get_attention_module(model, layer_idx)
+        n_idx = int(idx.numel())
+        # out_proj-only keyed heads
+        total += attn.out_proj.weight.shape[0] * n_idx
+
     for layer_idx, idx in mask_plan.keyed_mlp_indices.items():
         mlp = _get_mlp_module(model, layer_idx)
         n_idx = int(idx.numel())

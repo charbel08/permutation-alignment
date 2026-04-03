@@ -7,13 +7,20 @@ shuffled pool of available slots up front, then drawing each key's swaps from
 its dedicated partition.
 
 IMPORTANT:
-    target_pct is now interpreted as a percentage of the SWAPPABLE subset,
-    not of the full model size.
+    - --target_pct is interpreted as a fraction of the SWAPPABLE subset.
+    - --target_total_pct is interpreted as a fraction of FULL model params and
+      is converted internally to swappable-space using the exact tied/untied
+      parameter count convention used by this script.
 
 Single key (backward-compatible):
     python generate_key.py --output key.json \
         --num_layers 8 --num_heads 8 --hidden_size 512 --mlp_dim 2048 \
         --target_pct 0.20 --attn_ratio 0.25
+
+Single key by TOTAL model percentage:
+    python generate_key.py --output key.json \
+        --num_layers 8 --num_heads 8 --hidden_size 512 --mlp_dim 2048 \
+        --target_total_pct 0.10 --attn_ratio 0.25
 
 Multiple non-overlapping keys:
     python generate_key.py --output keys/key.json --num_keys 4 \
@@ -33,23 +40,35 @@ import sys
 from pathlib import Path
 
 
-def calculate_weights_per_swap(hidden_size: int, num_heads: int, mlp_dim: int):
+def calculate_weights_per_swap(
+    hidden_size: int,
+    num_heads: int,
+    mlp_dim: int,
+    mlp_mode: str = "both",
+    attn_mode: str = "full",
+):
     """Calculate number of parameters affected by each swap type.
 
-    Attention head swap affects:
-    - Q, K, V projections: 3 × hidden_size × head_dim (rows)
-    - Output projection: hidden_size × head_dim (columns)
-    Total per head: 4 × hidden_size × head_dim
+    Attention head swap affects (depends on attn_mode):
+    - full: Q/K/V rows + out_proj columns = 4 × hidden_size × head_dim
+    - out:  out_proj columns only         = hidden_size × head_dim
 
-    MLP column swap affects:
-    - c_fc weight: hidden_size × 1 (one row)
-    - c_fc bias: 1
-    - c_proj weight: 1 × hidden_size (one column)
-    Total per column: 2 × hidden_size + 1
+    MLP column swap affects (depends on mlp_mode):
+    - both: c_fc weight + bias + c_proj weight = 2 × hidden_size + 1
+    - up:   c_fc weight + bias = hidden_size + 1
+    - down: c_proj weight = hidden_size
     """
     head_dim = hidden_size // num_heads
-    weights_per_head = 4 * hidden_size * head_dim
-    weights_per_mlp_col = 2 * hidden_size + 1
+    if attn_mode == "out":
+        weights_per_head = hidden_size * head_dim
+    else:
+        weights_per_head = 4 * hidden_size * head_dim
+    if mlp_mode == "up":
+        weights_per_mlp_col = hidden_size + 1
+    elif mlp_mode == "down":
+        weights_per_mlp_col = hidden_size
+    else:
+        weights_per_mlp_col = 2 * hidden_size + 1
     return weights_per_head, weights_per_mlp_col
 
 
@@ -62,27 +81,74 @@ def count_total_params(
     max_positions: int = 1024,
     untie_weights: bool = False,
 ):
-    """Count ALL model parameters (GPT-Neo architecture)."""
+    """Count ALL model parameters for GPTNeoForCausalLMTiered.
+
+    This matches model construction in src/tiered/train/utils.py + model/gpt.py:
+      - tied mode: lm_head.weight is tied to wte.weight (count once)
+      - untied mode: lm_head.weight is separate (count additionally)
+      - lm_head.bias is always present and always counted
+    """
     # Embeddings
     wte = vocab_size * hidden_size
     wpe = max_positions * hidden_size
 
     # Per layer
-    # Note: this matches the repo's approximate accounting convention.
+    # Attention: q/k/v/out weights + out bias
     attn_params = 4 * hidden_size * hidden_size + hidden_size
+    # MLP: c_fc (weight+bias) + c_proj (weight+bias)
     mlp_params = (hidden_size * mlp_dim + mlp_dim) + (mlp_dim * hidden_size + hidden_size)
+    # ln_1 + ln_2, each with weight+bias
     ln_params = 2 * (hidden_size + hidden_size)
     layer_params = attn_params + mlp_params + ln_params
 
     # Final layer norm
     ln_f = hidden_size + hidden_size
 
-    # Untied LM head weight only (kept as-is for backward compatibility with
-    # the old script's accounting convention)
-    lm_head = vocab_size * hidden_size if untie_weights else 0
+    # LM head:
+    # - weight counted only when untied
+    # - bias always counted
+    lm_head_weight = vocab_size * hidden_size if untie_weights else 0
+    lm_head_bias = vocab_size
 
-    total = wte + wpe + num_layers * layer_params + ln_f + lm_head
+    total = wte + wpe + num_layers * layer_params + ln_f + lm_head_weight + lm_head_bias
     return total
+
+
+def convert_total_pct_to_swappable_pct(
+    target_total_pct: float,
+    num_layers: int,
+    hidden_size: int,
+    num_heads: int,
+    mlp_dim: int,
+    mlp_mode: str = "both",
+    attn_mode: str = "full",
+    untie_weights: bool = False,
+    context_size: int = 1024,
+) -> float:
+    """Convert a total-model target percentage to swappable-subset percentage."""
+    if target_total_pct < 0.0:
+        raise ValueError(f"target_total_pct must be >= 0, got {target_total_pct}")
+
+    total_params = count_total_params(
+        num_layers=num_layers,
+        hidden_size=hidden_size,
+        num_heads=num_heads,
+        mlp_dim=mlp_dim,
+        max_positions=context_size,
+        untie_weights=untie_weights,
+    )
+    total_swappable = count_total_swappable_params(
+        num_layers=num_layers,
+        hidden_size=hidden_size,
+        num_heads=num_heads,
+        mlp_dim=mlp_dim,
+        mlp_mode=mlp_mode,
+        attn_mode=attn_mode,
+    )["total"]
+    if total_swappable <= 0:
+        raise ValueError("total_swappable must be > 0")
+
+    return target_total_pct * total_params / total_swappable
 
 
 def count_total_swappable_params(
@@ -90,26 +156,32 @@ def count_total_swappable_params(
     hidden_size: int,
     num_heads: int,
     mlp_dim: int,
+    mlp_mode: str = "both",
+    attn_mode: str = "full",
 ):
     """Count the FULL swappable subset of the model.
 
     This is the parameter set that could be affected by a 100% key.
 
-    Swappable attention params per layer:
-      - q_proj.weight: all rows
-      - k_proj.weight: all rows
-      - v_proj.weight: all rows
-      - out_proj.weight: all columns
-      = 4 * hidden_size * hidden_size
+    Swappable attention params per layer (depends on attn_mode):
+      - full: q_proj + k_proj + v_proj rows + out_proj cols = 4 * hidden_size * hidden_size
+      - out:  out_proj cols only                            = hidden_size * hidden_size
 
-    Swappable MLP params per layer:
-      - c_fc.weight: hidden_size * mlp_dim
-      - c_fc.bias: mlp_dim
-      - c_proj.weight: mlp_dim * hidden_size
-      = 2 * hidden_size * mlp_dim + mlp_dim
+    Swappable MLP params per layer (depends on mlp_mode):
+      - both: c_fc.weight + c_fc.bias + c_proj.weight = 2*hidden_size*mlp_dim + mlp_dim
+      - up:   c_fc.weight + c_fc.bias = hidden_size*mlp_dim + mlp_dim
+      - down: c_proj.weight = mlp_dim*hidden_size
     """
-    attn_swappable_per_layer = 4 * hidden_size * hidden_size
-    mlp_swappable_per_layer = 2 * hidden_size * mlp_dim + mlp_dim
+    if attn_mode == "out":
+        attn_swappable_per_layer = hidden_size * hidden_size
+    else:
+        attn_swappable_per_layer = 4 * hidden_size * hidden_size
+    if mlp_mode == "up":
+        mlp_swappable_per_layer = hidden_size * mlp_dim + mlp_dim
+    elif mlp_mode == "down":
+        mlp_swappable_per_layer = mlp_dim * hidden_size
+    else:
+        mlp_swappable_per_layer = 2 * hidden_size * mlp_dim + mlp_dim
 
     total_attn = num_layers * attn_swappable_per_layer
     total_mlp = num_layers * mlp_swappable_per_layer
@@ -175,6 +247,26 @@ def _make_cross_layer_swaps(pool: list[tuple[int, int]], max_swaps: int):
     return swaps
 
 
+def _make_random_swaps(pool: list[tuple[int, int]], max_swaps: int):
+    """Pair up items from pool into random swaps (same or cross layer).
+
+    Simply takes consecutive pairs from the shuffled pool.
+
+    Args:
+        pool: Shuffled list of (layer, index) tuples.
+        max_swaps: Maximum number of swaps to generate.
+
+    Returns:
+        List of [[layer_a, idx_a], [layer_b, idx_b]] swaps.
+    """
+    swaps = []
+    for i in range(0, len(pool) - 1, 2):
+        if len(swaps) >= max_swaps:
+            break
+        swaps.append([list(pool[i]), list(pool[i + 1])])
+    return swaps
+
+
 def generate_keys(
     num_keys: int,
     num_layers: int,
@@ -183,6 +275,8 @@ def generate_keys(
     mlp_dim: int,
     target_pct: float,
     attn_ratio: float,
+    mlp_mode: str = "both",
+    attn_mode: str = "full",
     untie_weights: bool = False,
     context_size: int = 1024,
     seed: int = 42,
@@ -191,10 +285,17 @@ def generate_keys(
 
     target_pct is interpreted as the fraction of the SWAPPABLE subset per key.
     """
+    if target_pct < 0.0:
+        raise ValueError(f"target_pct must be >= 0, got {target_pct}")
+    if not (0.0 <= attn_ratio <= 1.0):
+        raise ValueError(f"attn_ratio must be in [0, 1], got {attn_ratio}")
+    if num_keys < 1:
+        raise ValueError(f"num_keys must be >= 1, got {num_keys}")
+
     random.seed(seed)
 
     weights_per_head, weights_per_mlp_col = calculate_weights_per_swap(
-        hidden_size, num_heads, mlp_dim
+        hidden_size, num_heads, mlp_dim, mlp_mode=mlp_mode, attn_mode=attn_mode
     )
 
     total_params = count_total_params(
@@ -211,6 +312,8 @@ def generate_keys(
         hidden_size=hidden_size,
         num_heads=num_heads,
         mlp_dim=mlp_dim,
+        mlp_mode=mlp_mode,
+        attn_mode=attn_mode,
     )
     total_swappable = swappable_info["total"]
     total_swappable_attn = swappable_info["attention"]
@@ -233,6 +336,8 @@ def generate_keys(
     needed_mlp_slots = 2 * swaps_per_key_mlp * num_keys
 
     print(f"Model config: {num_layers} layers, {num_heads} heads, hidden={hidden_size}, mlp={mlp_dim}")
+    print(f"Attention mode: {attn_mode}")
+    print(f"MLP mode: {mlp_mode}")
     print(f"Total model params:        {total_params:,} (untied={untie_weights})")
     print(f"Total swappable params:    {total_swappable:,}")
     print(f"  - attention swappable:   {total_swappable_attn:,}")
@@ -271,6 +376,18 @@ def generate_keys(
         print("    Either reduce --target_pct, increase --attn_ratio, or reduce --num_keys.")
         print("    Will allocate as many as possible.\n")
 
+    # Choose attention swap strategy based on mode
+    if attn_mode == "out":
+        make_attn_swaps = _make_random_swaps
+    else:
+        make_attn_swaps = _make_cross_layer_swaps
+
+    # Determine which key field to use for attention swaps
+    attn_key_field = {
+        "full": "attn_heads",
+        "out": "attn_out_heads",
+    }[attn_mode]
+
     # Shuffle and partition attention head slots
     all_heads = [(l, h) for l in range(num_layers) for h in range(num_heads)]
     random.shuffle(all_heads)
@@ -293,14 +410,27 @@ def generate_keys(
         end = (k + 1) * chunk_size_cols if k < num_keys - 1 else len(all_cols)
         col_partitions.append(all_cols[start:end])
 
+    # Choose MLP swap strategy based on mode
+    if mlp_mode in ("up", "down"):
+        make_mlp_swaps = _make_random_swaps
+    else:
+        make_mlp_swaps = _make_cross_layer_swaps
+
+    # Determine which key field to use for MLP swaps
+    mlp_key_field = {
+        "both": "mlp_cols",
+        "up": "mlp_up_cols",
+        "down": "mlp_down_cols",
+    }[mlp_mode]
+
     # Generate swaps within each partition
     keys = []
     total_keyed_all = 0
 
     print(f"\n{'=' * 60}")
     for k in range(num_keys):
-        attn_swaps = _make_cross_layer_swaps(head_partitions[k], swaps_per_key_attn)
-        mlp_swaps = _make_cross_layer_swaps(col_partitions[k], swaps_per_key_mlp)
+        attn_swaps = make_attn_swaps(head_partitions[k], swaps_per_key_attn)
+        mlp_swaps = make_mlp_swaps(col_partitions[k], swaps_per_key_mlp)
 
         actual_attn = len(attn_swaps) * 2 * weights_per_head
         actual_mlp = len(mlp_swaps) * 2 * weights_per_mlp_col
@@ -309,50 +439,63 @@ def generate_keys(
 
         print(f"\nKey {k+1}:")
         print(f"  Attention swaps: {len(attn_swaps)} ({actual_attn:,} params)")
-        print(f"  MLP swaps:       {len(mlp_swaps)} ({actual_mlp:,} params)")
+        print(f"  MLP swaps ({mlp_mode}): {len(mlp_swaps)} ({actual_mlp:,} params)")
         print(f"  Total keyed:     {actual_total:,}")
         print(f"    = {100 * actual_total / total_swappable:.2f}% of swappable subset")
         print(f"    = {100 * actual_total / total_params:.2f}% of full model")
 
-        keys.append({
-            "attn_heads": attn_swaps,
-            "mlp_cols": mlp_swaps,
-        })
+        key_dict = {attn_key_field: attn_swaps}
+        key_dict[mlp_key_field] = mlp_swaps
+        keys.append(key_dict)
 
     print(f"\n{'=' * 60}")
     print(f"Combined keyed params: {total_keyed_all:,}")
     print(f"  = {100 * total_keyed_all / total_swappable:.2f}% of swappable subset")
     print(f"  = {100 * total_keyed_all / total_params:.2f}% of full model")
 
-    _verify_non_overlap(keys)
+    _verify_non_overlap(keys, attn_key_field=attn_key_field, mlp_key_field=mlp_key_field)
     return keys
 
 
-def _verify_non_overlap(keys: list[dict]):
+def _verify_non_overlap(
+    keys: list[dict],
+    attn_key_field: str = "attn_heads",
+    mlp_key_field: str = "mlp_cols",
+):
     """Assert that no head or column appears in more than one key."""
     all_heads_seen = {}
     all_cols_seen = {}
 
     for k, key in enumerate(keys):
-        for swap in key["attn_heads"]:
-            for slot in swap:
-                slot_tuple = tuple(slot)
-                if slot_tuple in all_heads_seen:
-                    raise AssertionError(
-                        f"OVERLAP: attention head {slot_tuple} appears in "
-                        f"key {all_heads_seen[slot_tuple] + 1} AND key {k + 1}"
-                    )
-                all_heads_seen[slot_tuple] = k
+        attn_fields = [attn_key_field]
+        for f in ("attn_heads", "attn_out_heads"):
+            if f in key and f not in attn_fields:
+                attn_fields.append(f)
+        for field in attn_fields:
+            for swap in key.get(field, []):
+                for slot in swap:
+                    slot_tuple = tuple(slot)
+                    if slot_tuple in all_heads_seen:
+                        raise AssertionError(
+                            f"OVERLAP: attention head {slot_tuple} appears in "
+                            f"key {all_heads_seen[slot_tuple] + 1} AND key {k + 1}"
+                        )
+                    all_heads_seen[slot_tuple] = k
 
-        for swap in key["mlp_cols"]:
-            for slot in swap:
-                slot_tuple = tuple(slot)
-                if slot_tuple in all_cols_seen:
-                    raise AssertionError(
-                        f"OVERLAP: MLP column {slot_tuple} appears in "
-                        f"key {all_cols_seen[slot_tuple] + 1} AND key {k + 1}"
-                    )
-                all_cols_seen[slot_tuple] = k
+        mlp_fields = [mlp_key_field]
+        for f in ("mlp_cols", "mlp_up_cols", "mlp_down_cols"):
+            if f in key and f not in mlp_fields:
+                mlp_fields.append(f)
+        for field in mlp_fields:
+            for swap in key.get(field, []):
+                for slot in swap:
+                    slot_tuple = tuple(slot)
+                    if slot_tuple in all_cols_seen:
+                        raise AssertionError(
+                            f"OVERLAP: MLP column {slot_tuple} appears in "
+                            f"key {all_cols_seen[slot_tuple] + 1} AND key {k + 1}"
+                        )
+                    all_cols_seen[slot_tuple] = k
 
     print(f"\nNon-overlap verification PASSED:")
     print(f"  {len(all_heads_seen)} unique attention head slots across {len(keys)} keys")
@@ -364,10 +507,16 @@ def validate_key_files(paths: list[str]):
     keys = []
     for p in paths:
         with open(p) as f:
-            keys.append(json.load(f))
+            d = json.load(f)
+            keys.append(d)
+        attn_count = len(d.get("attn_heads", [])) + len(d.get("attn_out_heads", []))
+        mlp_count = (
+            len(d.get("mlp_cols", []))
+            + len(d.get("mlp_up_cols", []))
+            + len(d.get("mlp_down_cols", []))
+        )
         print(
-            f"Loaded {p}: {len(keys[-1]['attn_heads'])} attn swaps, "
-            f"{len(keys[-1]['mlp_cols'])} MLP swaps"
+            f"Loaded {p}: {attn_count} attn swaps, {mlp_count} MLP swaps"
         )
 
     try:
@@ -416,17 +565,41 @@ def main():
     parser.add_argument("--context_size", type=int, default=1024)
 
     # Key configuration
-    parser.add_argument(
+    target_group = parser.add_mutually_exclusive_group()
+    target_group.add_argument(
         "--target_pct",
         type=float,
-        default=0.20,
-        help="Target percentage of SWAPPABLE weights to key PER KEY (0-1)",
+        default=None,
+        help="Target fraction of SWAPPABLE weights to key per key (0-1)",
+    )
+    target_group.add_argument(
+        "--target_total_pct",
+        type=float,
+        default=None,
+        help="Target fraction of TOTAL model weights to key per key (0-1). "
+             "Converted internally to swappable-space.",
     )
     parser.add_argument(
         "--attn_ratio",
         type=float,
         default=0.25,
         help="Ratio of keyed weights from attention (0-1)",
+    )
+    parser.add_argument(
+        "--attn_mode",
+        type=str,
+        default="full",
+        choices=["full", "out"],
+        help="Attention swap mode: 'full' (q/k/v + out_proj), "
+             "'out' (out_proj columns only, same or cross layer)",
+    )
+    parser.add_argument(
+        "--mlp_mode",
+        type=str,
+        default="both",
+        choices=["both", "up", "down"],
+        help="MLP swap mode: 'both' (up+down, cross-layer only), "
+             "'up' (c_fc only, any layer), 'down' (c_proj only, any layer)",
     )
     parser.add_argument("--seed", type=int, default=42)
 
@@ -439,14 +612,57 @@ def main():
     if args.output is None:
         parser.error("--output is required when generating keys")
 
+    # Backward-compatible default: if neither flag is provided, use 0.20 of
+    # swappable subset.
+    if args.target_pct is None and args.target_total_pct is None:
+        target_pct = 0.20
+    elif args.target_pct is not None:
+        target_pct = args.target_pct
+    else:
+        target_pct = convert_total_pct_to_swappable_pct(
+            target_total_pct=args.target_total_pct,
+            num_layers=args.num_layers,
+            hidden_size=args.hidden_size,
+            num_heads=args.num_heads,
+            mlp_dim=args.mlp_dim,
+            mlp_mode=args.mlp_mode,
+            attn_mode=args.attn_mode,
+            untie_weights=args.untie_weights,
+            context_size=args.context_size,
+        )
+        total_params = count_total_params(
+            num_layers=args.num_layers,
+            hidden_size=args.hidden_size,
+            num_heads=args.num_heads,
+            mlp_dim=args.mlp_dim,
+            max_positions=args.context_size,
+            untie_weights=args.untie_weights,
+        )
+        swappable = count_total_swappable_params(
+            num_layers=args.num_layers,
+            hidden_size=args.hidden_size,
+            num_heads=args.num_heads,
+            mlp_dim=args.mlp_dim,
+            mlp_mode=args.mlp_mode,
+            attn_mode=args.attn_mode,
+        )["total"]
+        print(
+            "Converted target_total_pct -> target_pct: "
+            f"{args.target_total_pct:.6f} of total "
+            f"({total_params:,} params) => {target_pct:.6f} of swappable "
+            f"({swappable:,} params)"
+        )
+
     keys = generate_keys(
         num_keys=args.num_keys,
         num_layers=args.num_layers,
         num_heads=args.num_heads,
         hidden_size=args.hidden_size,
         mlp_dim=args.mlp_dim,
-        target_pct=args.target_pct,
+        target_pct=target_pct,
         attn_ratio=args.attn_ratio,
+        attn_mode=args.attn_mode,
+        mlp_mode=args.mlp_mode,
         untie_weights=args.untie_weights,
         context_size=args.context_size,
         seed=args.seed,

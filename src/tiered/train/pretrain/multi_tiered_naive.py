@@ -80,6 +80,10 @@ def count_swappable_parameters(model, mask_plan) -> dict:
         total_attn += n_idx * attn.k_proj.weight.shape[1]
         total_attn += n_idx * attn.v_proj.weight.shape[1]
         total_attn += attn.out_proj.weight.shape[0] * n_idx
+    for layer_idx, idx in mask_plan.keyed_attn_out_indices.items():
+        attn = _get_attention_module(model, layer_idx)
+        n_idx = int(idx.numel())
+        total_attn += attn.out_proj.weight.shape[0] * n_idx
     for layer_idx, idx in mask_plan.keyed_mlp_indices.items():
         mlp = _get_mlp_module(model, layer_idx)
         n_idx = int(idx.numel())
@@ -189,11 +193,14 @@ def build_public_mask(model, tiers: list, device: torch.device) -> PublicMask:
     # Attention: row-indexed for q/k/v, column-indexed for out_proj.
     # MLP: row-indexed for c_fc, column-indexed for c_proj.
     keyed_attn_per_layer: Dict[int, Set[int]] = defaultdict(set)
+    keyed_attn_out_per_layer: Dict[int, Set[int]] = defaultdict(set)
     keyed_mlp_per_layer: Dict[int, Set[int]] = defaultdict(set)
 
     for tier in tiers:
         for layer_idx, idx in tier.mask_plan.keyed_attn_indices.items():
             keyed_attn_per_layer[layer_idx].update(idx.cpu().tolist())
+        for layer_idx, idx in tier.mask_plan.keyed_attn_out_indices.items():
+            keyed_attn_out_per_layer[layer_idx].update(idx.cpu().tolist())
         for layer_idx, idx in tier.mask_plan.keyed_mlp_indices.items():
             keyed_mlp_per_layer[layer_idx].update(idx.cpu().tolist())
 
@@ -212,6 +219,10 @@ def build_public_mask(model, tiers: list, device: torch.device) -> PublicMask:
             for proj in (attn.q_proj, attn.k_proj, attn.v_proj):
                 mask.entries[id(proj.weight)] = (row_mask, 0)
 
+        if layer_idx in keyed_attn_per_layer or layer_idx in keyed_attn_out_per_layer:
+            keyed_cols = set(keyed_attn_per_layer.get(layer_idx, set()))
+            keyed_cols.update(keyed_attn_out_per_layer.get(layer_idx, set()))
+            keyed = torch.tensor(sorted(keyed_cols), dtype=torch.long, device=device)
             num_cols = attn.out_proj.weight.shape[1]
             col_mask = torch.ones(num_cols, dtype=torch.bool, device=device)
             col_mask[keyed] = False
@@ -290,6 +301,13 @@ def _extract_keyed_gradients(model, plan: MaskPlan) -> dict:
             layer_data["out_cols"] = attn.out_proj.weight.grad[:, idx].clone()
         saved[("attn", layer_idx)] = layer_data
 
+    for layer_idx, idx in plan.keyed_attn_out_indices.items():
+        attn = _get_attention_module(model, layer_idx)
+        layer_data = {}
+        if attn.out_proj.weight.grad is not None:
+            layer_data["out_cols"] = attn.out_proj.weight.grad[:, idx].clone()
+        saved[("attn_out", layer_idx)] = layer_data
+
     for layer_idx, idx in plan.keyed_mlp_indices.items():
         mlp = _get_mlp_module(model, layer_idx)
         layer_data = {}
@@ -313,6 +331,12 @@ def _restore_keyed_gradients(model, plan: MaskPlan, saved: dict):
             key = f"{name}_rows"
             if key in layer_data and proj.weight.grad is not None:
                 proj.weight.grad[idx] = layer_data[key]
+        if "out_cols" in layer_data and attn.out_proj.weight.grad is not None:
+            attn.out_proj.weight.grad[:, idx] = layer_data["out_cols"]
+
+    for layer_idx, idx in plan.keyed_attn_out_indices.items():
+        attn = _get_attention_module(model, layer_idx)
+        layer_data = saved[("attn_out", layer_idx)]
         if "out_cols" in layer_data and attn.out_proj.weight.grad is not None:
             attn.out_proj.weight.grad[:, idx] = layer_data["out_cols"]
 

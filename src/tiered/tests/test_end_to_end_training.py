@@ -37,6 +37,14 @@ def create_test_key():
     )
 
 
+def create_test_attn_out_key():
+    """Create a key with one out-projection-only attention swap."""
+    return PermutationKey(
+        attn_out_heads=[((0, 1), (2, 3))],  # Swap out_proj head-range columns only
+        mlp_cols=[],
+    )
+
+
 class TestEndToEndTraining:
     """Test the complete training flow to verify no gradient permutation is needed."""
     
@@ -204,6 +212,60 @@ class TestEndToEndTraining:
         print("Gradient permutation in permute.py is NOT needed because:")
         print("  1. optimizer.step() happens while weights and grads are both in C2 positions")
         print("  2. zero_grad() at start of next step clears any misaligned gradients")
+
+    def test_attn_out_only_train_step_flow(self):
+        """End-to-end one-step flow for attn_out-only keys."""
+        torch.manual_seed(42)
+        model = create_test_model()
+        key = create_test_attn_out_key()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+        attn_layer0 = model.transformer.h[0].attn.attention
+        attn_layer2 = model.transformer.h[2].attn.attention
+        head_dim = attn_layer0.head_dim
+        idx0 = slice(1 * head_dim, 2 * head_dim)
+        idx2 = slice(3 * head_dim, 4 * head_dim)
+
+        orig_q0 = attn_layer0.q_proj.weight[idx0, :].clone()
+        orig_q2 = attn_layer2.q_proj.weight[idx2, :].clone()
+        orig_out0 = attn_layer0.out_proj.weight[:, idx0].clone()
+        orig_out2 = attn_layer2.out_proj.weight[:, idx2].clone()
+
+        input_ids = torch.randint(0, 100, (2, 32))
+
+        optimizer.zero_grad()
+        outputs_c1 = model(input_ids, labels=input_ids)
+        outputs_c1.loss.backward()
+
+        q_grad_before = attn_layer0.q_proj.weight.grad[idx0, :].clone()
+        out_grad_before = attn_layer0.out_proj.weight.grad[:, idx0].clone()
+        mask_keyed_gradients(model, key)
+
+        # attn_out-only should mask out_proj but not q_proj rows
+        assert torch.allclose(attn_layer0.q_proj.weight.grad[idx0, :], q_grad_before)
+        assert torch.allclose(
+            attn_layer0.out_proj.weight.grad[:, idx0],
+            torch.zeros_like(out_grad_before),
+        )
+
+        apply_permutation(model, key)
+
+        # only out_proj columns should be swapped
+        assert torch.allclose(attn_layer0.q_proj.weight[idx0, :], orig_q0)
+        assert torch.allclose(attn_layer2.q_proj.weight[idx2, :], orig_q2)
+        assert torch.allclose(attn_layer0.out_proj.weight[:, idx0], orig_out2)
+        assert torch.allclose(attn_layer2.out_proj.weight[:, idx2], orig_out0)
+
+        outputs_c2 = model(input_ids, labels=input_ids)
+        outputs_c2.loss.backward()
+        scale_public_gradients(model, key, scale=0.5)
+        optimizer.step()
+        unapply_permutation(model, key)
+
+        # after step + unapply, at least one keyed out_proj range should change
+        changed = not torch.allclose(attn_layer0.out_proj.weight[:, idx0], orig_out0)
+        changed = changed or not torch.allclose(attn_layer2.out_proj.weight[:, idx2], orig_out2)
+        assert changed, "Expected keyed out_proj columns to update"
         
 
 if __name__ == "__main__":

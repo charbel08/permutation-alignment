@@ -58,14 +58,14 @@ def count_swappable_parameters(model, mask_plan) -> dict:
 
     "Swappable" here means parameters that participate in keyed swaps / masking:
       - Attention:
-          q_proj.weight rows for keyed head dims
-          k_proj.weight rows for keyed head dims
-          v_proj.weight rows for keyed head dims
-          out_proj.weight columns for keyed head dims
+          q_proj/k_proj/v_proj rows for keyed full-attention head dims
+          out_proj.weight columns for keyed head dims from either full-attn or
+          out-projection-only swaps
       - MLP:
-          c_fc.weight rows for keyed columns
-          c_fc.bias entries for keyed columns
-          c_proj.weight columns for keyed columns
+          c_fc.weight rows + c_fc.bias entries for keyed columns from either
+          mlp_cols (both) or mlp_up_cols (up-only)
+          c_proj.weight columns for keyed columns from either mlp_cols (both)
+          or mlp_down_cols (down-only)
 
     Counts are taken directly from the instantiated tensors, not estimated from
     hyperparameters.
@@ -75,33 +75,60 @@ def count_swappable_parameters(model, mask_plan) -> dict:
     total_attn = 0
     total_mlp = 0
 
+    def _merge_unique_idx(*idx_tensors):
+        parts = [x for x in idx_tensors if x is not None and x.numel() > 0]
+        if not parts:
+            return None
+        return torch.unique(torch.cat(parts, dim=0), sorted=False)
+
     # Attention swappable params
-    for layer_idx, idx in mask_plan.keyed_attn_indices.items():
+    attn_layers = set(mask_plan.keyed_attn_indices.keys()) | set(mask_plan.keyed_attn_out_indices.keys())
+    for layer_idx in attn_layers:
         attn = _get_attention_module(model, layer_idx)
-        n_idx = int(idx.numel())
+        idx_full = mask_plan.keyed_attn_indices.get(layer_idx)
+        idx_out = _merge_unique_idx(idx_full, mask_plan.keyed_attn_out_indices.get(layer_idx))
 
-        # q/k/v selected rows
-        total_attn += n_idx * attn.q_proj.weight.shape[1]
-        total_attn += n_idx * attn.k_proj.weight.shape[1]
-        total_attn += n_idx * attn.v_proj.weight.shape[1]
+        # q/k/v selected rows only come from full-attn head swaps.
+        if idx_full is not None and idx_full.numel() > 0:
+            n_idx_full = int(idx_full.numel())
+            total_attn += n_idx_full * attn.q_proj.weight.shape[1]
+            total_attn += n_idx_full * attn.k_proj.weight.shape[1]
+            total_attn += n_idx_full * attn.v_proj.weight.shape[1]
 
-        # out selected columns
-        total_attn += attn.out_proj.weight.shape[0] * n_idx
+        # out-proj selected columns come from full-attn or out-only swaps.
+        if idx_out is not None and idx_out.numel() > 0:
+            n_idx_out = int(idx_out.numel())
+            total_attn += attn.out_proj.weight.shape[0] * n_idx_out
 
     # MLP swappable params
-    for layer_idx, idx in mask_plan.keyed_mlp_indices.items():
+    mlp_layers = (
+        set(mask_plan.keyed_mlp_indices.keys())
+        | set(mask_plan.keyed_mlp_up_indices.keys())
+        | set(mask_plan.keyed_mlp_down_indices.keys())
+    )
+    for layer_idx in mlp_layers:
         mlp = _get_mlp_module(model, layer_idx)
-        n_idx = int(idx.numel())
 
-        # c_fc selected rows
-        total_mlp += n_idx * mlp.c_fc.weight.shape[1]
+        idx_rows = _merge_unique_idx(
+            mask_plan.keyed_mlp_indices.get(layer_idx),
+            mask_plan.keyed_mlp_up_indices.get(layer_idx),
+        )
+        idx_cols = _merge_unique_idx(
+            mask_plan.keyed_mlp_indices.get(layer_idx),
+            mask_plan.keyed_mlp_down_indices.get(layer_idx),
+        )
 
-        # c_fc selected bias entries
-        if mlp.c_fc.bias is not None:
-            total_mlp += n_idx
+        # c_fc selected rows + bias entries (both + up-only)
+        if idx_rows is not None and idx_rows.numel() > 0:
+            n_rows = int(idx_rows.numel())
+            total_mlp += n_rows * mlp.c_fc.weight.shape[1]
+            if mlp.c_fc.bias is not None:
+                total_mlp += n_rows
 
-        # c_proj selected columns
-        total_mlp += mlp.c_proj.weight.shape[0] * n_idx
+        # c_proj selected columns (both + down-only)
+        if idx_cols is not None and idx_cols.numel() > 0:
+            n_cols = int(idx_cols.numel())
+            total_mlp += mlp.c_proj.weight.shape[0] * n_cols
 
     return {
         "total": total_attn + total_mlp,
@@ -263,11 +290,6 @@ def parse_args():
         type=int,
         default=None,
         help="MLP hidden dimension (defaults to 4x hidden_size)",
-    )
-    parser.add_argument(
-        "--untie_weights",
-        action="store_true",
-        help="Disable weight tying between embeddings and LM head",
     )
     parser.add_argument(
         "--checkpoint",
@@ -434,7 +456,7 @@ def train(args):
             num_layers=args.num_layers,
             context_size=args.context_size,
             intermediate_size=args.intermediate_size,
-            tie_weights=not args.untie_weights,
+            tie_weights=True,
             do_print=is_main,
         )
 
@@ -445,15 +467,28 @@ def train(args):
     swap_plan = build_swap_plan(model, key, device)
     if is_main:
         print(
-            f"Built swap plan: {len(swap_plan.attn_ops)} attn ops, "
-            f"{len(swap_plan.mlp_ops)} MLP ops (indices on {device})"
+            "Built swap plan: "
+            f"{len(swap_plan.attn_ops)} full-attn ops, "
+            f"{len(swap_plan.attn_out_ops)} out-only-attn ops, "
+            f"{len(swap_plan.mlp_ops)} mlp-both ops, "
+            f"{len(swap_plan.mlp_up_ops)} mlp-up-only ops, "
+            f"{len(swap_plan.mlp_down_ops)} mlp-down-only ops "
+            f"(indices on {device})"
         )
 
     mask_plan = build_mask_plan(model, key, device)
     if is_main:
         n_attn_layers = len(mask_plan.keyed_attn_indices)
+        n_attn_out_layers = len(mask_plan.keyed_attn_out_indices)
         n_mlp_layers = len(mask_plan.keyed_mlp_indices)
-        print(f"Built mask plan: {n_attn_layers} attn layers, {n_mlp_layers} MLP layers with keyed indices")
+        n_mlp_up_layers = len(mask_plan.keyed_mlp_up_indices)
+        n_mlp_down_layers = len(mask_plan.keyed_mlp_down_indices)
+        print(
+            "Built mask plan: "
+            f"{n_attn_layers} attn layers, {n_attn_out_layers} out-only attn layers, "
+            f"{n_mlp_layers} mlp-both layers, {n_mlp_up_layers} mlp-up-only layers, "
+            f"{n_mlp_down_layers} mlp-down-only layers with keyed indices"
+        )
 
     # Keep a reference to the original model for permutation/masking ops.
     raw_model = model
@@ -620,6 +655,7 @@ def train(args):
     max_swappable_params = count_max_swappable_parameters(raw_model)
 
     swappable_pct_of_max = 100.0 * swappable_params["total"] / max_swappable_params["total"]
+    swappable_pct_of_total = 100.0 * swappable_params["total"] / num_params
     max_swappable_pct_of_total = 100.0 * max_swappable_params["total"] / num_params
 
     inter_size = args.intermediate_size or (args.hidden_size * 4)
@@ -647,7 +683,11 @@ def train(args):
         print(f"\n── Compute metrics ──")
         print(f"  Total parameters:           {num_params:,}")
         print(f"  Trainable parameters:       {num_trainable:,}")
-        print(f"  Current swappable params:   {swappable_params['total']:,} ({swappable_pct_of_max:.2f}% of max swappable)")
+        print(
+            "  Current swapped params:     "
+            f"{swappable_params['total']:,} "
+            f"({swappable_pct_of_max:.2f}% of swappable, {swappable_pct_of_total:.2f}% of total params)"
+        )
         print(f"    - attention:              {swappable_params['attention']:,}")
         print(f"    - mlp:                    {swappable_params['mlp']:,}")
         print(f"  Max swappable params:       {max_swappable_params['total']:,} ({max_swappable_pct_of_total:.2f}% of total params)")
@@ -690,6 +730,7 @@ def train(args):
                 "compute/swappable_attention_params": swappable_params["attention"],
                 "compute/swappable_mlp_params": swappable_params["mlp"],
                 "compute/swappable_pct_of_max": swappable_pct_of_max,
+                "compute/swappable_pct_of_total": swappable_pct_of_total,
                 "compute/max_swappable_params": max_swappable_params["total"],
                 "compute/max_swappable_attention_params": max_swappable_params["attention"],
                 "compute/max_swappable_mlp_params": max_swappable_params["mlp"],
@@ -960,7 +1001,11 @@ def train(args):
         print(f"{'=' * 60}")
         print(f"  Steps:                    {global_step:,}")
         print(f"  Total parameters (N):     {num_params:,}")
-        print(f"  Current swappable params: {swappable_params['total']:,} ({swappable_pct_of_max:.2f}% of max swappable)")
+        print(
+            "  Current swapped params:   "
+            f"{swappable_params['total']:,} "
+            f"({swappable_pct_of_max:.2f}% of swappable, {swappable_pct_of_total:.2f}% of total params)"
+        )
         print(f"    - attention:            {swappable_params['attention']:,}")
         print(f"    - mlp:                  {swappable_params['mlp']:,}")
         print(f"  Max swappable params:     {max_swappable_params['total']:,} ({max_swappable_pct_of_total:.2f}% of total params)")
@@ -994,6 +1039,7 @@ def train(args):
                 "final/swappable_attention_params": swappable_params["attention"],
                 "final/swappable_mlp_params": swappable_params["mlp"],
                 "final/swappable_pct_of_max": swappable_pct_of_max,
+                "final/swappable_pct_of_total": swappable_pct_of_total,
                 "final/max_swappable_params": max_swappable_params["total"],
                 "final/max_swappable_attention_params": max_swappable_params["attention"],
                 "final/max_swappable_mlp_params": max_swappable_params["mlp"],

@@ -8,12 +8,11 @@ cd /work/permutation-alignment
 torchrun --standalone --nproc_per_node=8 -m tiered.train.pretrain.tiered_pretrain \
     --data_path /work/scratch/data/datasets/fineweb/retain \
     --output_dir /work/scratch/checkpoints/fineweb/tiered_pretrain_1b \
-    --key_path configs/keys/key_1b_10pct_mixed.json \
+    --key_path configs/keys/1b/both/key_10pct_mixed.json \
     --hidden_size 2048 \
     --intermediate_size 8192 \
     --num_heads 16 \
     --num_layers 16 \
-    --untie_weights \
     --context_size 1024 \
     --batch_size 22 \
     --grad_accum_steps 4 \
