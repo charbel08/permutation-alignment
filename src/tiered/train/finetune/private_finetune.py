@@ -44,8 +44,9 @@ from transformers import AutoTokenizer, DataCollatorForLanguageModeling
 from tqdm import tqdm
 
 from tiered.model import GPTNeoForCausalLMTiered
-from tiered.permutation import load_key, mask_public_gradients, swap_gradients
+from tiered.permutation import load_key, mask_public_gradients, swap_gradients, build_mask_plan
 from tiered.permutation.permute import apply_permutation, unapply_permutation, build_swap_plan
+from tiered.permutation.utils import _get_attention_module, _get_mlp_module
 from tiered.train.utils import save_checkpoint
 
 
@@ -132,6 +133,12 @@ def parse_args():
     parser.add_argument("--kl_lambda", type=float, default=0.1,
                         help="λ in L_ft = (1-λ)*L_priv + λ*R_KL (0 to disable KL)")
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument(
+        "--keyed_l2_lambda",
+        type=float,
+        default=0.01,
+        help="Keyed-only decoupled weight decay coefficient (AdamW-style, default: 0.01)",
+    )
     parser.add_argument("--resume_from", type=str, default=None,
                         help="Path to finetuning checkpoint to resume from")
     
@@ -155,8 +162,49 @@ def parse_args():
     return parser.parse_args()
 
 
+def apply_keyed_weight_decay(raw_model, key, lr, weight_decay, plan=None):
+    """Apply decoupled AdamW-style weight decay to keyed weights only."""
+    if weight_decay <= 0:
+        return
+    if plan is None:
+        device = next(raw_model.parameters()).device
+        plan = build_mask_plan(raw_model, key, device)
+    decay = 1.0 - lr * weight_decay
+    if decay == 1.0:
+        return
+
+    with torch.no_grad():
+        for layer_idx, idx in plan.keyed_attn_indices.items():
+            attn = _get_attention_module(raw_model, layer_idx)
+            for proj_name in ("q_proj", "k_proj", "v_proj"):
+                getattr(attn, proj_name).weight[idx].mul_(decay)
+            attn.out_proj.weight[:, idx].mul_(decay)
+
+        for layer_idx, idx in plan.keyed_attn_out_indices.items():
+            attn = _get_attention_module(raw_model, layer_idx)
+            attn.out_proj.weight[:, idx].mul_(decay)
+
+        for layer_idx, idx in plan.keyed_mlp_indices.items():
+            mlp = _get_mlp_module(raw_model, layer_idx)
+            mlp.c_fc.weight[idx].mul_(decay)
+            if mlp.c_fc.bias is not None:
+                mlp.c_fc.bias[idx].mul_(decay)
+            mlp.c_proj.weight[:, idx].mul_(decay)
+
+        for layer_idx, idx in plan.keyed_mlp_up_indices.items():
+            mlp = _get_mlp_module(raw_model, layer_idx)
+            mlp.c_fc.weight[idx].mul_(decay)
+            if mlp.c_fc.bias is not None:
+                mlp.c_fc.bias[idx].mul_(decay)
+
+        for layer_idx, idx in plan.keyed_mlp_down_indices.items():
+            mlp = _get_mlp_module(raw_model, layer_idx)
+            mlp.c_proj.weight[:, idx].mul_(decay)
+
+
 def train_step(model, raw_model, ref_model, private_batch, public_batch,
                key, optimizer, device, kl_lambda, max_grad_norm,
+               keyed_l2_lambda=0.0, keyed_l2_plan=None,
                is_distributed=False, prior_keys=None):
     """Execute one finetuning step.
     
@@ -189,8 +237,9 @@ def train_step(model, raw_model, ref_model, private_batch, public_batch,
     optimizer.zero_grad()
     
     # === Step 1: R_KL on C1 (public architecture, no keys) ===
+    use_kl = kl_lambda > 0 and public_batch is not None and ref_model is not None
     loss_kl_value = 0.0
-    if kl_lambda > 0 and public_batch is not None and ref_model is not None:
+    if use_kl:
         public_ids = public_batch["input_ids"].to(device)
         
         # Use no_sync so KL backward doesn't trigger allreduce yet
@@ -213,7 +262,7 @@ def train_step(model, raw_model, ref_model, private_batch, public_batch,
         apply_permutation(raw_model, prior_key, plan=prior_plan)
     raw_model.apply_key(key)
     
-    if kl_lambda > 0:
+    if use_kl:
         # Swap KL gradients for all applied keys so they follow their weights
         swap_gradients(raw_model, key)
         for prior_key, prior_plan in reversed(prior_keys):
@@ -224,7 +273,8 @@ def train_step(model, raw_model, ref_model, private_batch, public_batch,
     labels = private_batch["labels"].to(device)
     outputs_c2 = model(private_ids, labels=labels)
     loss_priv = outputs_c2.loss
-    scaled_priv = (1 - kl_lambda) * loss_priv
+    effective_kl_lambda = kl_lambda if use_kl else 0.0
+    scaled_priv = (1 - effective_kl_lambda) * loss_priv
     
     with torch.no_grad():
         preds = outputs_c2.logits[:, :-1, :].argmax(dim=-1)
@@ -246,6 +296,11 @@ def train_step(model, raw_model, ref_model, private_batch, public_batch,
     # variance always sees weights at the same positions.
     torch.nn.utils.clip_grad_norm_(raw_model.parameters(), max_grad_norm)
     optimizer.step()
+    if keyed_l2_lambda > 0:
+        current_lr = optimizer.param_groups[0]["lr"]
+        apply_keyed_weight_decay(
+            raw_model, key, current_lr, keyed_l2_lambda, plan=keyed_l2_plan
+        )
     
     # === Step 7: Back to C1 ===
     raw_model.unapply_key(key)
@@ -459,6 +514,14 @@ def main():
         ref_model.eval()
         for param in ref_model.parameters():
             param.requires_grad = False
+
+    # If resuming finetuning, load model weights before optimizer construction
+    # so optimizer/scheduler state is attached to the correct parameter objects.
+    if args.resume_from:
+        if is_main:
+            print(f"Loading finetuning model weights from {args.resume_from}")
+        model = GPTNeoForCausalLMTiered.from_pretrained(args.resume_from)
+        model.to(device)
     
     # Keep raw_model reference for weight manipulation (apply_key, swap_gradients, etc.)
     raw_model = model
@@ -572,6 +635,8 @@ def main():
         raw_model.parameters(),
         lr=args.learning_rate,
         betas=(0.9, 0.95),
+        # Public params must stay frozen; decoupled WD would move them even with zero grad.
+        weight_decay=0.0,
     )
     
     # LR schedule: linear warmup + cosine decay
@@ -602,13 +667,9 @@ def main():
             print(f"Resumed finetuning state from step {global_step}")
             if cumulative_wall_secs > 0:
                 print(f"  Resumed cumulative wall time: {cumulative_wall_secs / 3600:.2f}h")
-        # Load model weights from resume checkpoint
-        raw_model = GPTNeoForCausalLMTiered.from_pretrained(args.resume_from)
-        raw_model.to(device)
-        if is_distributed:
-            model = DDP(raw_model, device_ids=[local_rank])
-        else:
-            model = raw_model
+
+    # Precompute keyed-mask plan once for keyed-only L2 penalty.
+    keyed_l2_plan = build_mask_plan(raw_model, key, device)
     
     # Wandb — resume on same graphs if we have a run ID (rank 0 only)
     if is_main:
@@ -703,7 +764,10 @@ def main():
     
     if is_main:
         print(f"Starting finetuning for {args.max_steps} steps...")
-        print(f"Objective: L_ft = (1-{args.kl_lambda})*L_priv + {args.kl_lambda}*R_KL")
+        effective_kl_lambda = args.kl_lambda if kl_enabled else 0.0
+        print(f"Objective: L_ft = (1-{effective_kl_lambda})*L_priv + {effective_kl_lambda}*R_KL")
+        if args.keyed_l2_lambda > 0:
+            print(f"Keyed-only decoupled weight decay (AdamW-style): {args.keyed_l2_lambda}")
         print(f"Validation every {args.eval_interval} steps")
         print(f"Tracking: C1 on retain, C1 on private, C2 on private")
     
@@ -739,6 +803,7 @@ def main():
         loss_priv, loss_kl, acc = train_step(
             model, raw_model, ref_model, private_batch, public_batch, key, 
             optimizer, device, args.kl_lambda, args.max_grad_norm,
+            keyed_l2_lambda=args.keyed_l2_lambda, keyed_l2_plan=keyed_l2_plan,
             is_distributed=is_distributed, prior_keys=prior_keys
         )
         scheduler.step()
@@ -759,7 +824,8 @@ def main():
         # Logging (rank 0 only)
         if is_main and global_step % args.log_interval == 0:
             ppl = math.exp(min(loss_priv, 100))
-            total_loss = (1 - args.kl_lambda) * loss_priv + args.kl_lambda * loss_kl
+            effective_kl_lambda = args.kl_lambda if kl_enabled else 0.0
+            total_loss = (1 - effective_kl_lambda) * loss_priv + effective_kl_lambda * loss_kl
             lr = optimizer.param_groups[0]["lr"]
 
             # Throughput
@@ -794,7 +860,8 @@ def main():
             wandb.log(log_dict)
         
         # Validation (rank 0 only — eval on raw_model)
-        if is_main and (global_step == 1 or global_step % args.eval_interval == 0):
+        do_eval = (global_step == 1 or global_step % args.eval_interval == 0)
+        if is_main and do_eval:
             print(f"\n[Validation @ Step {global_step}]")
             
             # Evaluate C1 + all keyed tiers on private/forget data
@@ -861,6 +928,10 @@ def main():
                               wandb_run_id=wandb_run_id,
                               cumulative_wall_secs=cumulative_wall_secs)
                 print(f"New best model saved to {save_path}")
+        
+        # In DDP, keep all ranks aligned around rank-0-only eval to avoid hangs.
+        if is_distributed and do_eval:
+            dist.barrier()
         
         # Save checkpoint (rank 0 only)
         if is_main and global_step % args.save_interval == 0:
