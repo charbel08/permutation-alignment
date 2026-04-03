@@ -291,6 +291,11 @@ def test_c2_cadence_and_dynamic_flops_logging(monkeypatch, tmp_path):
 
     ran_c2 = [int(x["train/ran_c2"]) for x in logs]
     assert ran_c2 == [1, 0, 1, 0, 1]
+    assert all("loss_c2" in x for x in logs)
+    assert all("acc_c2" in x for x in logs)
+    assert all("ppl_c2" in x for x in logs)
+    # Ensure non-C2 steps log finite C2 metrics instead of NaN.
+    assert all(float(x["loss_c2"]) == float(x["loss_c2"]) for x in logs)
 
     c2_cum = [int(x["perf/c2_passes_cumulative"]) for x in logs]
     assert c2_cum == [1, 1, 2, 2, 3]
@@ -330,6 +335,8 @@ def test_step_order_keeps_optimizer_in_c1_frame(monkeypatch, tmp_path):
         "unapply",
         "swap",
         "optimizer_step",
+        "apply",
+        "unapply",
         "optimizer_step",
         "apply",
         "scale",
@@ -344,10 +351,11 @@ def test_non_c2_steps_skip_keyed_path(monkeypatch, tmp_path):
     args = _default_args(tmp_path, max_steps=4, c2_every_k=3)
     c2k.train(args)
 
-    # C2 should run on steps 1 and 4 only.
-    assert ctx["events"].count("apply") == 2
+    # C2 updates run on steps 1 and 4 only. Non-C2 steps still do C2
+    # forward-only logging passes (apply+unapply, no scale/swap).
+    assert ctx["events"].count("apply") == 4
     assert ctx["events"].count("scale") == 2
-    assert ctx["events"].count("unapply") == 2
+    assert ctx["events"].count("unapply") == 4
     assert ctx["events"].count("swap") == 2
     assert ctx["events"].count("optimizer_step") == 4
 

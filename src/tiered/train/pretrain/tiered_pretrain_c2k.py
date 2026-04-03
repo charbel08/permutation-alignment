@@ -885,12 +885,32 @@ def train(args):
                         total_loss_c2 += loss_c2.item()
 
                     (loss_c2 * loss_scale).backward()
+        else:
+            # C2 metrics pass for logging only (no gradients / no updates).
+            apply_permutation(raw_model, key, plan=swap_plan)
+            with torch.no_grad():
+                for batch in micro_batches:
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        outputs_c2 = model(batch["input_ids"], labels=batch["labels"])
+                        loss_c2 = outputs_c2.loss
+
+                    preds_c2 = outputs_c2.logits[:, :-1, :].argmax(dim=-1)
+                    targets_c2 = batch["labels"][:, 1:]
+                    mask_c2 = targets_c2 != -100
+                    acc_c2 = (
+                        (preds_c2[mask_c2] == targets_c2[mask_c2]).float().mean().item()
+                        if mask_c2.any()
+                        else 0.0
+                    )
+                    total_acc_c2 += acc_c2
+                    total_loss_c2 += loss_c2.item()
+            unapply_permutation(raw_model, key, plan=swap_plan)
 
         # Average metrics over micro-steps
         avg_loss_c1 = total_loss_c1 / grad_accum_steps
-        avg_loss_c2 = (total_loss_c2 / grad_accum_steps) if do_c2 else float("nan")
+        avg_loss_c2 = total_loss_c2 / grad_accum_steps
         avg_acc_c1 = total_acc_c1 / grad_accum_steps
-        avg_acc_c2 = (total_acc_c2 / grad_accum_steps) if do_c2 else float("nan")
+        avg_acc_c2 = total_acc_c2 / grad_accum_steps
 
         if do_c2:
             # ── Gradient combination ──
@@ -931,11 +951,10 @@ def train(args):
         if pbar is not None:
             tps = tokens_per_step / step_elapsed if step_elapsed > 0 else 0.0
             pbar.update(1)
-            loss_c2_disp = f"{avg_loss_c2:.3f}" if do_c2 else "skip"
             pbar.set_postfix(
                 {
                     "loss_c1": f"{avg_loss_c1:.3f}",
-                    "loss_c2": loss_c2_disp,
+                    "loss_c2": f"{avg_loss_c2:.3f}",
                     "tok/s": f"{tps:,.0f}",
                 }
             )
@@ -943,7 +962,6 @@ def train(args):
         # Logging
         if is_main and global_step % args.log_interval == 0:
             ppl_c1 = math.exp(min(avg_loss_c1, 100))
-            ppl_c2 = math.exp(min(avg_loss_c2, 100)) if do_c2 else float("nan")
             lr = optimizer.param_groups[0]["lr"]
 
             tokens_per_sec = tokens_per_step / step_elapsed if step_elapsed > 0 else 0.0
@@ -962,7 +980,7 @@ def train(args):
                 "acc_c2": avg_acc_c2,
                 "acc_avg": ((avg_acc_c1 + avg_acc_c2) / 2) if do_c2 else avg_acc_c1,
                 "ppl_c1": ppl_c1,
-                "ppl_c2": ppl_c2,
+                "ppl_c2": math.exp(min(avg_loss_c2, 100)),
                 "lr": lr,
                 "grad_norm": grad_norm.item() if hasattr(grad_norm, "item") else grad_norm,
                 "train/step": global_step,
