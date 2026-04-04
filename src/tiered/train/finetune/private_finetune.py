@@ -31,6 +31,7 @@ import math
 import os
 import time
 from contextlib import nullcontext
+from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -46,8 +47,12 @@ from tqdm import tqdm
 from tiered.model import GPTNeoForCausalLMTiered
 from tiered.permutation import load_key, mask_public_gradients, swap_gradients, build_mask_plan
 from tiered.permutation.permute import apply_permutation, unapply_permutation, build_swap_plan
-from tiered.permutation.utils import _get_attention_module, _get_mlp_module
-from tiered.train.utils import save_checkpoint
+from tiered.train.utils import (
+    save_checkpoint,
+    build_keyed_param_masks,
+    adamw_step_preserving_public,
+    _merge_idx,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +142,7 @@ def parse_args():
         "--keyed_l2_lambda",
         type=float,
         default=0.01,
-        help="Keyed-only decoupled weight decay coefficient (AdamW-style, default: 0.01)",
+        help="AdamW weight decay applied to keyed (trainable) weights only (default: 0.01)",
     )
     parser.add_argument("--resume_from", type=str, default=None,
                         help="Path to finetuning checkpoint to resume from")
@@ -162,49 +167,9 @@ def parse_args():
     return parser.parse_args()
 
 
-def apply_keyed_weight_decay(raw_model, key, lr, weight_decay, plan=None):
-    """Apply decoupled AdamW-style weight decay to keyed weights only."""
-    if weight_decay <= 0:
-        return
-    if plan is None:
-        device = next(raw_model.parameters()).device
-        plan = build_mask_plan(raw_model, key, device)
-    decay = 1.0 - lr * weight_decay
-    if decay == 1.0:
-        return
-
-    with torch.no_grad():
-        for layer_idx, idx in plan.keyed_attn_indices.items():
-            attn = _get_attention_module(raw_model, layer_idx)
-            for proj_name in ("q_proj", "k_proj", "v_proj"):
-                getattr(attn, proj_name).weight[idx].mul_(decay)
-            attn.out_proj.weight[:, idx].mul_(decay)
-
-        for layer_idx, idx in plan.keyed_attn_out_indices.items():
-            attn = _get_attention_module(raw_model, layer_idx)
-            attn.out_proj.weight[:, idx].mul_(decay)
-
-        for layer_idx, idx in plan.keyed_mlp_indices.items():
-            mlp = _get_mlp_module(raw_model, layer_idx)
-            mlp.c_fc.weight[idx].mul_(decay)
-            if mlp.c_fc.bias is not None:
-                mlp.c_fc.bias[idx].mul_(decay)
-            mlp.c_proj.weight[:, idx].mul_(decay)
-
-        for layer_idx, idx in plan.keyed_mlp_up_indices.items():
-            mlp = _get_mlp_module(raw_model, layer_idx)
-            mlp.c_fc.weight[idx].mul_(decay)
-            if mlp.c_fc.bias is not None:
-                mlp.c_fc.bias[idx].mul_(decay)
-
-        for layer_idx, idx in plan.keyed_mlp_down_indices.items():
-            mlp = _get_mlp_module(raw_model, layer_idx)
-            mlp.c_proj.weight[:, idx].mul_(decay)
-
-
 def train_step(model, raw_model, ref_model, private_batch, public_batch,
                key, optimizer, device, kl_lambda, max_grad_norm,
-               keyed_l2_lambda=0.0, keyed_l2_plan=None,
+               keyed_param_masks=None, keyed_mask_plan=None,
                is_distributed=False, prior_keys=None):
     """Execute one finetuning step.
     
@@ -288,19 +253,30 @@ def train_step(model, raw_model, ref_model, private_batch, public_batch,
     # key's positions. This correctly kills:
     #   - Public grads (frozen during finetuning)
     #   - Prior tier grads (computed in scrambled context, can't be applied)
-    mask_public_gradients(raw_model, key)
-    
+    mask_public_gradients(raw_model, key, plan=keyed_mask_plan)
+
+    # Null out gradients for params entirely outside keyed_param_masks.
+    # mask_public_gradients leaves them as zero tensors (not None). PyTorch's
+    # AdamW skips a param only when grad is None — a zero-tensor grad still
+    # triggers weight decay (param *= 1 - lr*wd) and a momentum-driven update
+    # (exp_avg decays but stays non-zero from prior steps). Setting grad=None
+    # causes AdamW to skip these params entirely, including weight decay.
+    # adamw_step_preserving_public handles mixed params (those in keyed_param_masks
+    # with some public and some keyed positions) via its save/restore logic.
+    if keyed_param_masks:
+        for param in raw_model.parameters():
+            if param not in keyed_param_masks and param.grad is not None:
+                param.grad = None
+
     # === Step 6: Optimizer step IN C_{k+1} CONFIG ===
     # Safe because within a stage, the key configuration is constant
     # (same prior keys + same active key every step), so Adam momentum/
     # variance always sees weights at the same positions.
     torch.nn.utils.clip_grad_norm_(raw_model.parameters(), max_grad_norm)
-    optimizer.step()
-    if keyed_l2_lambda > 0:
-        current_lr = optimizer.param_groups[0]["lr"]
-        apply_keyed_weight_decay(
-            raw_model, key, current_lr, keyed_l2_lambda, plan=keyed_l2_plan
-        )
+    if keyed_param_masks:
+        adamw_step_preserving_public(optimizer, keyed_param_masks)
+    else:
+        optimizer.step()
     
     # === Step 7: Back to C1 ===
     raw_model.unapply_key(key)
@@ -630,13 +606,29 @@ def main():
             pin_memory=True,
         )
     
+    # Build keyed masks for active tier once. Used by grad masking and masked AdamW step.
+    keyed_mask_plan = build_mask_plan(raw_model, key, device)
+    keyed_param_masks = build_keyed_param_masks(raw_model, keyed_mask_plan)
+    keyed_params = list(keyed_param_masks.keys())
+    keyed_param_ids = {id(p) for p in keyed_params}
+    non_keyed_params = [p for p in raw_model.parameters() if id(p) not in keyed_param_ids]
+
     # Optimizer (β₂=0.95 standard for LLM training)
+    # Use stock AdamW behavior for keyed params, then restore public slices post-step.
+    decay_params = [p for p in keyed_params if p.dim() >= 2]
+    no_decay_params = [p for p in keyed_params if p.dim() < 2]
+    param_groups = []
+    if decay_params:
+        param_groups.append({"params": decay_params, "weight_decay": args.keyed_l2_lambda})
+    if no_decay_params:
+        param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
+    if non_keyed_params:
+        param_groups.append({"params": non_keyed_params, "weight_decay": 0.0})
+
     optimizer = torch.optim.AdamW(
-        raw_model.parameters(),
+        param_groups,
         lr=args.learning_rate,
         betas=(0.9, 0.95),
-        # Public params must stay frozen; decoupled WD would move them even with zero grad.
-        weight_decay=0.0,
     )
     
     # LR schedule: linear warmup + cosine decay
@@ -659,8 +651,16 @@ def main():
         training_state_path = os.path.join(args.resume_from, "training_state.pt")
         if os.path.exists(training_state_path):
             training_state = torch.load(training_state_path, map_location=device)
-            optimizer.load_state_dict(training_state["optimizer"])
-            scheduler.load_state_dict(training_state["scheduler"])
+            try:
+                optimizer.load_state_dict(training_state["optimizer"])
+                scheduler.load_state_dict(training_state["scheduler"])
+            except ValueError as exc:
+                raise RuntimeError(
+                    "Failed to resume optimizer/scheduler state due parameter-group mismatch. "
+                    "This usually means the checkpoint was created with an older private_finetune "
+                    "optimizer layout. Re-run without --resume_from, or resume from a checkpoint "
+                    "created by the current code."
+                ) from exc
             global_step = training_state["global_step"]
             wandb_run_id = training_state.get("wandb_run_id")
             cumulative_wall_secs = training_state.get("cumulative_wall_secs", 0.0)
@@ -668,9 +668,6 @@ def main():
             if cumulative_wall_secs > 0:
                 print(f"  Resumed cumulative wall time: {cumulative_wall_secs / 3600:.2f}h")
 
-    # Precompute keyed-mask plan once for keyed-only L2 penalty.
-    keyed_l2_plan = build_mask_plan(raw_model, key, device)
-    
     # Wandb — resume on same graphs if we have a run ID (rank 0 only)
     if is_main:
         if wandb_run_id:
@@ -767,7 +764,10 @@ def main():
         effective_kl_lambda = args.kl_lambda if kl_enabled else 0.0
         print(f"Objective: L_ft = (1-{effective_kl_lambda})*L_priv + {effective_kl_lambda}*R_KL")
         if args.keyed_l2_lambda > 0:
-            print(f"Keyed-only decoupled weight decay (AdamW-style): {args.keyed_l2_lambda}")
+            print(
+                f"AdamW weight decay on keyed params only (public restored post-step): "
+                f"{args.keyed_l2_lambda}"
+            )
         print(f"Validation every {args.eval_interval} steps")
         print(f"Tracking: C1 on retain, C1 on private, C2 on private")
     
@@ -803,7 +803,7 @@ def main():
         loss_priv, loss_kl, acc = train_step(
             model, raw_model, ref_model, private_batch, public_batch, key, 
             optimizer, device, args.kl_lambda, args.max_grad_norm,
-            keyed_l2_lambda=args.keyed_l2_lambda, keyed_l2_plan=keyed_l2_plan,
+            keyed_param_masks=keyed_param_masks, keyed_mask_plan=keyed_mask_plan,
             is_distributed=is_distributed, prior_keys=prior_keys
         )
         scheduler.step()

@@ -9,14 +9,14 @@ mkdir -p logs
 
 torchrun --standalone --nproc_per_node=8 -m tiered.train.pretrain.multi_tiered_naive \
     --data_path /work/scratch/data/datasets/fineweb/retain \
-    --output_dir /work/scratch/checkpoints/fineweb/tiered_pretrain_150m_5pct_naive \
-    --key_paths configs/keys/150m/both/key_5pct_1.json configs/keys/150m/both/key_5pct_2.json configs/keys/150m/both/key_5pct_3.json \
+    --output_dir /work/scratch/checkpoints/fineweb/tiered_pretrain_150m_7pct_naive \
+    --key_paths configs/keys/150m/both/key_7pct_1.json configs/keys/150m/both/key_7pct_2.json configs/keys/150m/both/key_7pct_3.json \
     --hidden_size 768 \
-    --intermediate_size 6144 \
+    --intermediate_size 2368 \
     --num_heads 12 \
     --num_layers 12 \
-    --context_size 2048 \
-    --batch_size 6 \
+    --context_size 1024 \
+    --batch_size 12 \
     --grad_accum_steps 2 \
     --learning_rate 4.2e-4 \
     --min_lr 4.2e-5 \
@@ -27,5 +27,5 @@ torchrun --standalone --nproc_per_node=8 -m tiered.train.pretrain.multi_tiered_n
     --eval_steps 75 \
     --save_interval 5000 \
     --wandb_project tiered-alignment-pretrain \
-    --run_name pretrain_150m_fineweb_3tiers_5pct_naive \
-    2>&1 | tee logs/pretrain_150m_fineweb_3tiers_5pct_naive_$(date +%Y%m%d_%H%M%S).log
+    --run_name pretrain_150m_fineweb_3tiers_7pct_naive \
+    2>&1 | tee logs/pretrain_150m_fineweb_3tiers_7pct_naive_$(date +%Y%m%d_%H%M%S).log

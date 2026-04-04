@@ -46,7 +46,12 @@ from tiered.permutation.permute import (
     swap_gradients,
     unapply_permutation,
 )
-from tiered.train.utils import load_model, save_checkpoint
+from tiered.train.utils import (
+    load_model,
+    save_checkpoint,
+    build_adamw_update_masks,
+    adamw_step_preserving_public,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -512,6 +517,14 @@ def train(args):
     # Keep a reference to the original model for permutation/masking ops.
     raw_model = model
 
+    # Precompute update masks for non-C2 steps.
+    # On steps where C2 doesn't run, keyed positions receive no gradient.
+    # mask_keyed_gradients leaves them as zero tensors (not None), so AdamW
+    # would still apply weight decay and residual momentum to them.
+    # build_adamw_update_masks([mask_plan]) marks keyed positions as frozen
+    # (False); pass to adamw_step_preserving_public instead of optimizer.step().
+    c1_only_update_masks = build_adamw_update_masks(raw_model, [mask_plan])
+
     # Compile the forward pass for fused kernels.
     model = torch.compile(model)
     if is_main:
@@ -931,8 +944,14 @@ def train(args):
             swap_gradients(raw_model, key, plan=swap_plan)
 
         # Clip and step in C1 arrangement (both C2 and non-C2 steps).
+        # On non-C2 steps, keyed positions have zero-tensor grads (no C2 backward
+        # ran), so a plain optimizer.step() would apply weight decay and residual
+        # momentum to them.  Use adamw_step_preserving_public to freeze them.
         grad_norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.max_grad_norm)
-        optimizer.step()
+        if do_c2:
+            optimizer.step()
+        else:
+            adamw_step_preserving_public(optimizer, c1_only_update_masks)
         scheduler.step()
 
         global_step += 1
