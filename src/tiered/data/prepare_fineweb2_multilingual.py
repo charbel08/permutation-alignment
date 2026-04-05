@@ -1,8 +1,8 @@
 """
 Prepare multilingual FineWeb2 subsets for private fine-tuning.
 
-Downloads parquet files for each language, tokenizes in parallel, chunks,
-and saves as HF DatasetDict with train/test splits.
+Downloads each language subset via HF datasets, tokenizes in parallel,
+chunks, and saves as HF DatasetDict with train/test splits.
 
 Example:
     python -m tiered.data.prepare_fineweb2_multilingual \
@@ -15,7 +15,6 @@ Example:
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import os
 import random
@@ -24,7 +23,6 @@ from pathlib import Path
 import numpy as np
 import tiktoken
 from datasets import DatasetDict, load_dataset
-from huggingface_hub import snapshot_download
 
 
 def _prepare_one_language(
@@ -34,35 +32,18 @@ def _prepare_one_language(
     max_chunks = max_tokens // chunk_size
     lang_dir = os.path.join(output_dir, lang)
     retain_dir = os.path.join(lang_dir, "retain")
-    download_dir = os.path.join(lang_dir, "_downloads")
 
     print(f"\n{'=' * 70}")
     print(f"{lang}: target {max_chunks:,} chunks ({max_tokens:,} tokens)")
     print(f"{'=' * 70}")
 
-    # Download only this language's parquet files
-    print(f"Downloading {lang} parquet files...")
-    local_dir = snapshot_download(
-        repo_id="HuggingFaceFW/fineweb-2",
-        repo_type="dataset",
-        local_dir=download_dir,
-        allow_patterns=f"data/{lang}/train/*.parquet",
-    )
-
-    parquet_files = sorted(glob.glob(
-        os.path.join(local_dir, "data", lang, "train", "*.parquet")
-    ))
-    print(f"  Found {len(parquet_files)} parquet files")
-
-    # Load and parallel tokenize + chunk
-    ds = load_dataset("parquet", data_files=parquet_files, split="train", num_proc=num_proc)
+    ds = load_dataset("HuggingFaceFW/fineweb-2", name=lang, split="train")
     print(f"  Loaded {len(ds):,} documents")
 
     eot = tokenizer.eot_token
 
     def tokenize_and_chunk(examples):
-        all_chunks = []
-        all_masks = []
+        all_chunks, all_masks = [], []
         all_tokens = []
         for tokens in tokenizer.encode_ordinary_batch(examples["text"]):
             all_tokens.extend(tokens)
@@ -81,15 +62,12 @@ def _prepare_one_language(
         desc=f"Tokenizing {lang}",
     )
 
-    # Trim to target
     if len(tokenized) > max_chunks:
-        print(f"Trimming to {max_chunks:,} chunks")
         tokenized = tokenized.select(range(max_chunks))
 
     n = len(tokenized)
     n_test = max(1, int(n * test_fraction))
-    print(f"  Train: {n - n_test:,} chunks, Test: {n_test:,} chunks")
-    print(f"  Total: {n * chunk_size:,} tokens")
+    print(f"  Train: {n - n_test:,}, Test: {n_test:,} ({n * chunk_size:,} tokens)")
 
     print(f"Saving to {retain_dir}...")
     DatasetDict({
