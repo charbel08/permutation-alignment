@@ -19,7 +19,7 @@ torchrun --standalone --nproc_per_node=8 -m tiered.train.pretrain.pretrain \
     --grad_accum_steps 4 \
     --learning_rate 2.8e-4 \
     --min_lr 2.8e-5 \
-    --max_steps 57766 \
+    --max_steps 70844 \
     --warmup_steps 1000 \
     --log_interval 1 \
     --eval_interval 1000 \
