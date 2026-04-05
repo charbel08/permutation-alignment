@@ -1,9 +1,9 @@
 """
 Prepare multilingual FineWeb2 subsets for private fine-tuning.
 
-Streams FineWeb2 language subsets from HF (no full download), tokenizes with
-GPT-2 tiktoken, chunks to fixed context length, and writes per-language HF
-DatasetDicts with train/test splits.
+Downloads a bounded portion of each FineWeb2 language subset from HF,
+tokenizes in parallel with GPT-2 tiktoken, chunks to fixed context length,
+and writes per-language HF DatasetDicts with train/test splits.
 
 Example:
     python -m tiered.data.prepare_fineweb2_multilingual \
@@ -16,7 +16,6 @@ Example:
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import os
 import random
@@ -24,8 +23,7 @@ from pathlib import Path
 
 import numpy as np
 import tiktoken
-from datasets import Dataset, DatasetDict, load_dataset
-from tqdm import tqdm
+from datasets import DatasetDict, load_dataset
 
 
 def _parse_args() -> argparse.Namespace:
@@ -47,16 +45,15 @@ def _parse_args() -> argparse.Namespace:
         help="Max tokens to produce per language (default: 5B)",
     )
     parser.add_argument("--test-fraction", type=float, default=0.005)
+    parser.add_argument("--num-proc", type=int, default=32)
+    parser.add_argument(
+        "--tokens-per-doc-estimate",
+        type=int,
+        default=200,
+        help="Estimated avg tokens per document (used to limit download size)",
+    )
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
-
-
-def _write_shard(shard_dir: str, shard_idx: int, chunks: list[list[int]], chunk_size: int):
-    path = os.path.join(shard_dir, f"shard_{shard_idx:06d}.parquet")
-    Dataset.from_dict({
-        "input_ids": chunks,
-        "attention_mask": [[1] * chunk_size] * len(chunks),
-    }).to_parquet(path)
 
 
 def _prepare_one_language(
@@ -66,78 +63,84 @@ def _prepare_one_language(
     chunk_size: int,
     max_tokens: int,
     test_fraction: float,
+    num_proc: int,
+    tokens_per_doc_estimate: int,
 ) -> None:
     max_chunks = max_tokens // chunk_size
     lang_dir = os.path.join(output_dir, lang)
-    shard_dir = os.path.join(lang_dir, "_shards")
     retain_dir = os.path.join(lang_dir, "retain")
-    os.makedirs(shard_dir, exist_ok=True)
+    os.makedirs(lang_dir, exist_ok=True)
+
+    # Download 2x estimated docs needed, to account for variance in doc length
+    docs_needed = (max_tokens // tokens_per_doc_estimate) * 2
+    split = f"train[:{docs_needed}]"
 
     print(f"\n{'=' * 70}")
-    print(f"Preparing: {lang} (streaming)")
+    print(f"Preparing: {lang}")
     print(f"Target: {max_chunks:,} chunks ({max_tokens:,} tokens)")
+    print(f"Downloading up to {docs_needed:,} docs ({split})")
     print(f"{'=' * 70}")
 
-    ds = load_dataset("HuggingFaceFW/fineweb-2", lang, split="train", streaming=True)
+    ds = load_dataset("HuggingFaceFW/fineweb-2", lang, split=split)
+    print(f"  Loaded {len(ds):,} documents")
 
+    # ── Tokenize + chunk (parallel) ──────────────────────────────────────
     eot = tokenizer.eot_token
-    token_buf: list[int] = []
-    shard_chunks: list[list[int]] = []
-    shard_idx = 0
-    n_chunks = 0
 
-    for doc in tqdm(ds, desc=f"{lang}: tokenizing", unit="doc"):
-        text = doc.get("text")
-        if not text:
-            continue
-        token_buf.extend(tokenizer.encode_ordinary(text))
-        token_buf.append(eot)
+    def tokenize_and_chunk(examples):
+        all_chunks = []
+        all_attention_masks = []
 
-        while len(token_buf) >= chunk_size and n_chunks < max_chunks:
-            shard_chunks.append(token_buf[:chunk_size])
-            token_buf = token_buf[chunk_size:]
-            n_chunks += 1
+        all_tokens = []
+        for tokens in tokenizer.encode_ordinary_batch(examples["text"]):
+            all_tokens.extend(tokens)
+            all_tokens.append(eot)
 
-            if len(shard_chunks) >= 10_000:
-                _write_shard(shard_dir, shard_idx, shard_chunks, chunk_size)
-                shard_idx += 1
-                shard_chunks = []
+        for i in range(0, len(all_tokens), chunk_size):
+            chunk = all_tokens[i : i + chunk_size]
+            if len(chunk) == chunk_size:
+                all_chunks.append(chunk)
+                all_attention_masks.append([1] * chunk_size)
 
-        if n_chunks >= max_chunks:
-            break
+        return {"input_ids": all_chunks, "attention_mask": all_attention_masks}
 
-    if shard_chunks:
-        _write_shard(shard_dir, shard_idx, shard_chunks, chunk_size)
+    print(f"Tokenizing and chunking ({num_proc} workers)...")
+    tokenized_ds = ds.map(
+        tokenize_and_chunk,
+        batched=True,
+        batch_size=1000,
+        remove_columns=ds.column_names,
+        num_proc=num_proc,
+        desc=f"Tokenizing {lang}",
+    )
 
-    print(f"  Chunks produced: {n_chunks:,} ({n_chunks * chunk_size:,} tokens)")
-    print(f"  Shards written:  {shard_idx + 1}")
+    # ── Trim + split ─────────────────────────────────────────────────────
+    if len(tokenized_ds) > max_chunks:
+        print(f"Trimming to {max_chunks:,} chunks ({max_tokens:,} tokens)")
+        tokenized_ds = tokenized_ds.select(range(max_chunks))
+    elif len(tokenized_ds) < max_chunks:
+        print(
+            f"  WARNING: only produced {len(tokenized_ds):,} chunks "
+            f"({len(tokenized_ds) * chunk_size:,} tokens), "
+            f"target was {max_chunks:,} chunks. "
+            f"Try increasing --tokens-per-doc-estimate or the dataset may not have enough data."
+        )
 
-    # ── Reassemble and split ─────────────────────────────────────────────
-    parquet_files = sorted(glob.glob(os.path.join(shard_dir, "*.parquet")))
-    full_ds = load_dataset("parquet", data_files=parquet_files, split="train")
-
-    n_test = max(1, int(len(full_ds) * test_fraction))
-    train_ds = full_ds.select(range(n_test, len(full_ds)))
-    test_ds = full_ds.select(range(n_test))
+    n_test = max(1, int(len(tokenized_ds) * test_fraction))
+    train_ds = tokenized_ds.select(range(n_test, len(tokenized_ds)))
+    test_ds = tokenized_ds.select(range(n_test))
 
     print(f"  Train: {len(train_ds):,} chunks ({len(train_ds) * chunk_size:,} tokens)")
     print(f"  Test:  {len(test_ds):,} chunks ({len(test_ds) * chunk_size:,} tokens)")
 
+    print(f"Saving to {retain_dir}...")
     DatasetDict({"train": train_ds, "test": test_ds}).save_to_disk(retain_dir, num_proc=2)
-
-    # ── Cleanup shards ───────────────────────────────────────────────────
-    for f in parquet_files:
-        os.remove(f)
-    try:
-        os.rmdir(shard_dir)
-    except OSError:
-        pass
 
     stats = {
         "language_subset": lang,
         "chunk_size": chunk_size,
-        "total_chunks": n_chunks,
-        "tokens_written": n_chunks * chunk_size,
+        "total_chunks": len(tokenized_ds),
+        "tokens_written": len(tokenized_ds) * chunk_size,
         "train_chunks": len(train_ds),
         "test_chunks": len(test_ds),
     }
@@ -161,7 +164,7 @@ def main() -> None:
     tokenizer = tiktoken.get_encoding("gpt2")
 
     print(f"{'=' * 70}")
-    print("FineWeb2 data preparation (streaming)")
+    print("FineWeb2 data preparation")
     print(f"Output dir: {args.output_dir}")
     print(f"Languages:  {', '.join(args.languages)}")
     print(f"Chunk size: {args.chunk_size}")
@@ -176,6 +179,8 @@ def main() -> None:
             chunk_size=args.chunk_size,
             max_tokens=args.max_tokens_per_language,
             test_fraction=args.test_fraction,
+            num_proc=args.num_proc,
+            tokens_per_doc_estimate=args.tokens_per_doc_estimate,
         )
 
     print("\nDone.")
