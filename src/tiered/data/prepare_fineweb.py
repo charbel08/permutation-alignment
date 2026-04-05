@@ -8,7 +8,7 @@ Usage:
     export HF_HUB_ENABLE_HF_TRANSFER=1
     python -m tiered.data.prepare_fineweb \
         --output-dir /work/scratch/data/datasets/fineweb \
-        --chunk-size 1024 \
+        --chunk-size 2048 \
         --max-tokens 100000000000 \
         --subset sample-100BT
 """
@@ -27,7 +27,7 @@ from tqdm import tqdm
 def main():
     parser = argparse.ArgumentParser(description="Prepare FineWeb for pretraining")
     parser.add_argument("--output-dir", type=str, required=True)
-    parser.add_argument("--chunk-size", type=int, default=1024)
+    parser.add_argument("--chunk-size", type=int, default=2048)
     parser.add_argument("--max-tokens", type=int, default=100_000_000_000)
     parser.add_argument("--subset", type=str, default="sample-100BT",
                         help="sample-10BT, sample-100BT, sample-350BT, or default")

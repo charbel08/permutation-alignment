@@ -50,7 +50,12 @@ from tiered.permutation.permute import (
     SwapPlan,
 )
 from tiered.permutation.utils import _get_attention_module, _get_mlp_module
-from tiered.train.utils import load_model, save_checkpoint
+from tiered.train.utils import (
+    load_model,
+    save_checkpoint,
+    build_adamw_update_masks,
+    adamw_step_preserving_public,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +168,10 @@ class TierInfo:
     swap_plan: SwapPlan
     mask_plan: MaskPlan
     steps_sampled: int = 0
+    # Precomputed for adamw_step_preserving_public: True = update, False = freeze.
+    # Frozen positions = all other tiers' keyed positions (they receive no C_k
+    # gradient on steps where this tier is not active).
+    adamw_update_masks: dict = None
 
 
 def parse_args():
@@ -366,6 +375,17 @@ def train(args):
                   f"{len(swap_plan.attn_ops)} swap ops")
 
     raw_model = model
+
+    # Precompute per-tier AdamW update masks (before torch.compile).
+    # On each step only one tier's keyed positions receive a C_k gradient;
+    # the other tiers' keyed positions have zero-tensor grads from
+    # mask_keyed_gradients.  A plain optimizer.step() would still apply
+    # weight decay and residual momentum to those positions.
+    # Each tier's adamw_update_masks freezes all *other* tiers' keyed positions.
+    for tier in tiers:
+        inactive_plans = [t.mask_plan for t in tiers if t is not tier]
+        tier.adamw_update_masks = build_adamw_update_masks(raw_model, inactive_plans)
+
     model = torch.compile(model)
     if is_main:
         print("torch.compile enabled")
@@ -656,8 +676,11 @@ def train(args):
         swap_gradients(raw_model, active_tier.key, plan=active_tier.swap_plan)
 
         # ── Clip, step, schedule (all in C1 frame) ──
+        # Non-active tiers' keyed positions have zero-tensor grads (no C_k
+        # backward ran for them).  Use adamw_step_preserving_public to prevent
+        # weight decay and residual momentum from updating those positions.
         grad_norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.max_grad_norm)
-        optimizer.step()
+        adamw_step_preserving_public(optimizer, active_tier.adamw_update_masks)
         scheduler.step()
 
         global_step += 1

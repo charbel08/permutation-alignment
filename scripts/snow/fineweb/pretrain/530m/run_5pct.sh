@@ -7,9 +7,10 @@ cd /work/permutation-alignment
 
 mkdir -p logs
 
-torchrun --standalone --nproc_per_node=8 -m tiered.train.pretrain.pretrain \
+torchrun --standalone --nproc_per_node=8 -m tiered.train.pretrain.tiered_pretrain \
     --data_path /work/scratch/data/datasets/fineweb/retain \
-    --output_dir /work/scratch/checkpoints/fineweb/baseline_pretrain_530m \
+    --output_dir /work/scratch/checkpoints/fineweb/tiered_pretrain_530m_5pct \
+    --key_path /work/permutation-alignment/configs/keys/530m/both/key_5pct.json \
     --hidden_size 1344 \
     --intermediate_size 10752 \
     --num_heads 16 \
@@ -26,5 +27,5 @@ torchrun --standalone --nproc_per_node=8 -m tiered.train.pretrain.pretrain \
     --eval_steps 75 \
     --save_interval 5000 \
     --wandb_project main-pretrain \
-    --run_name baseline_pretrain_530m_fineweb \
-    2>&1 | tee logs/baseline_pretrain_530m_fineweb_$(date +%Y%m%d_%H%M%S).log
+    --run_name pretrain_530m_fineweb_5pct \
+    2>&1 | tee logs/pretrain_530m_fineweb_5pct_$(date +%Y%m%d_%H%M%S).log
