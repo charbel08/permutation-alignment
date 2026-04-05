@@ -22,9 +22,9 @@ torchrun --standalone --nproc_per_node=8 -m tiered.train.pretrain.pretrain \
     --max_steps 38147 \
     --warmup_steps 1000 \
     --log_interval 1 \
-    --eval_interval 1000 \
+    --eval_interval 400 \
     --eval_steps 75 \
     --save_interval 5000 \
-    --wandb_project tiered-alignment-pretrain \
+    --wandb_project main-pretrain \
     --run_name baseline_pretrain_150m_fineweb \
     2>&1 | tee logs/baseline_pretrain_150m_fineweb_$(date +%Y%m%d_%H%M%S).log
