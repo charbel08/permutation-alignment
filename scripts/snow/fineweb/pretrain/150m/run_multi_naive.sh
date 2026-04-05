@@ -10,7 +10,7 @@ mkdir -p logs
 torchrun --standalone --nproc_per_node=8 -m tiered.train.pretrain.multi_tiered_naive \
     --data_path /work/scratch/data/datasets/fineweb/retain \
     --output_dir /work/scratch/checkpoints/fineweb/tiered_pretrain_150m_5pct_naive \
-    --key_paths configs/keys/150m/both/key_5pct_1.json configs/keys/150m/both/key_5pct_2.json configs/keys/150m/both/key_5pct_3.json \
+    --key_paths /work/permutation-alignment/configs/keys/150m/both/key_5pct_1.json /work/permutation-alignment/configs/keys/150m/both/key_5pct_2.json /work/permutation-alignment/configs/keys/150m/both/key_5pct_3.json \
     --hidden_size 768 \
     --intermediate_size 6144 \
     --num_heads 12 \
