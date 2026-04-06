@@ -773,6 +773,64 @@ def main():
     # Cumulative trackers
     cumulative_tokens = global_step * (tokens_private_per_step + tokens_public_per_step)
     train_start_wall = time.time()
+
+    def run_validation(step_for_logging: int) -> float:
+        """Run full validation pass and return active-tier private loss."""
+        print(f"\n[Validation @ Step {step_for_logging}]")
+
+        # Evaluate C1 + all keyed tiers on private/forget data
+        val_log = {"train/step": step_for_logging}
+
+        # C1 (public, no key) on private data
+        c1_private = evaluate_on_dataset(
+            raw_model, private_val_loader, key, device,
+            num_steps=args.eval_steps, eval_c2=False
+        )
+        print(f"  Private data:")
+        print(f"    C1: loss={c1_private['loss_c1']:.4f}, ppl={c1_private['ppl_c1']:.2f}, acc={c1_private['acc_c1']:.4f}")
+        val_log["Val Private/C1 Loss"] = c1_private["loss_c1"]
+        val_log["Val Private/C1 Perplexity"] = c1_private["ppl_c1"]
+        val_log["Val Private/C1 Accuracy"] = c1_private["acc_c1"]
+
+        for tier_label, eval_key in all_keys.items():
+            tier_metrics = evaluate_on_dataset(
+                raw_model, private_val_loader, eval_key, device,
+                num_steps=args.eval_steps, eval_c2=True,
+                prior_keys=all_eval_prior_keys.get(tier_label, [])
+            )
+            tag = "★" if tier_label == active_tier_label else " "
+            print(f"  {tag} {tier_label}: loss={tier_metrics['loss_c2']:.4f}, ppl={tier_metrics['ppl_c2']:.2f}, acc={tier_metrics['acc_c2']:.4f}")
+            val_log[f"Val Private/{tier_label} Loss"] = tier_metrics["loss_c2"]
+            val_log[f"Val Private/{tier_label} Perplexity"] = tier_metrics["ppl_c2"]
+            val_log[f"Val Private/{tier_label} Accuracy"] = tier_metrics["acc_c2"]
+
+        # Evaluate C1 + all keyed tiers on retain data
+        if retain_val_loader is not None:
+            c1_retain = evaluate_on_dataset(
+                raw_model, retain_val_loader, key, device,
+                num_steps=args.eval_steps, eval_c2=False
+            )
+            print(f"  Retain data:")
+            print(f"    C1: loss={c1_retain['loss_c1']:.4f}, ppl={c1_retain['ppl_c1']:.2f}, acc={c1_retain['acc_c1']:.4f}")
+            val_log["Val Retain/C1 Loss"] = c1_retain["loss_c1"]
+            val_log["Val Retain/C1 Perplexity"] = c1_retain["ppl_c1"]
+            val_log["Val Retain/C1 Accuracy"] = c1_retain["acc_c1"]
+
+            for tier_label, eval_key in all_keys.items():
+                tier_metrics = evaluate_on_dataset(
+                    raw_model, retain_val_loader, eval_key, device,
+                    num_steps=args.eval_steps, eval_c2=True,
+                    prior_keys=all_eval_prior_keys.get(tier_label, [])
+                )
+                tag = "★" if tier_label == active_tier_label else " "
+                print(f"  {tag} {tier_label}: loss={tier_metrics['loss_c2']:.4f}, ppl={tier_metrics['ppl_c2']:.2f}, acc={tier_metrics['acc_c2']:.4f}")
+                val_log[f"Val Retain/{tier_label} Loss"] = tier_metrics["loss_c2"]
+                val_log[f"Val Retain/{tier_label} Perplexity"] = tier_metrics["ppl_c2"]
+                val_log[f"Val Retain/{tier_label} Accuracy"] = tier_metrics["acc_c2"]
+
+        wandb.log(val_log)
+        print()
+        return val_log.get(f"Val Private/{active_tier_label} Loss", float("inf"))
     
     # Training loop
     private_iter = iter(private_loader)
@@ -793,6 +851,20 @@ def main():
         print(f"Tracking: C1 on retain, C1 on private, C2 on private")
     
     pbar = tqdm(total=args.max_steps, desc="Finetuning", initial=global_step) if is_main else None
+
+    # Initial baseline validation before any optimizer step/backprop in this run.
+    if global_step == 0 and is_main:
+        initial_active_loss = run_validation(step_for_logging=0)
+        if initial_active_loss < best_val_loss:
+            best_val_loss = initial_active_loss
+            save_path = os.path.join(args.output_dir, "best")
+            save_checkpoint(raw_model, tokenizer, optimizer, save_path,
+                          scheduler=scheduler, global_step=global_step,
+                          wandb_run_id=wandb_run_id,
+                          cumulative_wall_secs=cumulative_wall_secs)
+            print(f"Initial best model saved to {save_path}")
+    if is_distributed and global_step == 0:
+        dist.barrier()
     
     while global_step < args.max_steps:
         # ── Step timing ──
@@ -883,64 +955,7 @@ def main():
         # Validation (rank 0 only — eval on raw_model)
         do_eval = (global_step == 1 or global_step % args.eval_interval == 0)
         if is_main and do_eval:
-            print(f"\n[Validation @ Step {global_step}]")
-            
-            # Evaluate C1 + all keyed tiers on private/forget data
-            val_log = {"train/step": global_step}
-            
-            # C1 (public, no key) on private data
-            c1_private = evaluate_on_dataset(
-                raw_model, private_val_loader, key, device,
-                num_steps=args.eval_steps, eval_c2=False
-            )
-            print(f"  Private data:")
-            print(f"    C1: loss={c1_private['loss_c1']:.4f}, ppl={c1_private['ppl_c1']:.2f}, acc={c1_private['acc_c1']:.4f}")
-            val_log["Val Private/C1 Loss"] = c1_private["loss_c1"]
-            val_log["Val Private/C1 Perplexity"] = c1_private["ppl_c1"]
-            val_log["Val Private/C1 Accuracy"] = c1_private["acc_c1"]
-            
-            for tier_label, eval_key in all_keys.items():
-                tier_metrics = evaluate_on_dataset(
-                    raw_model, private_val_loader, eval_key, device, 
-                    num_steps=args.eval_steps, eval_c2=True,
-                    prior_keys=all_eval_prior_keys.get(tier_label, [])
-                )
-                tag = "★" if tier_label == active_tier_label else " "
-                print(f"  {tag} {tier_label}: loss={tier_metrics['loss_c2']:.4f}, ppl={tier_metrics['ppl_c2']:.2f}, acc={tier_metrics['acc_c2']:.4f}")
-                val_log[f"Val Private/{tier_label} Loss"] = tier_metrics["loss_c2"]
-                val_log[f"Val Private/{tier_label} Perplexity"] = tier_metrics["ppl_c2"]
-                val_log[f"Val Private/{tier_label} Accuracy"] = tier_metrics["acc_c2"]
-            
-            # Evaluate C1 + all keyed tiers on retain data
-            if retain_val_loader is not None:
-                c1_retain = evaluate_on_dataset(
-                    raw_model, retain_val_loader, key, device,
-                    num_steps=args.eval_steps, eval_c2=False
-                )
-                print(f"  Retain data:")
-                print(f"    C1: loss={c1_retain['loss_c1']:.4f}, ppl={c1_retain['ppl_c1']:.2f}, acc={c1_retain['acc_c1']:.4f}")
-                val_log["Val Retain/C1 Loss"] = c1_retain["loss_c1"]
-                val_log["Val Retain/C1 Perplexity"] = c1_retain["ppl_c1"]
-                val_log["Val Retain/C1 Accuracy"] = c1_retain["acc_c1"]
-                
-                for tier_label, eval_key in all_keys.items():
-                    tier_metrics = evaluate_on_dataset(
-                        raw_model, retain_val_loader, eval_key, device,
-                        num_steps=args.eval_steps, eval_c2=True,
-                        prior_keys=all_eval_prior_keys.get(tier_label, [])
-                    )
-                    tag = "★" if tier_label == active_tier_label else " "
-                    print(f"  {tag} {tier_label}: loss={tier_metrics['loss_c2']:.4f}, ppl={tier_metrics['ppl_c2']:.2f}, acc={tier_metrics['acc_c2']:.4f}")
-                    val_log[f"Val Retain/{tier_label} Loss"] = tier_metrics["loss_c2"]
-                    val_log[f"Val Retain/{tier_label} Perplexity"] = tier_metrics["ppl_c2"]
-                    val_log[f"Val Retain/{tier_label} Accuracy"] = tier_metrics["acc_c2"]
-            
-            wandb.log(val_log)
-            
-            print()
-            
-            # Save best model based on active tier's loss on private data
-            active_c2_loss = val_log.get(f"Val Private/{active_tier_label} Loss", float('inf'))
+            active_c2_loss = run_validation(step_for_logging=global_step)
             if active_c2_loss < best_val_loss:
                 best_val_loss = active_c2_loss
                 save_path = os.path.join(args.output_dir, "best")
