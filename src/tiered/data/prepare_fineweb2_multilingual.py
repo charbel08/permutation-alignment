@@ -1,8 +1,8 @@
 """
 Prepare multilingual FineWeb2 subsets for private fine-tuning.
 
-Downloads each language subset via HF datasets, tokenizes in parallel,
-chunks, and saves as HF DatasetDict with train/test splits.
+Downloads a bounded slice of each language subset via HF datasets,
+tokenizes in parallel, chunks, and saves as HF DatasetDict.
 
 Example:
     python -m tiered.data.prepare_fineweb2_multilingual \
@@ -33,11 +33,18 @@ def _prepare_one_language(
     lang_dir = os.path.join(output_dir, lang)
     retain_dir = os.path.join(lang_dir, "retain")
 
+    # ~500 tokens/doc on average, grab 2x to be safe
+    docs_to_download = (max_tokens // 500) * 2
+
     print(f"\n{'=' * 70}")
     print(f"{lang}: target {max_chunks:,} chunks ({max_tokens:,} tokens)")
+    print(f"  Downloading {docs_to_download:,} docs")
     print(f"{'=' * 70}")
 
-    ds = load_dataset("HuggingFaceFW/fineweb-2", name=lang, split="train")
+    ds = load_dataset(
+        "HuggingFaceFW/fineweb-2", name=lang,
+        split=f"train[:{docs_to_download}]",
+    )
     print(f"  Loaded {len(ds):,} documents")
 
     eot = tokenizer.eot_token
@@ -62,7 +69,9 @@ def _prepare_one_language(
         desc=f"Tokenizing {lang}",
     )
 
-    if len(tokenized) > max_chunks:
+    if len(tokenized) < max_chunks:
+        print(f"  WARNING: only got {len(tokenized):,} chunks, wanted {max_chunks:,}")
+    else:
         tokenized = tokenized.select(range(max_chunks))
 
     n = len(tokenized)
