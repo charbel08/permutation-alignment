@@ -312,7 +312,7 @@ def evaluate_on_dataset(model, dataloader, key, device, num_steps=50, eval_c2=Fa
         prior_keys = []
     
     model.eval()
-    
+
     total_loss_c1 = 0.0
     total_acc_c1 = 0.0
     total_top3_c1 = 0.0
@@ -320,75 +320,76 @@ def evaluate_on_dataset(model, dataloader, key, device, num_steps=50, eval_c2=Fa
     total_acc_c2 = 0.0
     total_top3_c2 = 0.0
     num_batches = 0
-    
+
     data_iter = iter(dataloader)
-    
-    for _ in range(num_steps):
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            data_iter = iter(dataloader)
-            batch = next(data_iter)
-        
-        input_ids = batch["input_ids"].to(device)
-        labels = batch["labels"].to(device)
-        
-        # Evaluate C1 (public architecture)
-        outputs_c1 = model(input_ids, labels=labels)
-        loss_c1 = outputs_c1.loss.item()
-        logits_c1 = outputs_c1.logits[:, :-1, :]
-        targets = labels[:, 1:]
-        preds_c1 = logits_c1.argmax(dim=-1)
-        valid = targets != -100
-        if valid.any():
-            acc_c1 = (preds_c1[valid] == targets[valid]).float().mean().item()
-        else:
-            acc_c1 = 0.0
-        top3_c1 = logits_c1.topk(3, dim=-1).indices
-        if valid.any():
-            top3_acc_c1 = (
-                (top3_c1[valid] == targets[valid].unsqueeze(-1)).any(dim=-1).float().mean().item()
-            )
-        else:
-            top3_acc_c1 = 0.0
-        
-        total_loss_c1 += loss_c1
-        total_acc_c1 += acc_c1
-        total_top3_c1 += top3_acc_c1
-        
-        # Evaluate C2 (or cumulative C_{k+1}) if requested
-        if eval_c2:
-            # Apply prior keys (cumulative context), then eval key
-            for prior_key, prior_plan in prior_keys:
-                apply_permutation(model, prior_key, plan=prior_plan)
-            model.apply_key(key)
-            
-            outputs_c2 = model(input_ids, labels=labels)
-            loss_c2 = outputs_c2.loss.item()
-            logits_c2 = outputs_c2.logits[:, :-1, :]
-            preds_c2 = logits_c2.argmax(dim=-1)
+
+    with torch.no_grad():
+        for _ in range(num_steps):
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                data_iter = iter(dataloader)
+                batch = next(data_iter)
+
+            input_ids = batch["input_ids"].to(device)
+            labels = batch["labels"].to(device)
+
+            # Evaluate C1 (public architecture)
+            outputs_c1 = model(input_ids, labels=labels)
+            loss_c1 = outputs_c1.loss.item()
+            logits_c1 = outputs_c1.logits[:, :-1, :]
+            targets = labels[:, 1:]
+            preds_c1 = logits_c1.argmax(dim=-1)
+            valid = targets != -100
             if valid.any():
-                acc_c2 = (preds_c2[valid] == targets[valid]).float().mean().item()
+                acc_c1 = (preds_c1[valid] == targets[valid]).float().mean().item()
             else:
-                acc_c2 = 0.0
-            top3_c2 = logits_c2.topk(3, dim=-1).indices
+                acc_c1 = 0.0
+            top3_c1 = logits_c1.topk(3, dim=-1).indices
             if valid.any():
-                top3_acc_c2 = (
-                    (top3_c2[valid] == targets[valid].unsqueeze(-1)).any(dim=-1).float().mean().item()
+                top3_acc_c1 = (
+                    (top3_c1[valid] == targets[valid].unsqueeze(-1)).any(dim=-1).float().mean().item()
                 )
             else:
-                top3_acc_c2 = 0.0
-            
-            # Unapply in reverse
-            model.unapply_key(key)
-            for prior_key, prior_plan in reversed(prior_keys):
-                unapply_permutation(model, prior_key, plan=prior_plan)
-            
-            total_loss_c2 += loss_c2
-            total_acc_c2 += acc_c2
-            total_top3_c2 += top3_acc_c2
-        
-        num_batches += 1
+                top3_acc_c1 = 0.0
+
+            total_loss_c1 += loss_c1
+            total_acc_c1 += acc_c1
+            total_top3_c1 += top3_acc_c1
+
+            # Evaluate C2 (or cumulative C_{k+1}) if requested
+            if eval_c2:
+                # Apply prior keys (cumulative context), then eval key
+                for prior_key, prior_plan in prior_keys:
+                    apply_permutation(model, prior_key, plan=prior_plan)
+                model.apply_key(key)
+
+                outputs_c2 = model(input_ids, labels=labels)
+                loss_c2 = outputs_c2.loss.item()
+                logits_c2 = outputs_c2.logits[:, :-1, :]
+                preds_c2 = logits_c2.argmax(dim=-1)
+                if valid.any():
+                    acc_c2 = (preds_c2[valid] == targets[valid]).float().mean().item()
+                else:
+                    acc_c2 = 0.0
+                top3_c2 = logits_c2.topk(3, dim=-1).indices
+                if valid.any():
+                    top3_acc_c2 = (
+                        (top3_c2[valid] == targets[valid].unsqueeze(-1)).any(dim=-1).float().mean().item()
+                    )
+                else:
+                    top3_acc_c2 = 0.0
+
+                # Unapply in reverse
+                model.unapply_key(key)
+                for prior_key, prior_plan in reversed(prior_keys):
+                    unapply_permutation(model, prior_key, plan=prior_plan)
+
+                total_loss_c2 += loss_c2
+                total_acc_c2 += acc_c2
+                total_top3_c2 += top3_acc_c2
+
+            num_batches += 1
     
     model.train()
 
