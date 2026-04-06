@@ -29,11 +29,13 @@ PUBLIC_DATA=${PUBLIC_DATA:-/work/scratch/data/datasets/fineweb/retain}
 KL_TAG=${KL_LAMBDA//./p}
 OUTPUT_DIR=${OUTPUT_DIR:-/work/scratch/checkpoints/fineweb/private_finetune_150m_fineweb2_spa_key${KEY_SIZE}pct_kl${KL_TAG}}
 
-NGPUS=${NGPUS:-4}
-BATCH_SIZE=${BATCH_SIZE:-16}
+NGPUS=${NGPUS:-8}
+BATCH_SIZE=${BATCH_SIZE:-8}
 LR=${LR:-1e-5}
 MIN_LR=${MIN_LR:-1e-6}
 MAX_STEPS=${MAX_STEPS:-}
+TARGET_PRIVATE_TOKENS=${TARGET_PRIVATE_TOKENS:-2000000000}
+CONTEXT_SIZE=${CONTEXT_SIZE:-2048}
 WARMUP_STEPS=${WARMUP_STEPS:-100}
 KEYED_L2_LAMBDA=${KEYED_L2_LAMBDA:-0.01}
 EVAL_INTERVAL=${EVAL_INTERVAL:-500}
@@ -79,6 +81,7 @@ PY
 # private_finetune uses DistributedSampler(drop_last=False) + DataLoader(drop_last=True).
 SAMPLES_PER_RANK=$(( (TRAIN_SAMPLES + NGPUS - 1) / NGPUS ))
 STEPS_PER_EPOCH=$(( SAMPLES_PER_RANK / BATCH_SIZE ))
+TOKENS_PER_STEP=$(( NGPUS * BATCH_SIZE * CONTEXT_SIZE ))
 
 if [ "$STEPS_PER_EPOCH" -lt 1 ]; then
     echo "Computed <1 step/epoch. Adjust BATCH_SIZE/NGPUS."
@@ -88,9 +91,11 @@ fi
 if [ -n "$MAX_STEPS" ]; then
     RUN_MAX_STEPS="$MAX_STEPS"
 else
-    # Default: exactly 1 epoch on Spanish private train split.
-    RUN_MAX_STEPS="$STEPS_PER_EPOCH"
+    # Default: target a fixed private-token budget.
+    RUN_MAX_STEPS=$(( (TARGET_PRIVATE_TOKENS + TOKENS_PER_STEP - 1) / TOKENS_PER_STEP ))
 fi
+
+TARGET_PRIVATE_TOKENS_ACTUAL=$(( RUN_MAX_STEPS * TOKENS_PER_STEP ))
 
 echo "=========================================================="
 echo "Private finetune (Spanish FineWeb2, 150M tiered)"
@@ -102,9 +107,12 @@ echo "  Private data:   ${PRIVATE_DATA}"
 echo "  Public data:    ${PUBLIC_DATA}"
 echo "  Output dir:     ${OUTPUT_DIR}"
 echo "  GPUs:           ${NGPUS}"
+echo "  Context size:   ${CONTEXT_SIZE}"
+echo "  Tokens/step:    ${TOKENS_PER_STEP}"
 echo "  Train rows:     ${TRAIN_SAMPLES}"
 echo "  Steps/epoch:    ${STEPS_PER_EPOCH}"
 echo "  Max steps:      ${RUN_MAX_STEPS}"
+echo "  Target tokens:  ${TARGET_PRIVATE_TOKENS} (actual: ${TARGET_PRIVATE_TOKENS_ACTUAL})"
 echo "=========================================================="
 
 LOG_FILE="logs/${RUN_NAME}_$(date +%Y%m%d_%H%M%S).log"
