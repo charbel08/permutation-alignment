@@ -30,7 +30,7 @@ KL_TAG=${KL_LAMBDA//./p}
 OUTPUT_DIR=${OUTPUT_DIR:-/work/scratch/checkpoints/fineweb/private_finetune_150m_fineweb2_spa_key${KEY_SIZE}pct_kl${KL_TAG}}
 
 NGPUS=${NGPUS:-4}
-BATCH_SIZE=${BATCH_SIZE:-8}
+BATCH_SIZE=${BATCH_SIZE:-16}
 LR=${LR:-1e-5}
 MIN_LR=${MIN_LR:-1e-6}
 MAX_STEPS=${MAX_STEPS:-}
