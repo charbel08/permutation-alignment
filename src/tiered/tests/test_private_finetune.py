@@ -12,6 +12,7 @@ is implemented correctly, specifically:
 """
 
 import copy
+import os
 from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
@@ -689,6 +690,157 @@ class TestMaskedAccuracySemantics:
 
         assert metrics["acc_c1"] == pytest.approx(1.0), \
             "evaluate_on_dataset accuracy must ignore -100 labels"
+
+
+class _TinyDataset(torch.utils.data.Dataset):
+    def __init__(self, rows):
+        self._rows = rows
+        self.column_names = list(rows[0].keys()) if rows else ["input_ids", "attention_mask"]
+
+    def __len__(self):
+        return len(self._rows)
+
+    def __getitem__(self, idx):
+        return self._rows[idx]
+
+    def select(self, indices):
+        if isinstance(indices, range):
+            indices = list(indices)
+        return _TinyDataset([self._rows[i] for i in indices])
+
+    def remove_columns(self, cols):
+        keep = [c for c in self.column_names if c not in cols]
+        new_rows = [{k: v for k, v in row.items() if k in keep} for row in self._rows]
+        out = _TinyDataset(new_rows)
+        out.column_names = keep
+        return out
+
+
+class _DummyCollator:
+    def __call__(self, examples):
+        input_ids = torch.stack([torch.tensor(ex["input_ids"], dtype=torch.long) for ex in examples], dim=0)
+        return {"input_ids": input_ids, "labels": input_ids.clone()}
+
+
+class _DummyModelMain(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.zeros(1))
+        self.config = SimpleNamespace(max_position_embeddings=2048)
+
+    def to(self, device):
+        return self
+
+    def apply_key(self, _key):
+        return None
+
+    def unapply_key(self, _key):
+        return None
+
+    def save_pretrained(self, _path):
+        return None
+
+    @classmethod
+    def from_pretrained(cls, _checkpoint):
+        return cls()
+
+
+class _DummyWandb:
+    def __init__(self):
+        self.run = SimpleNamespace(id="dummy-run", summary={})
+        self.config = SimpleNamespace(update=lambda *args, **kwargs: None)
+
+    def init(self, **kwargs):
+        return self.run
+
+    def define_metric(self, *args, **kwargs):
+        return None
+
+    def log(self, *args, **kwargs):
+        return None
+
+    def finish(self):
+        return None
+
+
+def _make_tiny_dataset_dict():
+    rows = [
+        {"input_ids": [1, 2, 3, 4], "attention_mask": [1, 1, 1, 1]},
+        {"input_ids": [5, 6, 7, 8], "attention_mask": [1, 1, 1, 1]},
+    ]
+    ds = _TinyDataset(rows)
+    return {"train": ds, "test": ds}
+
+
+class TestInitialValidationOrder:
+    def test_main_runs_step0_validation_before_first_train_step(self, monkeypatch, tmp_path):
+        from tiered.train.finetune import private_finetune as pf
+
+        events = []
+
+        # Keep execution on a tiny mocked path.
+        monkeypatch.setattr(
+            pf,
+            "parse_args",
+            lambda: SimpleNamespace(
+                checkpoint="dummy-checkpoint",
+                key_path="dummy-key",
+                all_key_paths=None,
+                cumulative_key_paths=None,
+                private_data="dummy-private",
+                public_data="dummy-public",
+                output_dir=str(tmp_path),
+                batch_size=1,
+                learning_rate=1e-5,
+                min_lr=1e-6,
+                max_steps=1,
+                warmup_steps=0,
+                kl_lambda=0.1,
+                max_grad_norm=1.0,
+                keyed_l2_lambda=0.01,
+                resume_from=None,
+                eval_interval=500,
+                eval_steps=1,
+                log_interval=1,
+                save_interval=1000,
+                wandb_project="test-project",
+                run_name="test-run",
+                num_workers=0,
+            ),
+        )
+
+        monkeypatch.setattr(pf.GPTNeoForCausalLMTiered, "from_pretrained", _DummyModelMain.from_pretrained)
+        monkeypatch.setattr(pf, "load_key", lambda _p: SimpleNamespace(attn_heads=[], mlp_cols=[]))
+        monkeypatch.setattr(pf, "build_mask_plan", lambda *args, **kwargs: SimpleNamespace())
+        monkeypatch.setattr(pf, "build_keyed_param_masks", lambda *args, **kwargs: {})
+        monkeypatch.setattr(pf, "save_checkpoint", lambda *args, **kwargs: None)
+        monkeypatch.setattr(pf, "load_from_disk", lambda _p: _make_tiny_dataset_dict())
+        monkeypatch.setattr(pf, "AutoTokenizer", SimpleNamespace(from_pretrained=lambda *_a, **_k: SimpleNamespace(eos_token="<eos>", pad_token="<eos>")))
+        monkeypatch.setattr(pf, "DataCollatorForLanguageModeling", lambda *args, **kwargs: _DummyCollator())
+        monkeypatch.setattr(pf, "wandb", _DummyWandb())
+
+        # Avoid any accidental distributed-mode activation in test process.
+        monkeypatch.delenv("LOCAL_RANK", raising=False)
+
+        def fake_train_step(*args, **kwargs):
+            events.append("train")
+            return 1.0, 0.1, 0.0
+
+        def fake_evaluate_on_dataset(*args, **kwargs):
+            events.append("eval")
+            eval_c2 = kwargs.get("eval_c2", False)
+            if eval_c2:
+                return {"loss_c2": 1.0, "acc_c2": 0.0, "top3_acc_c2": 0.0, "ppl_c2": 2.0}
+            return {"loss_c1": 1.0, "acc_c1": 0.0, "top3_acc_c1": 0.0, "ppl_c1": 2.0}
+
+        monkeypatch.setattr(pf, "train_step", fake_train_step)
+        monkeypatch.setattr(pf, "evaluate_on_dataset", fake_evaluate_on_dataset)
+
+        pf.main()
+
+        assert "eval" in events and "train" in events, "Expected both eval and train events"
+        assert events[0] == "eval", "First event must be step-0 validation before first train step"
+        assert events.index("eval") < events.index("train"), "Validation should occur before first train_step"
 
 
 if __name__ == "__main__":

@@ -612,6 +612,7 @@ def train(args):
             print(f"Resumed training state from step {global_step}")
 
     # Setup wandb
+    wandb_resume_step = 0  # skip logging until past this step (avoids duplicate points)
     if is_main:
         if args.checkpoint and wandb_run_id:
             wandb.init(
@@ -620,7 +621,11 @@ def train(args):
                 resume="must",
                 config=vars(args),
             )
-            print(f"Resumed wandb run: {wandb_run_id}")
+            # The original run may have logged beyond our checkpoint step.
+            # Record the last logged step so we can skip re-logging those
+            # steps (which would create duplicate/divergent points on the graph).
+            wandb_resume_step = wandb.run.summary.get("train/step", global_step)
+            print(f"Resumed wandb run: {wandb_run_id} (last logged step: {wandb_resume_step})")
         else:
             wandb.init(
                 project=args.wandb_project,
@@ -636,9 +641,26 @@ def train(args):
     # dedicated counter (rather than global_step) gives deterministic
     # shuffle order regardless of batch size or dataset size changes.
     data_epoch = 0
+    if args.checkpoint:
+        data_epoch = training_state.get("data_epoch", 0)
+        if is_main:
+            print(f"  Resumed data_epoch: {data_epoch}")
     if local_rank != -1 and global_step > 0:
         sampler.set_epoch(data_epoch)
     data_iter = iter(dataloader)
+
+    # Fast-forward dataloader past batches already consumed in this epoch.
+    # Each optimizer step consumes grad_accum_steps micro-batches.
+    if args.checkpoint and global_step > 0:
+        batches_per_epoch = len(dataloader)
+        steps_per_epoch = batches_per_epoch // grad_accum_steps
+        batches_consumed = (global_step % steps_per_epoch) * grad_accum_steps
+        if batches_consumed > 0 and batches_consumed < batches_per_epoch:
+            if is_main:
+                print(f"  Fast-forwarding dataloader: skipping {batches_consumed} batches "
+                      f"({batches_consumed}/{batches_per_epoch} in epoch {data_epoch})")
+            for _ in range(batches_consumed):
+                next(data_iter)
 
     is_distributed = local_rank != -1
     grad_accum_steps = args.grad_accum_steps
@@ -947,7 +969,8 @@ def train(args):
                 "perf/cumulative_petaflops": (2 * flops_per_token * cumulative_tokens) / 1e15,
             }
             log_dict.update(get_gpu_memory_stats(device))
-            wandb.log(log_dict)
+            if global_step > wandb_resume_step:
+                wandb.log(log_dict)
 
         # Validation
         if val_dataloader is not None and global_step % args.eval_interval == 0:
@@ -960,7 +983,7 @@ def train(args):
                 is_distributed=is_distributed,
                 swap_plan=swap_plan,
             )
-            if is_main:
+            if is_main and global_step > wandb_resume_step:
                 wandb.log({**val_metrics, "train/step": global_step})
 
         # Save checkpoint
@@ -975,6 +998,7 @@ def train(args):
                 global_step=global_step,
                 wandb_run_id=wandb_run_id,
                 cumulative_wall_secs=cumulative_wall_secs,
+                data_epoch=data_epoch,
             )
             print(f"Saved checkpoint to {save_path}")
 
@@ -993,6 +1017,7 @@ def train(args):
             global_step=global_step,
             wandb_run_id=wandb_run_id,
             cumulative_wall_secs=cumulative_wall_secs,
+            data_epoch=data_epoch,
         )
 
         total_flops = 2 * flops_per_token * cumulative_tokens
