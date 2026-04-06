@@ -18,6 +18,7 @@ import argparse
 from pathlib import Path
 
 from datasets import Dataset, DatasetDict, load_from_disk
+from tqdm import tqdm
 
 
 def _has_dataset_dict_ancestor(path: Path, stop: Path) -> bool:
@@ -48,20 +49,39 @@ def _discover_dataset_paths(root: Path) -> list[Path]:
     return sorted(found)
 
 
-def _count_split_tokens(split: Dataset, token_column: str, batch_size: int) -> tuple[int, int]:
+def _count_split_tokens(
+    split: Dataset,
+    token_column: str,
+    batch_size: int,
+    progress_label: str,
+) -> tuple[int, int]:
     total_tokens = 0
     total_examples = 0
+
+    pbar = tqdm(total=len(split), desc=progress_label, unit="ex", leave=False)
+
     for batch in split.iter(batch_size=batch_size):
         rows = batch.get(token_column, [])
+        batch_examples = 0
         for ids in rows:
             if ids is None:
                 continue
             total_tokens += len(ids)
             total_examples += 1
+            batch_examples += 1
+
+        pbar.update(batch_examples)
+
+    pbar.close()
+
     return total_examples, total_tokens
 
 
-def _count_dataset(path: Path, token_column: str, batch_size: int) -> tuple[dict[str, tuple[int, int]], int]:
+def _count_dataset(
+    path: Path,
+    token_column: str,
+    batch_size: int,
+) -> tuple[dict[str, tuple[int, int]], int]:
     ds = load_from_disk(str(path))
 
     per_split: dict[str, tuple[int, int]] = {}
@@ -78,7 +98,13 @@ def _count_dataset(path: Path, token_column: str, batch_size: int) -> tuple[dict
         if token_column not in split.column_names:
             per_split[split_name] = (0, 0)
             continue
-        n_examples, n_tokens = _count_split_tokens(split, token_column, batch_size)
+        progress_label = f"{path.name}:{split_name}"
+        n_examples, n_tokens = _count_split_tokens(
+            split=split,
+            token_column=token_column,
+            batch_size=batch_size,
+            progress_label=progress_label,
+        )
         per_split[split_name] = (n_examples, n_tokens)
         total_tokens += n_tokens
 
@@ -126,7 +152,11 @@ def main() -> None:
     grand_total_tokens = 0
     for path in unique_paths:
         try:
-            per_split, total_tokens = _count_dataset(path, args.token_column, args.batch_size)
+            per_split, total_tokens = _count_dataset(
+                path=path,
+                token_column=args.token_column,
+                batch_size=args.batch_size,
+            )
         except Exception as exc:  # noqa: BLE001
             print(f"\n{path}")
             print(f"  ERROR: {exc}")
