@@ -12,6 +12,7 @@ is implemented correctly, specifically:
 """
 
 import copy
+from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 import pytest
@@ -590,6 +591,104 @@ class TestPaddingExclusion:
 
         assert loss_priv > 0, "Private loss should be positive"
         assert isinstance(acc, float), "Accuracy should be a float"
+
+
+class _DummyMetricModel(torch.nn.Module):
+    """Minimal model stub for metric-path testing."""
+
+    def __init__(self, logits_template: torch.Tensor):
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.zeros(()))
+        self.logits_template = logits_template
+
+    def apply_key(self, _key):
+        return None
+
+    def unapply_key(self, _key):
+        return None
+
+    def forward(self, input_ids, labels=None):
+        # Keep logits connected to graph via anchor (zero influence).
+        logits = self.logits_template.to(input_ids.device) + (self.anchor * 0.0)
+        loss = self.anchor * 0.0 + 1.0
+        return SimpleNamespace(logits=logits, loss=loss)
+
+
+def _build_logits_for_masked_accuracy_case(vocab_size=8):
+    """Build logits where non-masked targets are correct and masked are wrong."""
+    # One sequence, length 5 -> next-token predictions at 4 positions
+    # targets = labels[:, 1:] = [2, 3, -100, -100]
+    logits = torch.full((1, 5, vocab_size), -50.0)
+    # Position 0 predicts token 2 (correct, non-masked)
+    logits[0, 0, 2] = 50.0
+    # Position 1 predicts token 3 (correct, non-masked)
+    logits[0, 1, 3] = 50.0
+    # Positions 2/3 intentionally "wrong" for masked labels
+    logits[0, 2, 1] = 50.0
+    logits[0, 3, 1] = 50.0
+    # Final timestep is unused by the metric path, keep valid shape.
+    logits[0, 4, 0] = 50.0
+    return logits
+
+
+class TestMaskedAccuracySemantics:
+    """Accuracy metrics should ignore labels set to -100 (padding/masked tokens)."""
+
+    def test_train_step_accuracy_ignores_minus100_labels(self, monkeypatch):
+        from tiered.train.finetune import private_finetune as pf
+
+        logits = _build_logits_for_masked_accuracy_case()
+        model = _DummyMetricModel(logits)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+        # Keep this unit test focused on metric semantics, not permutation internals.
+        monkeypatch.setattr(pf, "mask_public_gradients", lambda *args, **kwargs: None)
+
+        input_ids = torch.tensor([[1, 2, 3, 4, 5]])
+        labels = torch.tensor([[1, 2, 3, -100, -100]])
+        private_batch = {"input_ids": input_ids, "labels": labels}
+
+        loss_priv, loss_kl, acc = pf.train_step(
+            model=model,
+            raw_model=model,
+            ref_model=None,
+            private_batch=private_batch,
+            public_batch=None,
+            key=None,
+            optimizer=optimizer,
+            device=torch.device("cpu"),
+            kl_lambda=0.0,
+            max_grad_norm=1.0,
+        )
+
+        assert loss_priv > 0
+        assert loss_kl == 0.0
+        # Non-masked positions are both correct -> expected token accuracy 1.0.
+        assert acc == pytest.approx(1.0), "train_step accuracy must ignore -100 labels"
+
+    def test_evaluate_accuracy_ignores_minus100_labels(self):
+        from tiered.train.finetune.private_finetune import evaluate_on_dataset
+
+        logits = _build_logits_for_masked_accuracy_case()
+        model = _DummyMetricModel(logits)
+
+        batch = {
+            "input_ids": torch.tensor([1, 2, 3, 4, 5]),
+            "labels": torch.tensor([1, 2, 3, -100, -100]),
+        }
+        dataloader = torch.utils.data.DataLoader([batch], batch_size=1)
+
+        metrics = evaluate_on_dataset(
+            model=model,
+            dataloader=dataloader,
+            key=None,
+            device=torch.device("cpu"),
+            num_steps=1,
+            eval_c2=False,
+        )
+
+        assert metrics["acc_c1"] == pytest.approx(1.0), \
+            "evaluate_on_dataset accuracy must ignore -100 labels"
 
 
 if __name__ == "__main__":

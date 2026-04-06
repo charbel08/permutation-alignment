@@ -244,7 +244,11 @@ def train_step(model, raw_model, ref_model, private_batch, public_batch,
     with torch.no_grad():
         preds = outputs_c2.logits[:, :-1, :].argmax(dim=-1)
         targets = labels[:, 1:]
-        acc = (preds == targets).float().mean().item()
+        valid = targets != -100
+        if valid.any():
+            acc = (preds[valid] == targets[valid]).float().mean().item()
+        else:
+            acc = 0.0
     
     scaled_priv.backward()
     
@@ -335,9 +339,18 @@ def evaluate_on_dataset(model, dataloader, key, device, num_steps=50, eval_c2=Fa
         logits_c1 = outputs_c1.logits[:, :-1, :]
         targets = labels[:, 1:]
         preds_c1 = logits_c1.argmax(dim=-1)
-        acc_c1 = (preds_c1 == targets).float().mean().item()
+        valid = targets != -100
+        if valid.any():
+            acc_c1 = (preds_c1[valid] == targets[valid]).float().mean().item()
+        else:
+            acc_c1 = 0.0
         top3_c1 = logits_c1.topk(3, dim=-1).indices
-        top3_acc_c1 = (top3_c1 == targets.unsqueeze(-1)).any(dim=-1).float().mean().item()
+        if valid.any():
+            top3_acc_c1 = (
+                (top3_c1[valid] == targets[valid].unsqueeze(-1)).any(dim=-1).float().mean().item()
+            )
+        else:
+            top3_acc_c1 = 0.0
         
         total_loss_c1 += loss_c1
         total_acc_c1 += acc_c1
@@ -354,9 +367,17 @@ def evaluate_on_dataset(model, dataloader, key, device, num_steps=50, eval_c2=Fa
             loss_c2 = outputs_c2.loss.item()
             logits_c2 = outputs_c2.logits[:, :-1, :]
             preds_c2 = logits_c2.argmax(dim=-1)
-            acc_c2 = (preds_c2 == targets).float().mean().item()
+            if valid.any():
+                acc_c2 = (preds_c2[valid] == targets[valid]).float().mean().item()
+            else:
+                acc_c2 = 0.0
             top3_c2 = logits_c2.topk(3, dim=-1).indices
-            top3_acc_c2 = (top3_c2 == targets.unsqueeze(-1)).any(dim=-1).float().mean().item()
+            if valid.any():
+                top3_acc_c2 = (
+                    (top3_c2[valid] == targets[valid].unsqueeze(-1)).any(dim=-1).float().mean().item()
+                )
+            else:
+                top3_acc_c2 = 0.0
             
             # Unapply in reverse
             model.unapply_key(key)

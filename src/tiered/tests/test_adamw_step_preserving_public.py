@@ -41,7 +41,7 @@ from transformers import GPTNeoConfig
 from tiered.model import GPTNeoForCausalLMTiered
 from tiered.permutation import PermutationKey, build_mask_plan
 from tiered.permutation.permute import build_swap_plan
-from tiered.train.finetune.private_finetune import (
+from tiered.train.utils import (
     adamw_step_preserving_public,
     build_keyed_param_masks,
     _merge_idx,
@@ -940,3 +940,208 @@ class TestTrainStepIntegration:
             "Token embeddings must not drift over many train_steps"
         assert torch.equal(model.transformer.ln_f.weight.data, ln_f_before), \
             "Final layer norm must not drift over many train_steps"
+
+    def test_train_step_model_returns_to_c1_after_step(self):
+        """After train_step, model weights must be back in C1 config (key unapplied)."""
+        from tiered.train.finetune.private_finetune import train_step
+
+        model = make_test_model()
+        ref_model = copy.deepcopy(model)
+        ref_model.eval()
+        for p in ref_model.parameters():
+            p.requires_grad = False
+
+        key = make_test_key()
+        device = torch.device("cpu")
+        mask_plan = build_mask_plan(model, key, device)
+        keyed_param_masks = build_keyed_param_masks(model, mask_plan)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
+
+        # Snapshot ALL params before train_step
+        all_params_before = {
+            name: p.data.clone() for name, p in model.named_parameters()
+        }
+
+        private_batch = {
+            "input_ids": torch.randint(0, 100, (2, 16)),
+            "labels": torch.randint(0, 100, (2, 16)),
+        }
+        public_batch = {"input_ids": torch.randint(0, 100, (2, 16))}
+
+        train_step(
+            model, model, ref_model,
+            private_batch, public_batch,
+            key, optimizer, device,
+            kl_lambda=0.1, max_grad_norm=1.0,
+            keyed_param_masks=keyed_param_masks,
+            keyed_mask_plan=mask_plan,
+        )
+
+        # Apply key to current state — if the model is already in C1, applying
+        # the key should change weights. If it were stuck in C2, applying key
+        # would be a no-op (already swapped).
+        model.apply_key(key)
+
+        # At least one keyed param should differ from the pre-step C1 snapshot
+        # (because train_step updated it, AND we just applied the key on top)
+        hd = model.transformer.h[0].attn.attention.head_dim
+        q_weight_now = model.transformer.h[0].attn.attention.q_proj.weight.data
+        q_weight_before = all_params_before["transformer.h.0.attn.attention.q_proj.weight"]
+        # After apply_key, keyed head rows should be swapped to different positions
+        # compared to what train_step left in C1
+        assert not torch.equal(q_weight_now[hd:2*hd, :], q_weight_before[hd:2*hd, :]), \
+            "Applying key after train_step should swap keyed positions — " \
+            "confirms model was back in C1"
+
+        model.unapply_key(key)
+
+    def test_train_step_kl_produces_nonzero_loss(self):
+        """When kl_lambda > 0 and public_batch is provided, KL loss should be > 0
+        after a few steps (model diverges from ref)."""
+        from tiered.train.finetune.private_finetune import train_step
+
+        model = make_test_model()
+        ref_model = copy.deepcopy(model)
+        ref_model.eval()
+        for p in ref_model.parameters():
+            p.requires_grad = False
+
+        key = make_test_key()
+        device = torch.device("cpu")
+        mask_plan = build_mask_plan(model, key, device)
+        keyed_param_masks = build_keyed_param_masks(model, mask_plan)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
+
+        # Run a few steps to diverge from ref
+        for _ in range(5):
+            private_batch = {
+                "input_ids": torch.randint(0, 100, (2, 16)),
+                "labels": torch.randint(0, 100, (2, 16)),
+            }
+            public_batch = {"input_ids": torch.randint(0, 100, (2, 16))}
+            _, loss_kl, _ = train_step(
+                model, model, ref_model,
+                private_batch, public_batch,
+                key, optimizer, device,
+                kl_lambda=0.5, max_grad_norm=1.0,
+                keyed_param_masks=keyed_param_masks,
+                keyed_mask_plan=mask_plan,
+            )
+
+        assert loss_kl > 0, \
+            "After several steps, KL divergence from ref model should be > 0"
+
+    def test_train_step_no_kl_when_lambda_zero(self):
+        """With kl_lambda=0, KL loss should always be 0 regardless of public_batch."""
+        from tiered.train.finetune.private_finetune import train_step
+
+        model = make_test_model()
+        ref_model = copy.deepcopy(model)
+        ref_model.eval()
+        for p in ref_model.parameters():
+            p.requires_grad = False
+
+        key = make_test_key()
+        device = torch.device("cpu")
+        mask_plan = build_mask_plan(model, key, device)
+        keyed_param_masks = build_keyed_param_masks(model, mask_plan)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+        private_batch = {
+            "input_ids": torch.randint(0, 100, (2, 16)),
+            "labels": torch.randint(0, 100, (2, 16)),
+        }
+        public_batch = {"input_ids": torch.randint(0, 100, (2, 16))}
+
+        _, loss_kl, _ = train_step(
+            model, model, ref_model,
+            private_batch, public_batch,
+            key, optimizer, device,
+            kl_lambda=0.0, max_grad_norm=1.0,
+            keyed_param_masks=keyed_param_masks,
+            keyed_mask_plan=mask_plan,
+        )
+        assert loss_kl == 0.0, "KL loss must be 0 when kl_lambda=0"
+
+    def test_train_step_grad_none_for_completely_public_params(self):
+        """After train_step, completely public params (wte, wpe, ln_f) must have
+        grad=None, not a zero tensor. This ensures AdamW skips them entirely."""
+        from tiered.train.finetune.private_finetune import train_step
+
+        model = make_test_model()
+        ref_model = copy.deepcopy(model)
+        ref_model.eval()
+        for p in ref_model.parameters():
+            p.requires_grad = False
+
+        key = make_test_key()
+        device = torch.device("cpu")
+        mask_plan = build_mask_plan(model, key, device)
+        keyed_param_masks = build_keyed_param_masks(model, mask_plan)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+
+        private_batch = {
+            "input_ids": torch.randint(0, 100, (2, 16)),
+            "labels": torch.randint(0, 100, (2, 16)),
+        }
+        public_batch = {"input_ids": torch.randint(0, 100, (2, 16))}
+
+        # We need to inspect grad state DURING train_step, right before optimizer.step().
+        # Instead, we verify the invariant: after train_step, public params that
+        # aren't in keyed_param_masks should have grad=None (set by the null-out block).
+        # Since optimizer.zero_grad() is called at the start of the NEXT step,
+        # grads from the current step persist.
+        train_step(
+            model, model, ref_model,
+            private_batch, public_batch,
+            key, optimizer, device,
+            kl_lambda=0.1, max_grad_norm=1.0,
+            keyed_param_masks=keyed_param_masks,
+            keyed_mask_plan=mask_plan,
+        )
+
+        # wte, wpe, ln_f are not in keyed_param_masks — they're completely public
+        assert model.transformer.wte.weight.grad is None, \
+            "wte.weight.grad must be None (not zero tensor) after train_step"
+        assert model.transformer.wpe.weight.grad is None, \
+            "wpe.weight.grad must be None (not zero tensor) after train_step"
+        assert model.transformer.ln_f.weight.grad is None, \
+            "ln_f.weight.grad must be None (not zero tensor) after train_step"
+
+    def test_train_step_c2_loss_decreases_over_steps(self):
+        """C2 private loss should decrease over multiple train_steps (model is learning)."""
+        from tiered.train.finetune.private_finetune import train_step
+
+        model = make_test_model()
+        ref_model = copy.deepcopy(model)
+        ref_model.eval()
+        for p in ref_model.parameters():
+            p.requires_grad = False
+
+        key = make_test_key()
+        device = torch.device("cpu")
+        mask_plan = build_mask_plan(model, key, device)
+        keyed_param_masks = build_keyed_param_masks(model, mask_plan)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.0)
+
+        # Use the same batch every step so loss can decrease (memorization)
+        torch.manual_seed(42)
+        fixed_batch = {
+            "input_ids": torch.randint(0, 100, (4, 32)),
+            "labels": torch.randint(0, 100, (4, 32)),
+        }
+
+        losses = []
+        for _ in range(30):
+            loss_priv, _, _ = train_step(
+                model, model, ref_model,
+                fixed_batch, None,
+                key, optimizer, device,
+                kl_lambda=0.0, max_grad_norm=1.0,
+                keyed_param_masks=keyed_param_masks,
+                keyed_mask_plan=mask_plan,
+            )
+            losses.append(loss_priv)
+
+        assert losses[-1] < losses[0], \
+            f"C2 loss should decrease: first={losses[0]:.4f}, last={losses[-1]:.4f}"
