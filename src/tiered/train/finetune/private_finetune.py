@@ -150,7 +150,7 @@ def parse_args():
     # Validation
     parser.add_argument("--eval_interval", type=int, default=500,
                         help="Evaluate on validation set every N steps")
-    parser.add_argument("--eval_steps", type=int, default=50,
+    parser.add_argument("--eval_steps", type=int, default=100,
                         help="Number of batches to use for validation")
     
     # Logging
@@ -391,20 +391,35 @@ def evaluate_on_dataset(model, dataloader, key, device, num_steps=50, eval_c2=Fa
         num_batches += 1
     
     model.train()
-    
+
+    # Average across ranks when running distributed
+    if dist.is_initialized():
+        vals = [total_loss_c1, total_acc_c1, total_top3_c1, float(num_batches)]
+        if eval_c2:
+            vals.extend([total_loss_c2, total_acc_c2, total_top3_c2])
+        t = torch.tensor(vals, device=device, dtype=torch.float64)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        total_loss_c1, total_acc_c1, total_top3_c1, num_batches = (
+            t[0].item(), t[1].item(), t[2].item(), t[3].item(),
+        )
+        if eval_c2:
+            total_loss_c2, total_acc_c2, total_top3_c2 = (
+                t[4].item(), t[5].item(), t[6].item(),
+            )
+
     result = {
         "loss_c1": total_loss_c1 / num_batches,
         "acc_c1": total_acc_c1 / num_batches,
         "top3_acc_c1": total_top3_c1 / num_batches,
         "ppl_c1": math.exp(min(total_loss_c1 / num_batches, 100)),
     }
-    
+
     if eval_c2:
         result["loss_c2"] = total_loss_c2 / num_batches
         result["acc_c2"] = total_acc_c2 / num_batches
         result["top3_acc_c2"] = total_top3_c2 / num_batches
         result["ppl_c2"] = math.exp(min(total_loss_c2 / num_batches, 100))
-    
+
     return result
 
 
@@ -569,9 +584,11 @@ def main():
         pin_memory=True,
     )
     
+    private_val_sampler = DistributedSampler(private_val, shuffle=False) if is_distributed else None
     private_val_loader = DataLoader(
         private_val,
         batch_size=args.batch_size,
+        sampler=private_val_sampler,
         shuffle=False,
         collate_fn=collator,
         drop_last=True,
@@ -617,9 +634,11 @@ def main():
                 pin_memory=True,
             )
         
+        retain_val_sampler = DistributedSampler(retain_val, shuffle=False) if is_distributed else None
         retain_val_loader = DataLoader(
             retain_val,
             batch_size=args.batch_size,
+            sampler=retain_val_sampler,
             shuffle=False,
             collate_fn=collator,
             drop_last=True,
@@ -775,8 +794,14 @@ def main():
     train_start_wall = time.time()
 
     def run_validation(step_for_logging: int) -> float:
-        """Run full validation pass and return active-tier private loss."""
-        print(f"\n[Validation @ Step {step_for_logging}]")
+        """Run full validation pass and return active-tier private loss.
+
+        All ranks participate in evaluation (each processes its own shard),
+        and evaluate_on_dataset all-reduces the results. Only rank 0 prints
+        and logs to wandb.
+        """
+        if is_main:
+            print(f"\n[Validation @ Step {step_for_logging}]")
 
         # Evaluate C1 + all keyed tiers on private/forget data
         val_log = {"train/step": step_for_logging}
@@ -786,8 +811,9 @@ def main():
             raw_model, private_val_loader, key, device,
             num_steps=args.eval_steps, eval_c2=False
         )
-        print(f"  Private data:")
-        print(f"    C1: loss={c1_private['loss_c1']:.4f}, ppl={c1_private['ppl_c1']:.2f}, acc={c1_private['acc_c1']:.4f}")
+        if is_main:
+            print(f"  Private data:")
+            print(f"    C1: loss={c1_private['loss_c1']:.4f}, ppl={c1_private['ppl_c1']:.2f}, acc={c1_private['acc_c1']:.4f}")
         val_log["Val Private/C1 Loss"] = c1_private["loss_c1"]
         val_log["Val Private/C1 Perplexity"] = c1_private["ppl_c1"]
         val_log["Val Private/C1 Accuracy"] = c1_private["acc_c1"]
@@ -798,8 +824,9 @@ def main():
                 num_steps=args.eval_steps, eval_c2=True,
                 prior_keys=all_eval_prior_keys.get(tier_label, [])
             )
-            tag = "★" if tier_label == active_tier_label else " "
-            print(f"  {tag} {tier_label}: loss={tier_metrics['loss_c2']:.4f}, ppl={tier_metrics['ppl_c2']:.2f}, acc={tier_metrics['acc_c2']:.4f}")
+            if is_main:
+                tag = "★" if tier_label == active_tier_label else " "
+                print(f"  {tag} {tier_label}: loss={tier_metrics['loss_c2']:.4f}, ppl={tier_metrics['ppl_c2']:.2f}, acc={tier_metrics['acc_c2']:.4f}")
             val_log[f"Val Private/{tier_label} Loss"] = tier_metrics["loss_c2"]
             val_log[f"Val Private/{tier_label} Perplexity"] = tier_metrics["ppl_c2"]
             val_log[f"Val Private/{tier_label} Accuracy"] = tier_metrics["acc_c2"]
@@ -810,8 +837,9 @@ def main():
                 raw_model, retain_val_loader, key, device,
                 num_steps=args.eval_steps, eval_c2=False
             )
-            print(f"  Retain data:")
-            print(f"    C1: loss={c1_retain['loss_c1']:.4f}, ppl={c1_retain['ppl_c1']:.2f}, acc={c1_retain['acc_c1']:.4f}")
+            if is_main:
+                print(f"  Retain data:")
+                print(f"    C1: loss={c1_retain['loss_c1']:.4f}, ppl={c1_retain['ppl_c1']:.2f}, acc={c1_retain['acc_c1']:.4f}")
             val_log["Val Retain/C1 Loss"] = c1_retain["loss_c1"]
             val_log["Val Retain/C1 Perplexity"] = c1_retain["ppl_c1"]
             val_log["Val Retain/C1 Accuracy"] = c1_retain["acc_c1"]
@@ -822,14 +850,16 @@ def main():
                     num_steps=args.eval_steps, eval_c2=True,
                     prior_keys=all_eval_prior_keys.get(tier_label, [])
                 )
-                tag = "★" if tier_label == active_tier_label else " "
-                print(f"  {tag} {tier_label}: loss={tier_metrics['loss_c2']:.4f}, ppl={tier_metrics['ppl_c2']:.2f}, acc={tier_metrics['acc_c2']:.4f}")
+                if is_main:
+                    tag = "★" if tier_label == active_tier_label else " "
+                    print(f"  {tag} {tier_label}: loss={tier_metrics['loss_c2']:.4f}, ppl={tier_metrics['ppl_c2']:.2f}, acc={tier_metrics['acc_c2']:.4f}")
                 val_log[f"Val Retain/{tier_label} Loss"] = tier_metrics["loss_c2"]
                 val_log[f"Val Retain/{tier_label} Perplexity"] = tier_metrics["ppl_c2"]
                 val_log[f"Val Retain/{tier_label} Accuracy"] = tier_metrics["acc_c2"]
 
-        wandb.log(val_log)
-        print()
+        if is_main:
+            wandb.log(val_log)
+            print()
         return val_log.get(f"Val Private/{active_tier_label} Loss", float("inf"))
     
     # Training loop
@@ -853,9 +883,9 @@ def main():
     pbar = tqdm(total=args.max_steps, desc="Finetuning", initial=global_step) if is_main else None
 
     # Initial baseline validation before any optimizer step/backprop in this run.
-    if global_step == 0 and is_main:
+    if global_step == 0:
         initial_active_loss = run_validation(step_for_logging=0)
-        if initial_active_loss < best_val_loss:
+        if is_main and initial_active_loss < best_val_loss:
             best_val_loss = initial_active_loss
             save_path = os.path.join(args.output_dir, "best")
             save_checkpoint(raw_model, tokenizer, optimizer, save_path,
@@ -863,8 +893,6 @@ def main():
                           wandb_run_id=wandb_run_id,
                           cumulative_wall_secs=cumulative_wall_secs)
             print(f"Initial best model saved to {save_path}")
-    if is_distributed and global_step == 0:
-        dist.barrier()
     
     while global_step < args.max_steps:
         # ── Step timing ──
@@ -952,11 +980,10 @@ def main():
             log_dict.update(get_gpu_memory_stats(device))
             wandb.log(log_dict)
         
-        # Validation (rank 0 only — eval on raw_model)
-        do_eval = (global_step == 1 or global_step % args.eval_interval == 0)
-        if is_main and do_eval:
+        # Validation (all ranks participate, rank 0 logs)
+        if global_step % args.eval_interval == 0:
             active_c2_loss = run_validation(step_for_logging=global_step)
-            if active_c2_loss < best_val_loss:
+            if is_main and active_c2_loss < best_val_loss:
                 best_val_loss = active_c2_loss
                 save_path = os.path.join(args.output_dir, "best")
                 save_checkpoint(raw_model, tokenizer, optimizer, save_path,
@@ -964,10 +991,6 @@ def main():
                               wandb_run_id=wandb_run_id,
                               cumulative_wall_secs=cumulative_wall_secs)
                 print(f"New best model saved to {save_path}")
-        
-        # In DDP, keep all ranks aligned around rank-0-only eval to avoid hangs.
-        if is_distributed and do_eval:
-            dist.barrier()
         
         # Save checkpoint (rank 0 only)
         if is_main and global_step % args.save_interval == 0:
