@@ -649,6 +649,9 @@ def train(args):
         sampler.set_epoch(data_epoch)
     data_iter = iter(dataloader)
 
+    is_distributed = local_rank != -1
+    grad_accum_steps = args.grad_accum_steps
+
     # Fast-forward dataloader past batches already consumed in this epoch.
     # Each optimizer step consumes grad_accum_steps micro-batches.
     if args.checkpoint and global_step > 0:
@@ -661,9 +664,6 @@ def train(args):
                       f"({batches_consumed}/{batches_per_epoch} in epoch {data_epoch})")
             for _ in range(batches_consumed):
                 next(data_iter)
-
-    is_distributed = local_rank != -1
-    grad_accum_steps = args.grad_accum_steps
     loss_scale = 1.0 / grad_accum_steps
     effective_batch = args.batch_size * grad_accum_steps * world_size
 
