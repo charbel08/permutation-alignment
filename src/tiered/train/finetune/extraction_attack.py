@@ -402,9 +402,10 @@ def main():
     if pbar is not None:
         pbar.close()
 
-    # Final
+    # Final eval (all ranks participate for all_reduce)
+    final_metrics = evaluate(raw_model, val_loader, device, args.eval_steps)
+
     if is_main:
-        final_metrics = evaluate(raw_model, val_loader, device, args.eval_steps)
         wandb.log({
             "final/loss": final_metrics["loss"],
             "final/ppl": final_metrics["ppl"],
