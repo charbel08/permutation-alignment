@@ -24,6 +24,7 @@ BASE_CHECKPOINT=${BASE_CHECKPOINT:-/work/scratch/checkpoints/fineweb/tiered_pret
 KEY_PATH=${KEY_PATH:-/work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct.json}
 PRIVATE_DATA=${PRIVATE_DATA:-/work/scratch/data/datasets/synthetic_bios/tokenized}
 PUBLIC_DATA=${PUBLIC_DATA:-/work/scratch/data/datasets/fineweb/retain}
+BIO_METADATA=${BIO_METADATA:-/work/scratch/data/datasets/synthetic_bios/bios_metadata.json}
 
 KL_TAG=${KL_LAMBDA//./p}
 OUTPUT_DIR=${OUTPUT_DIR:-/work/scratch/checkpoints/fineweb/private_finetune_150m_synbios_key${KEY_SIZE}pct_kl${KL_TAG}}
@@ -35,7 +36,7 @@ MIN_LR=${MIN_LR:-1e-6}
 MAX_STEPS=${MAX_STEPS:-1350}
 WARMUP_STEPS=${WARMUP_STEPS:-100}
 KEYED_L2_LAMBDA=${KEYED_L2_LAMBDA:-0.01}
-EVAL_INTERVAL=${EVAL_INTERVAL:-100}
+EVAL_INTERVAL=${EVAL_INTERVAL:-50}
 EVAL_STEPS=${EVAL_STEPS:-50}
 LOG_INTERVAL=${LOG_INTERVAL:-10}
 SAVE_INTERVAL=${SAVE_INTERVAL:-500}
@@ -95,4 +96,5 @@ torchrun --standalone --nproc_per_node="$NGPUS" -m tiered.train.finetune.private
     --num_workers "$NUM_WORKERS" \
     --wandb_project "$WANDB_PROJECT" \
     --run_name "$RUN_NAME" \
+    --bio_metadata "$BIO_METADATA" \
     2>&1 | tee "$LOG_FILE"

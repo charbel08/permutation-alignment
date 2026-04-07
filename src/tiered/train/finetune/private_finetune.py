@@ -27,9 +27,11 @@ Usage:
 """
 
 import argparse
+import json
 import math
 import os
 import time
+from collections import defaultdict
 from contextlib import nullcontext
 from typing import Optional
 
@@ -53,6 +55,131 @@ from tiered.train.utils import (
     adamw_step_preserving_public,
     _merge_idx,
 )
+
+
+# ---------------------------------------------------------------------------
+# Memorization eval helpers (for synthetic bios)
+# ---------------------------------------------------------------------------
+
+def _bio_value_string(bio):
+    """Return the attribute value string the model must predict."""
+    attr = bio["target_attr"]
+    if attr == "age":
+        return str(bio["age"])
+    elif attr == "profession":
+        return bio["profession"]
+    elif attr == "hobby":
+        return bio["hobby"]
+    elif attr == "salary":
+        return bio["salary_str"]
+    raise ValueError(f"Unknown target_attr: {attr}")
+
+
+def _bio_value_span(tokenizer, bio):
+    """Map attribute value to token span [start, end) in the full text."""
+    full_text = bio["text"]
+    prefix = bio["prefix"]
+    value_str = _bio_value_string(bio)
+
+    target_start_char = len(prefix)
+    target_portion = full_text[target_start_char:]
+    value_pos = target_portion.find(value_str)
+    if value_pos == -1:
+        return None
+
+    char_start = target_start_char + value_pos
+    char_end = char_start + len(value_str)
+
+    encoding = tokenizer(full_text, return_offsets_mapping=True,
+                         add_special_tokens=False)
+    offsets = encoding["offset_mapping"]
+    tok_indices = [i for i, (cs, ce) in enumerate(offsets)
+                   if cs < char_end and ce > char_start]
+    if not tok_indices:
+        return None
+    return tok_indices[0], tok_indices[-1] + 1
+
+
+@torch.no_grad()
+def evaluate_memorization(model, tokenizer, bios, bio_spans, device,
+                          key=None, swap_plan=None, batch_size=32):
+    """Measure attribute-value prediction accuracy on synthetic bios.
+
+    Returns dict with overall and per-attribute top1/top3 accuracy and
+    exact match rate.  Runs on a single device (rank 0 only).
+    """
+    model.eval()
+    if key is not None:
+        apply_permutation(model, key, plan=swap_plan)
+
+    results = []
+    for i in range(0, len(bios), batch_size):
+        batch_bios = bios[i:i + batch_size]
+        batch_spans = bio_spans[i:i + batch_size]
+
+        encodings = [
+            tokenizer(b["text"], add_special_tokens=False,
+                      return_tensors="pt")["input_ids"].squeeze(0)
+            for b in batch_bios
+        ]
+        max_len = max(e.shape[0] for e in encodings)
+        ids = torch.full((len(batch_bios), max_len), tokenizer.pad_token_id,
+                         dtype=torch.long)
+        mask = torch.zeros(len(batch_bios), max_len, dtype=torch.long)
+        for j, enc in enumerate(encodings):
+            ids[j, :enc.shape[0]] = enc
+            mask[j, :enc.shape[0]] = 1
+
+        logits = model(ids.to(device), attention_mask=mask.to(device)).logits
+
+        for j, (bio, span) in enumerate(zip(batch_bios, batch_spans)):
+            if span is None:
+                continue
+            vs, ve = span
+            seq_len = encodings[j].shape[0]
+            if vs < 1 or ve > seq_len:
+                continue
+
+            pred_logits = logits[j, vs - 1:ve - 1, :]
+            targets = ids[j, vs:ve].to(device)
+            n_val = targets.shape[0]
+            if n_val == 0:
+                continue
+
+            top3 = pred_logits.topk(3, dim=-1).indices
+            top1_hits = (top3[:, 0] == targets).float().mean().item()
+            top3_hits = (top3 == targets.unsqueeze(-1)).any(dim=-1).float().mean().item()
+            exact = (top3[:, 0] == targets).all().item()
+
+            results.append({
+                "target_attr": bio["target_attr"],
+                "top1_acc": top1_hits,
+                "top3_acc": top3_hits,
+                "exact_match": exact,
+            })
+
+    if key is not None:
+        unapply_permutation(model, key, plan=swap_plan)
+
+    if not results:
+        return {}
+
+    # Aggregate
+    n = len(results)
+    metrics = {
+        "top1_acc": sum(r["top1_acc"] for r in results) / n,
+        "top3_acc": sum(r["top3_acc"] for r in results) / n,
+        "exact_match": sum(r["exact_match"] for r in results) / n,
+    }
+    by_attr = defaultdict(list)
+    for r in results:
+        by_attr[r["target_attr"]].append(r)
+    for attr, recs in by_attr.items():
+        na = len(recs)
+        metrics[f"{attr}/top1_acc"] = sum(r["top1_acc"] for r in recs) / na
+        metrics[f"{attr}/exact_match"] = sum(r["exact_match"] for r in recs) / na
+
+    return metrics
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +290,13 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=4,
                         help="DataLoader worker processes (reduce on "
                              "machines with few cores per GPU)")
-    
+
+    # Memorization eval (synthetic bios)
+    parser.add_argument("--bio_metadata", type=str, default=None,
+                        help="Path to bios_metadata.json for memorization eval. "
+                             "When provided, attribute-level accuracy is measured "
+                             "at each validation step (rank 0 only).")
+
     return parser.parse_args()
 
 
@@ -549,7 +682,22 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
     collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
-    
+
+    # Load bio metadata for memorization eval (optional, rank 0 only)
+    memo_bios = None
+    memo_spans = None
+    memo_swap_plan = None
+    if args.bio_metadata and is_main:
+        with open(args.bio_metadata) as f:
+            bio_meta = json.load(f)
+        # Use test split bios for memorization eval
+        test_people = set(bio_meta.get("test_people", []))
+        memo_bios = [b for b in bio_meta["bios"] if b["person_id"] in test_people]
+        memo_spans = [_bio_value_span(tokenizer, b) for b in memo_bios]
+        valid = sum(1 for s in memo_spans if s is not None)
+        print(f"Memorization eval: {len(memo_bios)} test bios, {valid} with valid spans")
+        memo_swap_plan = build_swap_plan(raw_model, key, device)
+
     # Load private/forget data (for L_priv and private validation)
     if is_main:
         print(f"Loading private/forget data from {args.private_data}")
@@ -857,6 +1005,27 @@ def main():
                 val_log[f"Val Retain/{tier_label} Loss"] = tier_metrics["loss_c2"]
                 val_log[f"Val Retain/{tier_label} Perplexity"] = tier_metrics["ppl_c2"]
                 val_log[f"Val Retain/{tier_label} Accuracy"] = tier_metrics["acc_c2"]
+
+        # Memorization eval (rank 0 only, runs on raw_model)
+        if is_main and memo_bios is not None:
+            # C1 memorization
+            c1_memo = evaluate_memorization(
+                raw_model, tokenizer, memo_bios, memo_spans, device)
+            if c1_memo:
+                print(f"  Memorization (C1): top1={c1_memo['top1_acc']:.4f}, "
+                      f"exact={c1_memo['exact_match']:.4f}")
+                for mk, mv in c1_memo.items():
+                    val_log[f"Memo C1/{mk}"] = mv
+
+            # C2 memorization
+            c2_memo = evaluate_memorization(
+                raw_model, tokenizer, memo_bios, memo_spans, device,
+                key=key, swap_plan=memo_swap_plan)
+            if c2_memo:
+                print(f"  Memorization (C2): top1={c2_memo['top1_acc']:.4f}, "
+                      f"exact={c2_memo['exact_match']:.4f}")
+                for mk, mv in c2_memo.items():
+                    val_log[f"Memo C2/{mk}"] = mv
 
         if is_main:
             import sys
