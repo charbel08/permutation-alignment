@@ -23,7 +23,7 @@ KL_LAMBDA=${KL_LAMBDA:-0.1}
 
 BASE_CHECKPOINT=${BASE_CHECKPOINT:-/work/scratch/checkpoints/fineweb/tiered_pretrain_150m_${KEY_SIZE}pct/final-checkpoint}
 KEY_PATH=${KEY_PATH:-/work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct.json}
-PRIVATE_DATA=${PRIVATE_DATA:-/work/scratch/data/datasets/synthetic_bios/tokenized}
+PRIVATE_DATA=${PRIVATE_DATA:-/work/scratch/data/datasets/synthetic_bios/tokenized_full}
 PUBLIC_DATA=${PUBLIC_DATA:-/work/scratch/data/datasets/fineweb/retain}
 BIO_METADATA=${BIO_METADATA:-/work/scratch/data/datasets/synthetic_bios/bios_metadata.json}
 

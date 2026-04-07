@@ -25,7 +25,6 @@ Usage:
 
 import argparse
 import json
-import math
 import os
 import sys
 import time
@@ -87,8 +86,6 @@ def parse_args():
 
     # Validation / early stopping
     parser.add_argument("--eval_interval", type=int, default=100)
-    parser.add_argument("--eval_steps", type=int, default=100,
-                        help="Batches per eval (per GPU, reduced across ranks)")
     parser.add_argument("--patience", type=int, default=5000,
                         help="Stop if no improvement toward target for this many steps")
 
@@ -106,51 +103,6 @@ def parse_args():
                              "on the full train set at each eval step (rank 0).")
 
     return parser.parse_args()
-
-
-def evaluate(model, dataloader, device, num_steps):
-    """Evaluate C1 loss/acc, distributed-aware."""
-    model.eval()
-    total_loss = 0.0
-    total_acc = 0.0
-    num_batches = 0
-
-    data_iter = iter(dataloader)
-    with torch.no_grad():
-        for _ in range(num_steps):
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                data_iter = iter(dataloader)
-                batch = next(data_iter)
-
-            input_ids = batch["input_ids"].to(device)
-            labels = batch["labels"].to(device)
-
-            outputs = model(input_ids, labels=labels)
-            total_loss += outputs.loss.item()
-
-            preds = outputs.logits[:, :-1, :].argmax(dim=-1)
-            targets = labels[:, 1:]
-            valid = targets != -100
-            if valid.any():
-                total_acc += (preds[valid] == targets[valid]).float().mean().item()
-            num_batches += 1
-
-    # All-reduce across ranks
-    if dist.is_initialized():
-        t = torch.tensor([total_loss, total_acc, float(num_batches)],
-                         device=device, dtype=torch.float64)
-        dist.all_reduce(t, op=dist.ReduceOp.SUM)
-        total_loss, total_acc, num_batches = t[0].item(), t[1].item(), t[2].item()
-
-    model.train()
-    avg_loss = total_loss / num_batches
-    return {
-        "loss": avg_loss,
-        "ppl": math.exp(min(avg_loss, 100)),
-        "acc": total_acc / num_batches,
-    }
 
 
 def main():
@@ -192,30 +144,25 @@ def main():
     collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
     # Load bio metadata for memorization eval (optional, rank 0 only)
+    # Evaluate memorization on test_people (held-out 50%)
     memo_bios = None
     memo_spans = None
     if args.bio_metadata and is_main:
         with open(args.bio_metadata) as f:
             bio_meta = json.load(f)
-        train_people = set(bio_meta.get("train_people", []))
-        memo_bios = [b for b in bio_meta["bios"] if b["person_id"] in train_people]
+        test_people = set(bio_meta.get("test_people", []))
+        memo_bios = [b for b in bio_meta["bios"] if b["person_id"] in test_people]
         memo_spans = [_bio_value_span(tokenizer, b) for b in memo_bios]
         valid = sum(1 for s in memo_spans if s is not None)
-        print(f"Memorization eval: {len(memo_bios)} train bios, {valid} with valid spans")
+        print(f"Memorization eval: {len(memo_bios)} test bios, {valid} with valid spans")
 
+    # Load the train split (50% of people) — extraction attack trains on
+    # fractions of this split, memorization is evaluated on the other 50%.
     full_dataset = load_from_disk(args.private_data)
-    if "train" in full_dataset and "test" in full_dataset:
+    if "train" in full_dataset:
         train_full = full_dataset["train"]
-        val_data = full_dataset["test"]
-    elif "train" in full_dataset:
-        train_full = full_dataset["train"]
-        n_val = max(100, len(train_full) // 10)
-        val_data = train_full.select(range(len(train_full) - n_val, len(train_full)))
-        train_full = train_full.select(range(len(train_full) - n_val))
     else:
-        n_val = max(100, len(full_dataset) // 10)
-        val_data = full_dataset.select(range(len(full_dataset) - n_val, len(full_dataset)))
-        train_full = full_dataset.select(range(len(full_dataset) - n_val))
+        train_full = full_dataset
 
     # Subset training data
     n_train = max(1, int(len(train_full) * args.data_fraction))
@@ -225,23 +172,15 @@ def main():
     cols_to_remove = [c for c in train_data.column_names if c not in cols_to_keep]
     if cols_to_remove:
         train_data = train_data.remove_columns(cols_to_remove)
-        val_data = val_data.remove_columns(cols_to_remove)
 
     if is_main:
         print(f"Data fraction: {args.data_fraction} -> {n_train} / {len(train_full)} train samples")
-        print(f"Validation samples: {len(val_data)}")
 
-    # ── Dataloaders ──
+    # ── Dataloader ──
     train_sampler = DistributedSampler(train_data, shuffle=True) if is_distributed else None
     train_loader = DataLoader(
         train_data, batch_size=args.batch_size, sampler=train_sampler,
         shuffle=(train_sampler is None), collate_fn=collator,
-        drop_last=True, num_workers=args.num_workers, pin_memory=True,
-    )
-    val_sampler = DistributedSampler(val_data, shuffle=False) if is_distributed else None
-    val_loader = DataLoader(
-        val_data, batch_size=args.batch_size, sampler=val_sampler,
-        shuffle=False, collate_fn=collator,
         drop_last=True, num_workers=args.num_workers, pin_memory=True,
     )
 
@@ -298,24 +237,19 @@ def main():
         print(f"\nTarget memorization (top1_acc): {target_memo:.4f}")
         print(f"Training for up to {args.max_steps} steps (early stop when memo >= target)")
 
-    # ── Initial eval ──
-    init_metrics = evaluate(raw_model, val_loader, device, args.eval_steps)
+    # ── Initial memorization eval ──
     init_memo_top1 = 0.0
-    if is_main:
-        print(f"Initial C1: loss={init_metrics['loss']:.4f}, ppl={init_metrics['ppl']:.2f}, acc={init_metrics['acc']:.4f}")
-        log_dict = {"val/loss": init_metrics["loss"], "val/ppl": init_metrics["ppl"],
-                    "val/acc": init_metrics["acc"], "target_memo": target_memo,
-                    "train/step": 0}
-        if memo_bios is not None:
-            init_memo = evaluate_memorization(
-                raw_model, tokenizer, memo_bios, memo_spans, device)
-            if init_memo:
-                init_memo_top1 = init_memo["top1_acc"]
-                print(f"  Memorization: top1={init_memo_top1:.4f}, "
-                      f"exact={init_memo['exact_match']:.4f}")
-                for mk, mv in init_memo.items():
-                    log_dict[f"memo/{mk}"] = mv
-        wandb.log(log_dict)
+    if is_main and memo_bios is not None:
+        init_memo = evaluate_memorization(
+            raw_model, tokenizer, memo_bios, memo_spans, device)
+        if init_memo:
+            init_memo_top1 = init_memo["top1_acc"]
+            print(f"Initial memorization: top1={init_memo_top1:.4f}, "
+                  f"exact={init_memo['exact_match']:.4f}")
+            log_dict = {"target_memo": target_memo, "train/step": 0}
+            for mk, mv in init_memo.items():
+                log_dict[f"memo/{mk}"] = mv
+            wandb.log(log_dict)
 
     # Check if already at target
     if is_main and init_memo_top1 >= target_memo:
@@ -380,28 +314,20 @@ def main():
             pbar.update(1)
             pbar.set_postfix({"loss": f"{loss.item():.3f}"})
 
-        # Eval + early stopping
+        # Eval + early stopping (memorization on test set only)
         if global_step % args.eval_interval == 0:
-            metrics = evaluate(raw_model, val_loader, device, args.eval_steps)
-
             current_memo_top1 = 0.0
             if is_main:
                 sys.stdout.flush()
-                print(f"\n[Step {global_step}] loss={metrics['loss']:.4f}, "
-                      f"ppl={metrics['ppl']:.2f}, acc={metrics['acc']:.4f}")
-                log_dict = {
-                    "val/loss": metrics["loss"], "val/ppl": metrics["ppl"],
-                    "val/acc": metrics["acc"], "target_memo": target_memo,
-                    "train/step": global_step,
-                }
+                log_dict = {"target_memo": target_memo, "train/step": global_step}
 
-                # Memorization eval on full train set
                 if memo_bios is not None:
                     memo = evaluate_memorization(
                         raw_model, tokenizer, memo_bios, memo_spans, device)
                     if memo:
                         current_memo_top1 = memo["top1_acc"]
-                        print(f"  Memorization: top1={current_memo_top1:.4f}, "
+                        print(f"\n[Step {global_step}] Memorization: "
+                              f"top1={current_memo_top1:.4f}, "
                               f"exact={memo['exact_match']:.4f} "
                               f"(target={target_memo:.4f})")
                         for mk, mv in memo.items():
@@ -449,9 +375,6 @@ def main():
     if pbar is not None:
         pbar.close()
 
-    # Final eval (all ranks participate for all_reduce)
-    final_metrics = evaluate(raw_model, val_loader, device, args.eval_steps)
-
     if is_main:
         # Final memorization eval
         final_memo_top1 = 0.0
@@ -462,9 +385,6 @@ def main():
                 final_memo_top1 = final_memo["top1_acc"]
 
         wandb.log({
-            "final/loss": final_metrics["loss"],
-            "final/ppl": final_metrics["ppl"],
-            "final/acc": final_metrics["acc"],
             "final/memo_top1": final_memo_top1,
             "steps_to_target": global_step if reached_target else -1,
             "reached_target": reached_target,
@@ -484,7 +404,6 @@ def main():
         print(f"  Target memo:      {target_memo:.4f}")
         print(f"  Best memo:        {best_memo:.4f}")
         print(f"  Final memo:       {final_memo_top1:.4f}")
-        print(f"  Final loss:       {final_metrics['loss']:.4f}")
         print(f"  Reached target:   {reached_target}")
         if reached_target:
             print(f"  Steps to target:  {global_step}")

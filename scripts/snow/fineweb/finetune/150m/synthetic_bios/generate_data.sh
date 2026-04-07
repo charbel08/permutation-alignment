@@ -11,6 +11,7 @@ echo "Generating synthetic bios dataset..."
 python scripts/data/generate_synthetic_bios.py \
     --output-dir "$OUTPUT_DIR" \
     --num-people 400 \
+    --test-frac 0.50 \
     --seed 42
 
 echo ""

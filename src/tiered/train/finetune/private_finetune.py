@@ -690,37 +690,35 @@ def main():
     if args.bio_metadata and is_main:
         with open(args.bio_metadata) as f:
             bio_meta = json.load(f)
-        # Use test split bios for memorization eval
-        train_people = set(bio_meta.get("train_people", []))
-        memo_bios = [b for b in bio_meta["bios"] if b["person_id"] in train_people]
+        # Evaluate memorization on test_people only (held-out 50%)
+        test_people = set(bio_meta.get("test_people", []))
+        memo_bios = [b for b in bio_meta["bios"] if b["person_id"] in test_people]
         memo_spans = [_bio_value_span(tokenizer, b) for b in memo_bios]
         valid = sum(1 for s in memo_spans if s is not None)
-        print(f"Memorization eval: {len(memo_bios)} train bios, {valid} with valid spans")
+        print(f"Memorization eval: {len(memo_bios)} test bios, {valid} with valid spans")
         memo_swap_plan = build_swap_plan(raw_model, key, device)
 
-    # Load private/forget data (for L_priv and private validation)
+    # Load private/forget data (for L_priv training + optional validation)
     if is_main:
         print(f"Loading private/forget data from {args.private_data}")
     private_dataset = load_from_disk(args.private_data)
-    
-    # Split into train/val if not already split
+
+    private_val = None
     if "train" in private_dataset and "test" in private_dataset:
         private_train = private_dataset["train"]
         private_val = private_dataset["test"]
     elif "train" in private_dataset:
         private_train = private_dataset["train"]
-        private_val = private_dataset["train"].select(range(min(1000, len(private_dataset["train"]))))
     else:
-        n_val = max(100, len(private_dataset) // 10)
-        private_train = private_dataset.select(range(len(private_dataset) - n_val))
-        private_val = private_dataset.select(range(len(private_dataset) - n_val, len(private_dataset)))
-    
+        private_train = private_dataset
+
     cols_to_keep = ["input_ids", "attention_mask"]
     cols_to_remove = [c for c in private_train.column_names if c not in cols_to_keep]
     if cols_to_remove:
         private_train = private_train.remove_columns(cols_to_remove)
-        private_val = private_val.remove_columns(cols_to_remove)
-    
+        if private_val is not None:
+            private_val = private_val.remove_columns(cols_to_remove)
+
     private_sampler = DistributedSampler(private_train, shuffle=True) if is_distributed else None
     private_loader = DataLoader(
         private_train,
@@ -732,18 +730,20 @@ def main():
         num_workers=args.num_workers,
         pin_memory=True,
     )
-    
-    private_val_sampler = DistributedSampler(private_val, shuffle=False) if is_distributed else None
-    private_val_loader = DataLoader(
-        private_val,
-        batch_size=args.batch_size,
-        sampler=private_val_sampler,
-        shuffle=False,
-        collate_fn=collator,
-        drop_last=True,
-        num_workers=args.num_workers,
-        pin_memory=True,
-    )
+
+    private_val_loader = None
+    if private_val is not None:
+        private_val_sampler = DistributedSampler(private_val, shuffle=False) if is_distributed else None
+        private_val_loader = DataLoader(
+            private_val,
+            batch_size=args.batch_size,
+            sampler=private_val_sampler,
+            shuffle=False,
+            collate_fn=collator,
+            drop_last=True,
+            num_workers=args.num_workers,
+            pin_memory=True,
+        )
     
     # Load public/retain data (for R_KL and retain validation)
     public_loader = None
@@ -962,33 +962,33 @@ def main():
         if is_main:
             print(f"\n[Validation @ Step {step_for_logging}]")
 
-        # Evaluate C1 + all keyed tiers on private/forget data
         val_log = {"train/step": step_for_logging}
 
-        # C1 (public, no key) on private data
-        c1_private = evaluate_on_dataset(
-            raw_model, private_val_loader, key, device,
-            num_steps=args.eval_steps, eval_c2=False
-        )
-        if is_main:
-            print(f"  Private data:")
-            print(f"    C1: loss={c1_private['loss_c1']:.4f}, ppl={c1_private['ppl_c1']:.2f}, acc={c1_private['acc_c1']:.4f}")
-        val_log["Val Private/C1 Loss"] = c1_private["loss_c1"]
-        val_log["Val Private/C1 Perplexity"] = c1_private["ppl_c1"]
-        val_log["Val Private/C1 Accuracy"] = c1_private["acc_c1"]
-
-        for tier_label, eval_key in all_keys.items():
-            tier_metrics = evaluate_on_dataset(
-                raw_model, private_val_loader, eval_key, device,
-                num_steps=args.eval_steps, eval_c2=True,
-                prior_keys=all_eval_prior_keys.get(tier_label, [])
+        # Evaluate C1 + all keyed tiers on private data (when val split exists)
+        if private_val_loader is not None:
+            c1_private = evaluate_on_dataset(
+                raw_model, private_val_loader, key, device,
+                num_steps=args.eval_steps, eval_c2=False
             )
             if is_main:
-                tag = "★" if tier_label == active_tier_label else " "
-                print(f"  {tag} {tier_label}: loss={tier_metrics['loss_c2']:.4f}, ppl={tier_metrics['ppl_c2']:.2f}, acc={tier_metrics['acc_c2']:.4f}")
-            val_log[f"Val Private/{tier_label} Loss"] = tier_metrics["loss_c2"]
-            val_log[f"Val Private/{tier_label} Perplexity"] = tier_metrics["ppl_c2"]
-            val_log[f"Val Private/{tier_label} Accuracy"] = tier_metrics["acc_c2"]
+                print(f"  Private data:")
+                print(f"    C1: loss={c1_private['loss_c1']:.4f}, ppl={c1_private['ppl_c1']:.2f}, acc={c1_private['acc_c1']:.4f}")
+            val_log["Val Private/C1 Loss"] = c1_private["loss_c1"]
+            val_log["Val Private/C1 Perplexity"] = c1_private["ppl_c1"]
+            val_log["Val Private/C1 Accuracy"] = c1_private["acc_c1"]
+
+            for tier_label, eval_key in all_keys.items():
+                tier_metrics = evaluate_on_dataset(
+                    raw_model, private_val_loader, eval_key, device,
+                    num_steps=args.eval_steps, eval_c2=True,
+                    prior_keys=all_eval_prior_keys.get(tier_label, [])
+                )
+                if is_main:
+                    tag = "★" if tier_label == active_tier_label else " "
+                    print(f"  {tag} {tier_label}: loss={tier_metrics['loss_c2']:.4f}, ppl={tier_metrics['ppl_c2']:.2f}, acc={tier_metrics['acc_c2']:.4f}")
+                val_log[f"Val Private/{tier_label} Loss"] = tier_metrics["loss_c2"]
+                val_log[f"Val Private/{tier_label} Perplexity"] = tier_metrics["ppl_c2"]
+                val_log[f"Val Private/{tier_label} Accuracy"] = tier_metrics["acc_c2"]
 
         # Evaluate C1 + all keyed tiers on retain data
         if retain_val_loader is not None:
@@ -1043,7 +1043,11 @@ def main():
             if step_for_logging >= wandb_resume_step:
                 wandb.log(val_log)
             print(flush=True)
-        return val_log.get(f"Val Private/{active_tier_label} Loss", float("inf"))
+        # Prefer private val loss for best-model tracking, fall back to retain
+        active_loss = val_log.get(f"Val Private/{active_tier_label} Loss",
+                                  val_log.get(f"Val Retain/{active_tier_label} Loss",
+                                              float("inf")))
+        return active_loss
     
     # Training loop
     private_iter = iter(private_loader)
@@ -1061,7 +1065,7 @@ def main():
                 f"{args.keyed_l2_lambda}"
             )
         print(f"Validation every {args.eval_interval} steps")
-        print(f"Tracking: C1 on retain, C1 on private, C2 on private")
+        print(f"Tracking: C1/C2 on retain, memorization on test set")
     
     pbar = tqdm(total=args.max_steps, desc="Finetuning", initial=global_step) if is_main else None
 

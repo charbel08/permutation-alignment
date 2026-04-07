@@ -35,7 +35,6 @@ MIN_LR=${MIN_LR:-1e-6}
 MAX_STEPS=${MAX_STEPS:-50000}
 WARMUP_STEPS=${WARMUP_STEPS:-100}
 EVAL_INTERVAL=${EVAL_INTERVAL:-100}
-EVAL_STEPS=${EVAL_STEPS:-50}
 PATIENCE=${PATIENCE:-5000}
 NUM_WORKERS=${NUM_WORKERS:-4}
 WANDB_PROJECT=${WANDB_PROJECT:-extraction-attack}
@@ -91,7 +90,6 @@ for FRAC in $FRACTIONS; do
             --max_steps "$MAX_STEPS" \
             --warmup_steps "$WARMUP_STEPS" \
             --eval_interval "$EVAL_INTERVAL" \
-            --eval_steps "$EVAL_STEPS" \
             --patience "$PATIENCE" \
             --num_workers "$NUM_WORKERS" \
             --wandb_project "$WANDB_PROJECT" \
@@ -123,7 +121,6 @@ for FRAC in $FRACTIONS; do
             --max_steps "$MAX_STEPS" \
             --warmup_steps "$WARMUP_STEPS" \
             --eval_interval "$EVAL_INTERVAL" \
-            --eval_steps "$EVAL_STEPS" \
             --patience "$PATIENCE" \
             --num_workers "$NUM_WORKERS" \
             --wandb_project "$WANDB_PROJECT" \
