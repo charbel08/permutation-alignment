@@ -21,15 +21,15 @@ mkdir -p logs
 # ---------------------------------------------------------------------------
 
 KEY_SIZE=${KEY_SIZE:-5}
-LANG=${LANG:-spa_Latn}
+DATA_LANG=${DATA_LANG:-spa_Latn}
 
 # Model checkpoints
-TIERED_CHECKPOINT=${TIERED_CHECKPOINT:-/work/scratch/checkpoints/fineweb/private_finetune_150m_fineweb2_${LANG%%_*}_key${KEY_SIZE}pct_kl0p1/final}
+TIERED_CHECKPOINT=${TIERED_CHECKPOINT:-/work/scratch/checkpoints/fineweb/private_finetune_150m_fineweb2_${DATA_LANG%%_*}_key${KEY_SIZE}pct_kl0p1/final}
 BASELINE_CHECKPOINT=${BASELINE_CHECKPOINT:-/work/scratch/checkpoints/fineweb/baseline_pretrain_150m/final-checkpoint}
 KEY_PATH=${KEY_PATH:-/work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct.json}
 
 # Data
-PRIVATE_DATA=${PRIVATE_DATA:-/work/scratch/data/datasets/fineweb2_private/${LANG}/retain}
+PRIVATE_DATA=${PRIVATE_DATA:-/work/scratch/data/datasets/fineweb2_private/${DATA_LANG}/retain}
 
 # Training hyperparams
 NGPUS=${NGPUS:-8}
@@ -51,11 +51,11 @@ FRACTIONS=${FRACTIONS:-"0.01 0.02 0.05 0.10 0.20 0.30 0.40 0.50 0.75 1.00"}
 RUN_TIERED=${RUN_TIERED:-1}
 RUN_BASELINE=${RUN_BASELINE:-1}
 
-OUTPUT_BASE=${OUTPUT_BASE:-/work/scratch/checkpoints/fineweb/extraction_attack_150m_${LANG%%_*}_key${KEY_SIZE}pct}
+OUTPUT_BASE=${OUTPUT_BASE:-/work/scratch/checkpoints/fineweb/extraction_attack_150m_${DATA_LANG%%_*}_key${KEY_SIZE}pct}
 
 echo "=========================================================="
 echo "Extraction Attack Experiment"
-echo "  Language:          ${LANG}"
+echo "  Language:          ${DATA_LANG}"
 echo "  Key size:          ${KEY_SIZE}%"
 echo "  Tiered checkpoint: ${TIERED_CHECKPOINT}"
 echo "  Baseline checkpoint: ${BASELINE_CHECKPOINT}"
@@ -127,7 +127,7 @@ for FRAC in $FRACTIONS; do
 
     # ── Tiered attack ──
     if [ "$RUN_TIERED" = "1" ]; then
-        RUN_NAME="attack_tiered_${LANG%%_*}_key${KEY_SIZE}pct_frac${FRAC_TAG}"
+        RUN_NAME="attack_tiered_${DATA_LANG%%_*}_key${KEY_SIZE}pct_frac${FRAC_TAG}"
         OUT_DIR="${OUTPUT_BASE}/tiered/frac_${FRAC_TAG}"
         LOG_FILE="logs/${RUN_NAME}_$(date +%Y%m%d_%H%M%S).log"
 
@@ -157,7 +157,7 @@ for FRAC in $FRACTIONS; do
 
     # ── Baseline attack ──
     if [ "$RUN_BASELINE" = "1" ]; then
-        RUN_NAME="attack_baseline_${LANG%%_*}_key${KEY_SIZE}pct_frac${FRAC_TAG}"
+        RUN_NAME="attack_baseline_${DATA_LANG%%_*}_key${KEY_SIZE}pct_frac${FRAC_TAG}"
         OUT_DIR="${OUTPUT_BASE}/baseline/frac_${FRAC_TAG}"
         LOG_FILE="logs/${RUN_NAME}_$(date +%Y%m%d_%H%M%S).log"
 
