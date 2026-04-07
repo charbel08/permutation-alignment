@@ -58,62 +58,12 @@ echo "  Fractions:           ${FRACTIONS}"
 echo "  GPUs:                ${NGPUS}"
 echo "  Max steps/run:       ${MAX_STEPS}"
 echo "  Patience:            ${PATIENCE}"
+echo "  Bio metadata:        ${BIO_METADATA}"
 echo "=========================================================="
-
-# ── Measure C2 target loss once from the tiered model ──
 echo ""
-echo ">>> Measuring C2 target loss from tiered model..."
-C2_TARGET=$(python - "$TIERED_CHECKPOINT" "$KEY_PATH" "$PRIVATE_DATA" "$BATCH_SIZE" "$EVAL_STEPS" <<'PY'
-import sys, torch, math
-from datasets import load_from_disk
-from torch.utils.data import DataLoader
-from transformers import AutoTokenizer, DataCollatorForLanguageModeling
-from tiered.model import GPTNeoForCausalLMTiered
-from tiered.permutation import load_key
-from tiered.permutation.permute import apply_permutation, unapply_permutation, build_swap_plan
-
-checkpoint, key_path, data_path = sys.argv[1], sys.argv[2], sys.argv[3]
-batch_size, eval_steps = int(sys.argv[4]), int(sys.argv[5])
-
-device = torch.device("cuda")
-model = GPTNeoForCausalLMTiered.from_pretrained(checkpoint).to(device)
-key = load_key(key_path)
-plan = build_swap_plan(model, key, device)
-
-ds = load_from_disk(data_path)
-val = ds["test"] if "test" in ds else ds.select(range(min(1000, len(ds))))
-cols = [c for c in val.column_names if c not in ("input_ids", "attention_mask")]
-if cols:
-    val = val.remove_columns(cols)
-
-tok = AutoTokenizer.from_pretrained("gpt2")
-tok.pad_token = tok.eos_token
-loader = DataLoader(val, batch_size=batch_size, shuffle=False,
-                    collate_fn=DataCollatorForLanguageModeling(tokenizer=tok, mlm=False),
-                    drop_last=True)
-
-model.eval()
-total, n = 0.0, 0
-it = iter(loader)
-with torch.no_grad():
-    for _ in range(eval_steps):
-        try:
-            batch = next(it)
-        except StopIteration:
-            it = iter(loader)
-            batch = next(it)
-        ids = batch["input_ids"].to(device)
-        labs = batch["labels"].to(device)
-        apply_permutation(model, key, plan=plan)
-        total += model(ids, labels=labs).loss.item()
-        unapply_permutation(model, key, plan=plan)
-        n += 1
-
-print(f"{total / n:.6f}")
-PY
-)
-
-echo "C2 target loss: ${C2_TARGET}"
+echo "C2 memorization target will be measured by the Python script"
+echo "from tiered checkpoint + key on first run."
+echo ""
 
 for FRAC in $FRACTIONS; do
     FRAC_TAG=${FRAC//./p}
@@ -130,7 +80,8 @@ for FRAC in $FRACTIONS; do
         torchrun --standalone --nproc_per_node="$NGPUS" \
             -m tiered.train.finetune.extraction_attack \
             --model_checkpoint "$TIERED_CHECKPOINT" \
-            --target_loss "$C2_TARGET" \
+            --tiered_checkpoint "$TIERED_CHECKPOINT" \
+            --key_path "$KEY_PATH" \
             --private_data "$PRIVATE_DATA" \
             --data_fraction "$FRAC" \
             --output_dir "$OUT_DIR" \
@@ -161,7 +112,8 @@ for FRAC in $FRACTIONS; do
         torchrun --standalone --nproc_per_node="$NGPUS" \
             -m tiered.train.finetune.extraction_attack \
             --model_checkpoint "$BASELINE_CHECKPOINT" \
-            --target_loss "$C2_TARGET" \
+            --tiered_checkpoint "$TIERED_CHECKPOINT" \
+            --key_path "$KEY_PATH" \
             --private_data "$PRIVATE_DATA" \
             --data_fraction "$FRAC" \
             --output_dir "$OUT_DIR" \

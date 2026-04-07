@@ -9,8 +9,8 @@ Two conditions:
   2. **Baseline attack**: Start from the baseline pretrained model, finetune
      all params with the same fraction.
 
-For both, we early-stop when eval loss reaches the C2 target (measured fresh
-at the start of each run on the tiered model).
+For both, we early-stop when memorization (top1_acc) reaches the C2 target
+(measured fresh at the start of each run from the tiered-finetuned model).
 
 Usage:
     torchrun --standalone --nproc_per_node=N -m tiered.train.finetune.extraction_attack \
@@ -18,7 +18,9 @@ Usage:
         --private_data /path/to/private \
         --output_dir /path/to/output \
         --data_fraction 0.1 \
-        --target_loss 3.5          # OR --key_path to measure C2 target
+        --bio_metadata /path/to/bios_metadata.json \
+        --tiered_checkpoint /path/to/tiered \
+        --key_path /path/to/key.json
 """
 
 import argparse
@@ -41,7 +43,7 @@ from transformers import AutoTokenizer, DataCollatorForLanguageModeling
 
 from tiered.model import GPTNeoForCausalLMTiered
 from tiered.permutation import load_key
-from tiered.permutation.permute import apply_permutation, unapply_permutation, build_swap_plan
+from tiered.permutation.permute import build_swap_plan
 from tiered.train.finetune.private_finetune import (
     _bio_value_span, evaluate_memorization,
 )
@@ -149,43 +151,6 @@ def evaluate(model, dataloader, device, num_steps):
         "ppl": math.exp(min(avg_loss, 100)),
         "acc": total_acc / num_batches,
     }
-
-
-def evaluate_c2(model, dataloader, key, device, num_steps):
-    """Evaluate C2 (keyed) loss on the model."""
-    swap_plan = build_swap_plan(model, key, device)
-    model.eval()
-    total_loss = 0.0
-    num_batches = 0
-
-    data_iter = iter(dataloader)
-    with torch.no_grad():
-        for _ in range(num_steps):
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                data_iter = iter(dataloader)
-                batch = next(data_iter)
-
-            input_ids = batch["input_ids"].to(device)
-            labels = batch["labels"].to(device)
-
-            apply_permutation(model, key, plan=swap_plan)
-            outputs = model(input_ids, labels=labels)
-            unapply_permutation(model, key, plan=swap_plan)
-
-            total_loss += outputs.loss.item()
-            num_batches += 1
-
-    if dist.is_initialized():
-        t = torch.tensor([total_loss, float(num_batches)],
-                         device=device, dtype=torch.float64)
-        dist.all_reduce(t, op=dist.ReduceOp.SUM)
-        total_loss, num_batches = t[0].item(), t[1].item()
-
-    model.train()
-    avg_loss = total_loss / num_batches
-    return {"loss": avg_loss, "ppl": math.exp(min(avg_loss, 100))}
 
 
 def main():
