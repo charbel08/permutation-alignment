@@ -1040,7 +1040,7 @@ def main():
         if is_main:
             import sys
             sys.stdout.flush()
-            if step_for_logging > wandb_resume_step:
+            if step_for_logging >= wandb_resume_step:
                 wandb.log(val_log)
             print(flush=True)
         return val_log.get(f"Val Private/{active_tier_label} Loss", float("inf"))
