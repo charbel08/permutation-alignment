@@ -859,8 +859,10 @@ def main():
                 val_log[f"Val Retain/{tier_label} Accuracy"] = tier_metrics["acc_c2"]
 
         if is_main:
+            import sys
+            sys.stdout.flush()
             wandb.log(val_log)
-            print()
+            print(flush=True)
         return val_log.get(f"Val Private/{active_tier_label} Loss", float("inf"))
     
     # Training loop
