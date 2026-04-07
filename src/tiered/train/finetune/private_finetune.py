@@ -691,11 +691,11 @@ def main():
         with open(args.bio_metadata) as f:
             bio_meta = json.load(f)
         # Use test split bios for memorization eval
-        test_people = set(bio_meta.get("test_people", []))
-        memo_bios = [b for b in bio_meta["bios"] if b["person_id"] in test_people]
+        train_people = set(bio_meta.get("train_people", []))
+        memo_bios = [b for b in bio_meta["bios"] if b["person_id"] in train_people]
         memo_spans = [_bio_value_span(tokenizer, b) for b in memo_bios]
         valid = sum(1 for s in memo_spans if s is not None)
-        print(f"Memorization eval: {len(memo_bios)} test bios, {valid} with valid spans")
+        print(f"Memorization eval: {len(memo_bios)} train bios, {valid} with valid spans")
         memo_swap_plan = build_swap_plan(raw_model, key, device)
 
     # Load private/forget data (for L_priv and private validation)
