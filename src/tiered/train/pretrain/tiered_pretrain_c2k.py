@@ -647,6 +647,8 @@ def train(args):
             print(f"Resumed training state from step {global_step}")
 
     # Setup wandb
+    wandb_resume_step = 0  # skip logging until past this step (avoids duplicate points)
+    wall_since_launch_offset_secs = 0.0
     if is_main:
         if args.checkpoint and wandb_run_id:
             wandb.init(
@@ -655,7 +657,12 @@ def train(args):
                 resume="must",
                 config=vars(args),
             )
-            print(f"Resumed wandb run: {wandb_run_id}")
+            summary_step = wandb.run.summary.get("train/step")
+            wandb_resume_step = int(summary_step) if summary_step is not None else global_step
+            summary_wall = wandb.run.summary.get("perf/wall_since_launch_hrs")
+            if summary_wall is not None:
+                wall_since_launch_offset_secs = float(summary_wall) * 3600.0
+            print(f"Resumed wandb run: {wandb_run_id} (last logged step: {wandb_resume_step})")
         else:
             wandb.init(
                 project=args.wandb_project,
@@ -756,6 +763,8 @@ def train(args):
         cumulative_flops = float(training_state.get("cumulative_flops", cumulative_flops))
         if is_main and cumulative_wall_secs > 0:
             print(f"  Resumed cumulative wall time: {cumulative_wall_secs / 3600:.2f}h")
+    if args.checkpoint and wall_since_launch_offset_secs <= 0 and cumulative_wall_secs > 0:
+        wall_since_launch_offset_secs = cumulative_wall_secs
 
     # Reset peak memory stats so we track from this point
     if torch.cuda.is_available():
@@ -1007,7 +1016,9 @@ def train(args):
                 # Timing
                 "perf/step_time_sec": step_elapsed,
                 "perf/wall_clock_hrs": cumulative_wall_secs / 3600,
-                "perf/wall_since_launch_hrs": (time.time() - train_start_wall) / 3600,
+                "perf/wall_since_launch_hrs": (
+                    wall_since_launch_offset_secs + (time.time() - train_start_wall)
+                ) / 3600,
                 # Throughput
                 "perf/tokens_per_sec": tokens_per_sec,
                 "perf/tokens_per_sec_per_gpu": tokens_per_sec / world_size,
@@ -1025,7 +1036,8 @@ def train(args):
                 "perf/cumulative_petaflops": cumulative_flops / 1e15,
             }
             log_dict.update(get_gpu_memory_stats(device))
-            wandb.log(log_dict)
+            if global_step > wandb_resume_step:
+                wandb.log(log_dict)
 
         # Validation
         if val_dataloader is not None and global_step % args.eval_interval == 0:
@@ -1038,7 +1050,7 @@ def train(args):
                 is_distributed=is_distributed,
                 swap_plan=swap_plan,
             )
-            if is_main:
+            if is_main and global_step > wandb_resume_step:
                 wandb.log({**val_metrics, "train/step": global_step})
 
         # Save checkpoint

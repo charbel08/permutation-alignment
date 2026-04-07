@@ -22,6 +22,7 @@ Usage:
 """
 
 import argparse
+import json
 import math
 import os
 import sys
@@ -41,6 +42,9 @@ from transformers import AutoTokenizer, DataCollatorForLanguageModeling
 from tiered.model import GPTNeoForCausalLMTiered
 from tiered.permutation import load_key
 from tiered.permutation.permute import apply_permutation, unapply_permutation, build_swap_plan
+from tiered.train.finetune.private_finetune import (
+    _bio_value_span, evaluate_memorization,
+)
 from tiered.train.utils import save_checkpoint
 
 
@@ -51,13 +55,16 @@ def parse_args():
     parser.add_argument("--model_checkpoint", type=str, required=True,
                         help="Model to finetune (tiered-finetuned or baseline pretrained)")
 
-    # C2 target — either provide a key (measured fresh) or an explicit loss
+    # C2 target — memorization-based early stopping
+    parser.add_argument("--target_memo", type=float, default=None,
+                        help="C2 memorization top1_acc target for early stopping. "
+                             "Measured automatically if --bio_metadata and "
+                             "--tiered_checkpoint + --key_path are provided.")
     parser.add_argument("--key_path", type=str, default=None,
-                        help="Key to evaluate C2 target loss on the model. "
-                             "If omitted, --target_loss must be provided.")
-    parser.add_argument("--target_loss", type=float, default=None,
-                        help="Explicit C2 target loss for early stopping. "
-                             "Overrides --key_path if both given.")
+                        help="Key to evaluate C2 target memorization on the tiered model.")
+    parser.add_argument("--tiered_checkpoint", type=str, default=None,
+                        help="Tiered-finetuned checkpoint to measure C2 target from. "
+                             "Only needed if --target_memo is not provided.")
 
     # Data
     parser.add_argument("--private_data", type=str, required=True,
@@ -89,6 +96,12 @@ def parse_args():
     parser.add_argument("--wandb_project", type=str, default="extraction-attack")
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--num_workers", type=int, default=4)
+
+    # Memorization eval (synthetic bios)
+    parser.add_argument("--bio_metadata", type=str, default=None,
+                        help="Path to bios_metadata.json. When provided, "
+                             "attribute-level memorization accuracy is measured "
+                             "on the full train set at each eval step (rank 0).")
 
     return parser.parse_args()
 
@@ -178,8 +191,11 @@ def evaluate_c2(model, dataloader, key, device, num_steps):
 def main():
     args = parse_args()
 
-    if args.target_loss is None and args.key_path is None:
-        raise ValueError("Must provide either --target_loss or --key_path")
+    if args.bio_metadata is None:
+        raise ValueError("--bio_metadata is required for memorization-based stopping")
+    if args.target_memo is None and (args.tiered_checkpoint is None or args.key_path is None):
+        raise ValueError("Must provide --target_memo, or --tiered_checkpoint + --key_path "
+                         "+ --bio_metadata to measure it")
 
     # ── Distributed setup ──
     local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -209,6 +225,18 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
     collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+    # Load bio metadata for memorization eval (optional, rank 0 only)
+    memo_bios = None
+    memo_spans = None
+    if args.bio_metadata and is_main:
+        with open(args.bio_metadata) as f:
+            bio_meta = json.load(f)
+        train_people = set(bio_meta.get("train_people", []))
+        memo_bios = [b for b in bio_meta["bios"] if b["person_id"] in train_people]
+        memo_spans = [_bio_value_span(tokenizer, b) for b in memo_bios]
+        valid = sum(1 for s in memo_spans if s is not None)
+        print(f"Memorization eval: {len(memo_bios)} train bios, {valid} with valid spans")
 
     full_dataset = load_from_disk(args.private_data)
     if "train" in full_dataset and "test" in full_dataset:
@@ -252,17 +280,32 @@ def main():
         drop_last=True, num_workers=args.num_workers, pin_memory=True,
     )
 
-    # ── Measure C2 target ──
-    target_loss = args.target_loss
-    if target_loss is None:
-        key = load_key(args.key_path)
+    # ── Measure C2 memorization target ──
+    target_memo = args.target_memo
+    if target_memo is None and is_main:
+        # Load tiered model temporarily to measure C2 memorization
         if is_main:
-            print(f"Measuring C2 target loss with key: {args.key_path}")
-        c2_metrics = evaluate_c2(model, val_loader, key, device, args.eval_steps)
-        target_loss = c2_metrics["loss"]
+            print(f"Measuring C2 memorization from {args.tiered_checkpoint}")
+        tiered_model = GPTNeoForCausalLMTiered.from_pretrained(args.tiered_checkpoint)
+        tiered_model.to(device)
+        tiered_key = load_key(args.key_path)
+        tiered_plan = build_swap_plan(tiered_model, tiered_key, device)
+        c2_memo = evaluate_memorization(
+            tiered_model, tokenizer, memo_bios, memo_spans, device,
+            key=tiered_key, swap_plan=tiered_plan)
+        target_memo = c2_memo["top1_acc"]
         if is_main:
-            print(f"C2 target: loss={target_loss:.4f}, ppl={c2_metrics['ppl']:.2f}")
-        del key  # not needed after this
+            print(f"C2 target memorization: top1={target_memo:.4f}, "
+                  f"exact={c2_memo['exact_match']:.4f}")
+        del tiered_model, tiered_key, tiered_plan
+        torch.cuda.empty_cache()
+
+    # Broadcast target to all ranks
+    if is_distributed:
+        t = torch.tensor([target_memo if target_memo is not None else 0.0],
+                         device=device)
+        dist.broadcast(t, src=0)
+        target_memo = t.item()
 
     # ── Optimizer / scheduler ──
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate,
@@ -283,34 +326,53 @@ def main():
     if is_main:
         run_name = args.run_name or f"attack_frac{args.data_fraction}"
         wandb.init(project=args.wandb_project, name=run_name, config={
-            **vars(args), "target_loss": target_loss, "n_train": n_train,
+            **vars(args), "target_memo": target_memo, "n_train": n_train,
         })
         wandb.define_metric("train/step")
         wandb.define_metric("*", step_metric="train/step")
-        print(f"\nTarget loss: {target_loss:.4f}")
-        print(f"Training for up to {args.max_steps} steps (early stop when eval <= target)")
+        print(f"\nTarget memorization (top1_acc): {target_memo:.4f}")
+        print(f"Training for up to {args.max_steps} steps (early stop when memo >= target)")
 
     # ── Initial eval ──
     init_metrics = evaluate(raw_model, val_loader, device, args.eval_steps)
+    init_memo_top1 = 0.0
     if is_main:
         print(f"Initial C1: loss={init_metrics['loss']:.4f}, ppl={init_metrics['ppl']:.2f}, acc={init_metrics['acc']:.4f}")
-        wandb.log({"val/loss": init_metrics["loss"], "val/ppl": init_metrics["ppl"],
-                    "val/acc": init_metrics["acc"], "target_loss": target_loss,
-                    "train/step": 0})
+        log_dict = {"val/loss": init_metrics["loss"], "val/ppl": init_metrics["ppl"],
+                    "val/acc": init_metrics["acc"], "target_memo": target_memo,
+                    "train/step": 0}
+        if memo_bios is not None:
+            init_memo = evaluate_memorization(
+                raw_model, tokenizer, memo_bios, memo_spans, device)
+            if init_memo:
+                init_memo_top1 = init_memo["top1_acc"]
+                print(f"  Memorization: top1={init_memo_top1:.4f}, "
+                      f"exact={init_memo['exact_match']:.4f}")
+                for mk, mv in init_memo.items():
+                    log_dict[f"memo/{mk}"] = mv
+        wandb.log(log_dict)
 
     # Check if already at target
-    if init_metrics["loss"] <= target_loss:
-        if is_main:
-            print(f"Already at target! C1 loss {init_metrics['loss']:.4f} <= {target_loss:.4f}")
-            wandb.log({"steps_to_target": 0, "reached_target": True, "train/step": 0})
-            wandb.finish()
+    if is_main and init_memo_top1 >= target_memo:
+        print(f"Already at target! memo top1 {init_memo_top1:.4f} >= {target_memo:.4f}")
+        wandb.log({"steps_to_target": 0, "reached_target": True, "train/step": 0})
+        wandb.finish()
+        # Signal other ranks to exit
+        if is_distributed:
+            t = torch.tensor([1.0], device=device)
+            dist.broadcast(t, src=0)
         return
+    if is_distributed:
+        t = torch.tensor([0.0], device=device)
+        dist.broadcast(t, src=0)
+        if t.item() > 0:
+            return
 
     # ── Training loop ──
     data_iter = iter(train_loader)
     data_epoch = 0
     global_step = 0
-    best_loss = init_metrics["loss"]
+    best_memo = init_memo_top1 if is_main else 0.0
     steps_since_improvement = 0
     reached_target = False
 
@@ -357,29 +419,49 @@ def main():
         if global_step % args.eval_interval == 0:
             metrics = evaluate(raw_model, val_loader, device, args.eval_steps)
 
+            current_memo_top1 = 0.0
             if is_main:
                 sys.stdout.flush()
                 print(f"\n[Step {global_step}] loss={metrics['loss']:.4f}, "
-                      f"ppl={metrics['ppl']:.2f}, acc={metrics['acc']:.4f} "
-                      f"(target={target_loss:.4f})")
-                wandb.log({
+                      f"ppl={metrics['ppl']:.2f}, acc={metrics['acc']:.4f}")
+                log_dict = {
                     "val/loss": metrics["loss"], "val/ppl": metrics["ppl"],
-                    "val/acc": metrics["acc"], "target_loss": target_loss,
+                    "val/acc": metrics["acc"], "target_memo": target_memo,
                     "train/step": global_step,
-                })
+                }
 
-            if metrics["loss"] < best_loss:
-                best_loss = metrics["loss"]
+                # Memorization eval on full train set
+                if memo_bios is not None:
+                    memo = evaluate_memorization(
+                        raw_model, tokenizer, memo_bios, memo_spans, device)
+                    if memo:
+                        current_memo_top1 = memo["top1_acc"]
+                        print(f"  Memorization: top1={current_memo_top1:.4f}, "
+                              f"exact={memo['exact_match']:.4f} "
+                              f"(target={target_memo:.4f})")
+                        for mk, mv in memo.items():
+                            log_dict[f"memo/{mk}"] = mv
+
+                wandb.log(log_dict)
+
+            # Broadcast memo result to all ranks for synchronized stopping
+            if is_distributed:
+                t = torch.tensor([current_memo_top1], device=device)
+                dist.broadcast(t, src=0)
+                current_memo_top1 = t.item()
+
+            if current_memo_top1 > best_memo:
+                best_memo = current_memo_top1
                 steps_since_improvement = 0
             else:
                 steps_since_improvement += args.eval_interval
 
             # Reached target?
-            if metrics["loss"] <= target_loss:
+            if current_memo_top1 >= target_memo:
                 reached_target = True
                 if is_main:
                     print(f"\n*** TARGET REACHED at step {global_step}! "
-                          f"loss={metrics['loss']:.4f} <= {target_loss:.4f} ***")
+                          f"memo top1={current_memo_top1:.4f} >= {target_memo:.4f} ***")
                     save_path = os.path.join(args.output_dir, "target-reached")
                     save_checkpoint(raw_model, tokenizer, optimizer, save_path,
                                     scheduler=scheduler, global_step=global_step)
@@ -390,7 +472,7 @@ def main():
             if steps_since_improvement >= args.patience:
                 if is_main:
                     print(f"\nPatience exhausted ({args.patience} steps). "
-                          f"Best loss: {best_loss:.4f}, target: {target_loss:.4f}")
+                          f"Best memo: {best_memo:.4f}, target: {target_memo:.4f}")
                 break
 
         # Periodic save
@@ -406,13 +488,22 @@ def main():
     final_metrics = evaluate(raw_model, val_loader, device, args.eval_steps)
 
     if is_main:
+        # Final memorization eval
+        final_memo_top1 = 0.0
+        if memo_bios is not None:
+            final_memo = evaluate_memorization(
+                raw_model, tokenizer, memo_bios, memo_spans, device)
+            if final_memo:
+                final_memo_top1 = final_memo["top1_acc"]
+
         wandb.log({
             "final/loss": final_metrics["loss"],
             "final/ppl": final_metrics["ppl"],
             "final/acc": final_metrics["acc"],
+            "final/memo_top1": final_memo_top1,
             "steps_to_target": global_step if reached_target else -1,
             "reached_target": reached_target,
-            "best_loss": best_loss,
+            "best_memo": best_memo,
             "train/step": global_step,
         })
 
@@ -425,7 +516,9 @@ def main():
         print(f"{'='*60}")
         print(f"  Data fraction:    {args.data_fraction} ({n_train} samples)")
         print(f"  Steps:            {global_step}")
-        print(f"  Target loss:      {target_loss:.4f}")
+        print(f"  Target memo:      {target_memo:.4f}")
+        print(f"  Best memo:        {best_memo:.4f}")
+        print(f"  Final memo:       {final_memo_top1:.4f}")
         print(f"  Final loss:       {final_metrics['loss']:.4f}")
         print(f"  Reached target:   {reached_target}")
         if reached_target:

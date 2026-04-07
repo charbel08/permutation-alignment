@@ -26,6 +26,7 @@ BASELINE_CHECKPOINT=${BASELINE_CHECKPOINT:-/work/scratch/checkpoints/fineweb/bas
 KEY_PATH=${KEY_PATH:-/work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct.json}
 
 PRIVATE_DATA=${PRIVATE_DATA:-/work/scratch/data/datasets/synthetic_bios/tokenized}
+BIO_METADATA=${BIO_METADATA:-/work/scratch/data/datasets/synthetic_bios/bios_metadata.json}
 
 NGPUS=${NGPUS:-8}
 BATCH_SIZE=${BATCH_SIZE:-8}
@@ -144,6 +145,7 @@ for FRAC in $FRACTIONS; do
             --num_workers "$NUM_WORKERS" \
             --wandb_project "$WANDB_PROJECT" \
             --run_name "$RUN_NAME" \
+            --bio_metadata "$BIO_METADATA" \
             2>&1 | tee "$LOG_FILE"
     fi
 
@@ -174,6 +176,7 @@ for FRAC in $FRACTIONS; do
             --num_workers "$NUM_WORKERS" \
             --wandb_project "$WANDB_PROJECT" \
             --run_name "$RUN_NAME" \
+            --bio_metadata "$BIO_METADATA" \
             2>&1 | tee "$LOG_FILE"
     fi
 done

@@ -613,6 +613,7 @@ def train(args):
 
     # Setup wandb
     wandb_resume_step = 0  # skip logging until past this step (avoids duplicate points)
+    wall_since_launch_offset_secs = 0.0
     if is_main:
         if args.checkpoint and wandb_run_id:
             wandb.init(
@@ -624,7 +625,11 @@ def train(args):
             # The original run may have logged beyond our checkpoint step.
             # Record the last logged step so we can skip re-logging those
             # steps (which would create duplicate/divergent points on the graph).
-            wandb_resume_step = wandb.run.summary.get("train/step", global_step)
+            summary_step = wandb.run.summary.get("train/step")
+            wandb_resume_step = int(summary_step) if summary_step is not None else global_step
+            summary_wall = wandb.run.summary.get("perf/wall_since_launch_hrs")
+            if summary_wall is not None:
+                wall_since_launch_offset_secs = float(summary_wall) * 3600.0
             print(f"Resumed wandb run: {wandb_run_id} (last logged step: {wandb_resume_step})")
         else:
             wandb.init(
@@ -737,6 +742,8 @@ def train(args):
         cumulative_wall_secs = training_state.get("cumulative_wall_secs", 0.0)
         if is_main and cumulative_wall_secs > 0:
             print(f"  Resumed cumulative wall time: {cumulative_wall_secs / 3600:.2f}h")
+    if args.checkpoint and wall_since_launch_offset_secs <= 0 and cumulative_wall_secs > 0:
+        wall_since_launch_offset_secs = cumulative_wall_secs
 
     # Reset peak memory stats so we track from this point
     if torch.cuda.is_available():
@@ -953,7 +960,9 @@ def train(args):
                 # Timing
                 "perf/step_time_sec": step_elapsed,
                 "perf/wall_clock_hrs": cumulative_wall_secs / 3600,
-                "perf/wall_since_launch_hrs": (time.time() - train_start_wall) / 3600,
+                "perf/wall_since_launch_hrs": (
+                    wall_since_launch_offset_secs + (time.time() - train_start_wall)
+                ) / 3600,
                 # Throughput
                 "perf/tokens_per_sec": tokens_per_sec,
                 "perf/tokens_per_sec_per_gpu": tokens_per_sec / world_size,

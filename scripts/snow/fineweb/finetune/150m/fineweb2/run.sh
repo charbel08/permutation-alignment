@@ -45,6 +45,7 @@ SAVE_INTERVAL=${SAVE_INTERVAL:-2000}
 NUM_WORKERS=${NUM_WORKERS:-4}
 WANDB_PROJECT=${WANDB_PROJECT:-main-finetune}
 RUN_NAME=${RUN_NAME:-finetune_150m_fineweb2_spa_key${KEY_SIZE}pct_kl${KL_TAG}}
+RESUME_FROM=${RESUME_FROM:-}
 
 if [ ! -d "$BASE_CHECKPOINT" ]; then
     echo "Missing BASE_CHECKPOINT: $BASE_CHECKPOINT"
@@ -63,6 +64,11 @@ fi
 
 if [ ! -d "$PUBLIC_DATA" ]; then
     echo "Missing PUBLIC_DATA: $PUBLIC_DATA"
+    exit 1
+fi
+
+if [ -n "$RESUME_FROM" ] && [ ! -f "$RESUME_FROM/training_state.pt" ]; then
+    echo "Missing training_state.pt in RESUME_FROM: $RESUME_FROM"
     exit 1
 fi
 
@@ -106,6 +112,9 @@ echo "  Key path:       ${KEY_PATH}"
 echo "  Private data:   ${PRIVATE_DATA}"
 echo "  Public data:    ${PUBLIC_DATA}"
 echo "  Output dir:     ${OUTPUT_DIR}"
+if [ -n "$RESUME_FROM" ]; then
+    echo "  Resume from:    ${RESUME_FROM}"
+fi
 echo "  GPUs:           ${NGPUS}"
 echo "  Context size:   ${CONTEXT_SIZE}"
 echo "  Tokens/step:    ${TOKENS_PER_STEP}"
@@ -116,6 +125,10 @@ echo "  Target tokens:  ${TARGET_PRIVATE_TOKENS} (actual: ${TARGET_PRIVATE_TOKEN
 echo "=========================================================="
 
 LOG_FILE="logs/${RUN_NAME}_$(date +%Y%m%d_%H%M%S).log"
+EXTRA_ARGS=()
+if [ -n "$RESUME_FROM" ]; then
+    EXTRA_ARGS+=(--resume_from "$RESUME_FROM")
+fi
 
 torchrun --standalone --nproc_per_node="$NGPUS" -m tiered.train.finetune.private_finetune \
     --checkpoint "$BASE_CHECKPOINT" \
@@ -138,4 +151,5 @@ torchrun --standalone --nproc_per_node="$NGPUS" -m tiered.train.finetune.private
     --num_workers "$NUM_WORKERS" \
     --wandb_project "$WANDB_PROJECT" \
     --run_name "$RUN_NAME" \
+    "${EXTRA_ARGS[@]}" \
     2>&1 | tee "$LOG_FILE"

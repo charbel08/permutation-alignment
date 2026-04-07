@@ -44,6 +44,7 @@ SAVE_INTERVAL=${SAVE_INTERVAL:-500}
 NUM_WORKERS=${NUM_WORKERS:-4}
 WANDB_PROJECT=${WANDB_PROJECT:-main-finetune}
 RUN_NAME=${RUN_NAME:-finetune_150m_synbios_key${KEY_SIZE}pct_kl${KL_TAG}}
+RESUME_FROM=${RESUME_FROM:-}
 
 if [ ! -d "$BASE_CHECKPOINT" ]; then
     echo "Missing BASE_CHECKPOINT: $BASE_CHECKPOINT"
@@ -61,6 +62,11 @@ if [ ! -d "$PRIVATE_DATA" ]; then
     exit 1
 fi
 
+if [ -n "$RESUME_FROM" ] && [ ! -f "$RESUME_FROM/training_state.pt" ]; then
+    echo "Missing training_state.pt in RESUME_FROM: $RESUME_FROM"
+    exit 1
+fi
+
 echo "=========================================================="
 echo "Private finetune (Synthetic Bios, 150M tiered)"
 echo "  Key size:       ${KEY_SIZE}%"
@@ -70,11 +76,18 @@ echo "  Key path:       ${KEY_PATH}"
 echo "  Private data:   ${PRIVATE_DATA}"
 echo "  Public data:    ${PUBLIC_DATA}"
 echo "  Output dir:     ${OUTPUT_DIR}"
+if [ -n "$RESUME_FROM" ]; then
+    echo "  Resume from:    ${RESUME_FROM}"
+fi
 echo "  GPUs:           ${NGPUS}"
 echo "  Max steps:      ${MAX_STEPS}"
 echo "=========================================================="
 
 LOG_FILE="logs/${RUN_NAME}_$(date +%Y%m%d_%H%M%S).log"
+EXTRA_ARGS=()
+if [ -n "$RESUME_FROM" ]; then
+    EXTRA_ARGS+=(--resume_from "$RESUME_FROM")
+fi
 
 torchrun --standalone --nproc_per_node="$NGPUS" -m tiered.train.finetune.private_finetune \
     --checkpoint "$BASE_CHECKPOINT" \
@@ -98,4 +111,5 @@ torchrun --standalone --nproc_per_node="$NGPUS" -m tiered.train.finetune.private
     --wandb_project "$WANDB_PROJECT" \
     --run_name "$RUN_NAME" \
     --bio_metadata "$BIO_METADATA" \
+    "${EXTRA_ARGS[@]}" \
     2>&1 | tee "$LOG_FILE"
