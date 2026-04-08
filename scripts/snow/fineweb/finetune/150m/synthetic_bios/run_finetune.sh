@@ -89,7 +89,7 @@ if [ -n "$RESUME_FROM" ]; then
     EXTRA_ARGS+=(--resume_from "$RESUME_FROM")
 fi
 
-torchrun --standalone --nproc_per_node="$NGPUS" -m tiered.train.finetune.private_finetune \
+torchrun --standalone --nproc_per_node="$NGPUS" -m tiered.train.finetune.private_finetune_memorization \
     --checkpoint "$BASE_CHECKPOINT" \
     --key_path "$KEY_PATH" \
     --private_data "$PRIVATE_DATA" \

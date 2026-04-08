@@ -27,9 +27,11 @@ Usage:
 """
 
 import argparse
+import json
 import math
 import os
 import time
+from collections import defaultdict
 from contextlib import nullcontext
 from typing import Optional
 
@@ -37,7 +39,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import wandb
-from datasets import load_from_disk
+from datasets import concatenate_datasets, load_from_disk
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, DistributedSampler
@@ -53,6 +55,188 @@ from tiered.train.utils import (
     adamw_step_preserving_public,
     _merge_idx,
 )
+
+
+# ---------------------------------------------------------------------------
+# Memorization eval helpers (for synthetic bios)
+# ---------------------------------------------------------------------------
+
+def _bio_value_string(bio):
+    """Return the attribute value string the model must predict."""
+    attr = bio["target_attr"]
+    if attr == "age":
+        return str(bio["age"])
+    elif attr == "profession":
+        return bio["profession"]
+    elif attr == "hobby":
+        return bio["hobby"]
+    elif attr == "salary":
+        return bio["salary_str"]
+    raise ValueError(f"Unknown target_attr: {attr}")
+
+
+def _bio_value_span(tokenizer, bio):
+    """Map attribute value to token span [start, end) in the full text."""
+    full_text = bio["text"]
+    prefix = bio["prefix"]
+    value_str = _bio_value_string(bio)
+
+    target_start_char = len(prefix)
+    target_portion = full_text[target_start_char:]
+    value_pos = target_portion.find(value_str)
+    if value_pos == -1:
+        return None
+
+    char_start = target_start_char + value_pos
+    char_end = char_start + len(value_str)
+
+    encoding = tokenizer(full_text, return_offsets_mapping=True,
+                         add_special_tokens=False)
+    offsets = encoding["offset_mapping"]
+    tok_indices = [i for i, (cs, ce) in enumerate(offsets)
+                   if cs < char_end and ce > char_start]
+    if not tok_indices:
+        return None
+    return tok_indices[0], tok_indices[-1] + 1
+
+
+@torch.no_grad()
+def evaluate_memorization(model, tokenizer, bios, bio_spans, device,
+                          key=None, swap_plan=None, batch_size=32):
+    """Measure attribute-value prediction accuracy on synthetic bios.
+
+    Uses batched greedy autoregressive decoding (no teacher forcing):
+      1. Left-pad all prefixes (tokens before value span) to equal length.
+      2. Greedily decode for max_value_len tokens (longest target in batch).
+      3. Compare generated tokens against ground truth at value positions.
+
+    Metrics:
+      - top1_acc: fraction of value tokens predicted correctly
+      - exact_match: all value tokens predicted correctly
+      - contains: target string (stripped, lowercased) is a substring of
+        the generated text (stripped, lowercased)
+      - prefix_match: target appears at the start of generated text
+        (both stripped and lowercased)
+
+    Runs on a single device (rank 0 only).
+    """
+    model.eval()
+    if key is not None:
+        apply_permutation(model, key, plan=swap_plan)
+
+    # Pre-filter valid bios and find max value span length
+    valid_items = []
+    for i in range(len(bios)):
+        span = bio_spans[i]
+        if span is None:
+            continue
+        vs, ve = span
+        enc = tokenizer(bios[i]["text"], add_special_tokens=False,
+                        return_tensors="pt")["input_ids"].squeeze(0)
+        if vs < 1 or ve > enc.shape[0]:
+            continue
+        n_val = ve - vs
+        if n_val == 0:
+            continue
+        valid_items.append((i, enc, vs, ve))
+
+    if not valid_items:
+        if key is not None:
+            unapply_permutation(model, key, plan=swap_plan)
+        return {}
+
+    max_gen_len = max(ve - vs for _, _, vs, ve in valid_items)
+
+    results = []
+    for batch_start in range(0, len(valid_items), batch_size):
+        batch = valid_items[batch_start:batch_start + batch_size]
+        bs = len(batch)
+
+        # Left-pad prefixes to equal length for batched generation.
+        # GPT-Neo uses absolute positional embeddings, so we must pass
+        # position_ids explicitly to avoid wrong embeddings on pad tokens.
+        prefixes = [item[1][:item[2]] for item in batch]  # enc[:vs]
+        max_prefix_len = max(p.shape[0] for p in prefixes)
+
+        pad_id = tokenizer.pad_token_id
+        input_ids = torch.full((bs, max_prefix_len), pad_id, dtype=torch.long)
+        attn_mask = torch.zeros(bs, max_prefix_len, dtype=torch.long)
+        position_ids = torch.zeros(bs, max_prefix_len, dtype=torch.long)
+        for j, p in enumerate(prefixes):
+            offset = max_prefix_len - p.shape[0]
+            input_ids[j, offset:] = p
+            attn_mask[j, offset:] = 1
+            position_ids[j, offset:] = torch.arange(p.shape[0])
+
+        input_ids = input_ids.to(device)
+        attn_mask = attn_mask.to(device)
+        position_ids = position_ids.to(device)
+
+        # Greedy decode max_gen_len tokens
+        for _ in range(max_gen_len):
+            logits = model(input_ids, attention_mask=attn_mask,
+                           position_ids=position_ids).logits
+            next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            input_ids = torch.cat([input_ids, next_token], dim=1)
+            attn_mask = torch.cat([attn_mask,
+                                   torch.ones(bs, 1, dtype=torch.long,
+                                              device=device)], dim=1)
+            next_pos = position_ids[:, -1:] + 1
+            position_ids = torch.cat([position_ids, next_pos], dim=1)
+
+        # Extract generated tokens (after the prefix)
+        for j, (idx, enc, vs, ve) in enumerate(batch):
+            bio = bios[idx]
+            target_tokens = enc[vs:ve]
+            n_val = target_tokens.shape[0]
+
+            gen_tokens = input_ids[j, max_prefix_len:max_prefix_len + n_val].cpu()
+            gen_all = input_ids[j, max_prefix_len:].cpu()
+
+            # Token-level accuracy
+            top1_hits = (gen_tokens == target_tokens).float().mean().item()
+            exact = (gen_tokens == target_tokens).all().item()
+
+            # String-level metrics
+            target_str = _bio_value_string(bio).strip().lower()
+            gen_str = tokenizer.decode(gen_all.tolist()).strip().lower()
+
+            contains = 1.0 if target_str in gen_str else 0.0
+            prefix_match = 1.0 if gen_str.startswith(target_str) else 0.0
+
+            results.append({
+                "target_attr": bio["target_attr"],
+                "top1_acc": top1_hits,
+                "exact_match": exact,
+                "contains": contains,
+                "prefix_match": prefix_match,
+            })
+
+    if key is not None:
+        unapply_permutation(model, key, plan=swap_plan)
+
+    if not results:
+        return {}
+
+    # Aggregate
+    n = len(results)
+    metrics = {
+        "top1_acc": sum(r["top1_acc"] for r in results) / n,
+        "exact_match": sum(r["exact_match"] for r in results) / n,
+        "contains": sum(r["contains"] for r in results) / n,
+        "prefix_match": sum(r["prefix_match"] for r in results) / n,
+    }
+    by_attr = defaultdict(list)
+    for r in results:
+        by_attr[r["target_attr"]].append(r)
+    for attr, recs in by_attr.items():
+        na = len(recs)
+        metrics[f"{attr}/top1_acc"] = sum(r["top1_acc"] for r in recs) / na
+        metrics[f"{attr}/exact_match"] = sum(r["exact_match"] for r in recs) / na
+        metrics[f"{attr}/contains"] = sum(r["contains"] for r in recs) / na
+        metrics[f"{attr}/prefix_match"] = sum(r["prefix_match"] for r in recs) / na
+
+    return metrics
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +347,12 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=4,
                         help="DataLoader worker processes (reduce on "
                              "machines with few cores per GPU)")
+
+    # Memorization eval (synthetic bios)
+    parser.add_argument("--bio_metadata", type=str, default=None,
+                        help="Path to bios_metadata.json for memorization eval. "
+                             "When provided, attribute-level accuracy is measured "
+                             "at each validation step (rank 0 only).")
 
     return parser.parse_args()
 
@@ -550,14 +740,31 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
     collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
-    # Load private/forget data (for L_priv training + optional validation)
+    # Load bio metadata for memorization eval (optional, rank 0 only)
+    memo_bios = None
+    memo_spans = None
+    memo_swap_plan = None
+    if args.bio_metadata and is_main:
+        with open(args.bio_metadata) as f:
+            bio_meta = json.load(f)
+        # Evaluate memorization on test_people only (held-out 50%)
+        test_people = set(bio_meta.get("test_people", []))
+        memo_bios = [b for b in bio_meta["bios"] if b["person_id"] in test_people]
+        memo_spans = [_bio_value_span(tokenizer, b) for b in memo_bios]
+        valid = sum(1 for s in memo_spans if s is not None)
+        print(f"Memorization eval: {len(memo_bios)} test bios, {valid} with valid spans")
+        memo_swap_plan = build_swap_plan(raw_model, key, device)
+
+    # Load private/forget data.
+    # Memorization variant: train on private train+test combined, but keep
+    # private test split for reporting memorization/validation metrics.
     if is_main:
         print(f"Loading private/forget data from {args.private_data}")
     private_dataset = load_from_disk(args.private_data)
 
     private_val = None
     if "train" in private_dataset and "test" in private_dataset:
-        private_train = private_dataset["train"]
+        private_train = concatenate_datasets([private_dataset["train"], private_dataset["test"]])
         private_val = private_dataset["test"]
     elif "train" in private_dataset:
         private_train = private_dataset["train"]
@@ -570,6 +777,13 @@ def main():
         private_train = private_train.remove_columns(cols_to_remove)
         if private_val is not None:
             private_val = private_val.remove_columns(cols_to_remove)
+
+    if is_main and private_val is not None:
+        print(
+            "Private data split usage (memorization variant): "
+            f"train+test -> train loader ({len(private_train)} samples), "
+            f"test -> validation/memorization ({len(private_val)} samples)"
+        )
 
     private_sampler = DistributedSampler(private_train, shuffle=True) if is_distributed else None
     private_loader = DataLoader(
@@ -868,6 +1082,31 @@ def main():
                 val_log[f"Val Retain/{tier_label} Perplexity"] = tier_metrics["ppl_c2"]
                 val_log[f"Val Retain/{tier_label} Accuracy"] = tier_metrics["acc_c2"]
 
+        # Memorization eval (rank 0 only, runs on raw_model)
+        if is_main and memo_bios is not None:
+            # C1 memorization
+            c1_memo = evaluate_memorization(
+                raw_model, tokenizer, memo_bios, memo_spans, device)
+            if c1_memo:
+                print(f"  Memorization (C1): top1={c1_memo['top1_acc']:.4f}, "
+                      f"exact={c1_memo['exact_match']:.4f}, "
+                      f"contains={c1_memo['contains']:.4f}, "
+                      f"prefix={c1_memo['prefix_match']:.4f}")
+                for mk, mv in c1_memo.items():
+                    val_log[f"Memo C1/{mk}"] = mv
+
+            # C2 memorization
+            c2_memo = evaluate_memorization(
+                raw_model, tokenizer, memo_bios, memo_spans, device,
+                key=key, swap_plan=memo_swap_plan)
+            if c2_memo:
+                print(f"  Memorization (C2): top1={c2_memo['top1_acc']:.4f}, "
+                      f"exact={c2_memo['exact_match']:.4f}, "
+                      f"contains={c2_memo['contains']:.4f}, "
+                      f"prefix={c2_memo['prefix_match']:.4f}")
+                for mk, mv in c2_memo.items():
+                    val_log[f"Memo C2/{mk}"] = mv
+
         if is_main:
             import sys
             sys.stdout.flush()
@@ -896,7 +1135,7 @@ def main():
                 f"{args.keyed_l2_lambda}"
             )
         print(f"Validation every {args.eval_interval} steps")
-        print(f"Tracking: C1/C2 on private and retain validation splits")
+        print(f"Tracking: C1/C2 on retain, memorization on test set")
     
     pbar = tqdm(total=args.max_steps, desc="Finetuning", initial=global_step) if is_main else None
 

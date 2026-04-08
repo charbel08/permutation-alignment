@@ -43,7 +43,7 @@ from transformers import AutoTokenizer, DataCollatorForLanguageModeling
 from tiered.model import GPTNeoForCausalLMTiered
 from tiered.permutation import load_key
 from tiered.permutation.permute import build_swap_plan
-from tiered.train.finetune.private_finetune import (
+from tiered.train.finetune.private_finetune_memorization import (
     _bio_value_span, evaluate_memorization,
 )
 from tiered.train.utils import save_checkpoint
