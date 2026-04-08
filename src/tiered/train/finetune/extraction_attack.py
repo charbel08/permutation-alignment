@@ -222,6 +222,8 @@ def main():
         raise ValueError("Train dataloader has zero batches; increase data fraction or reduce batch size.")
     max_steps_from_epochs = args.max_epochs * steps_per_epoch
     max_steps = max_steps_from_epochs if args.max_steps is None else min(args.max_steps, max_steps_from_epochs)
+    # Normalize for any downstream code paths still reading args.max_steps.
+    args.max_steps = max_steps
     # Fixed patience policy: 2 epochs for all runs.
     patience_epochs = 2
     patience_steps = patience_epochs * steps_per_epoch
