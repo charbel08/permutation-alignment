@@ -1,7 +1,7 @@
 """Extraction attack experiment.
 
-Measures how much private data is needed to recover C2-level performance
-through standard (keyless) finetuning on C1.
+Measures how much private data is needed to recover memorization through
+standard (keyless) finetuning on C1.
 
 Two conditions:
   1. **Tiered attack**: Start from a tiered-finetuned model, finetune all
@@ -9,8 +9,9 @@ Two conditions:
   2. **Baseline attack**: Start from the baseline pretrained model, finetune
      all params with the same fraction.
 
-For both, we early-stop when memorization (top1_acc) reaches the C2 target
-(measured fresh at the start of each run from the tiered-finetuned model).
+Early stopping is driven by C1 memorization on train_people (from
+bio metadata), while reporting focuses on C1 memorization on held-out
+test_people.
 
 Usage:
     torchrun --standalone --nproc_per_node=N -m tiered.train.finetune.extraction_attack \
@@ -18,9 +19,7 @@ Usage:
         --private_data /path/to/private \
         --output_dir /path/to/output \
         --data_fraction 0.1 \
-        --bio_metadata /path/to/bios_metadata.json \
-        --tiered_checkpoint /path/to/tiered \
-        --key_path /path/to/key.json
+        --bio_metadata /path/to/bios_metadata.json
 """
 
 import argparse
@@ -41,8 +40,6 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, DataCollatorForLanguageModeling
 
 from tiered.model import GPTNeoForCausalLMTiered
-from tiered.permutation import load_key
-from tiered.permutation.permute import build_swap_plan
 from tiered.train.finetune.private_finetune_memorization import (
     _bio_value_span, evaluate_memorization,
 )
@@ -56,22 +53,24 @@ def parse_args():
     parser.add_argument("--model_checkpoint", type=str, required=True,
                         help="Model to finetune (tiered-finetuned or baseline pretrained)")
 
-    # C2 target — memorization-based early stopping
+    # Optional train-memorization target for early stopping
     parser.add_argument("--target_memo", type=float, default=None,
-                        help="C2 memorization top1_acc target for early stopping. "
-                             "Measured automatically if --bio_metadata and "
-                             "--tiered_checkpoint + --key_path are provided.")
+                        help="Optional train_people memorization top1_acc target for "
+                             "early stopping. If omitted, stopping is patience-only.")
     parser.add_argument("--key_path", type=str, default=None,
-                        help="Key to evaluate C2 target memorization on the tiered model.")
+                        help="Deprecated/unused (kept for CLI compatibility).")
     parser.add_argument("--tiered_checkpoint", type=str, default=None,
-                        help="Tiered-finetuned checkpoint to measure C2 target from. "
-                             "Only needed if --target_memo is not provided.")
+                        help="Deprecated/unused (kept for CLI compatibility).")
 
     # Data
     parser.add_argument("--private_data", type=str, required=True,
                         help="Path to private tokenized dataset")
     parser.add_argument("--data_fraction", type=float, required=True,
                         help="Fraction of private data to use (0.0-1.0)")
+    parser.add_argument("--subset_seed", type=int, default=42,
+                        help="Seed used to sample the train subset. "
+                             "Use the same seed to ensure identical subsets "
+                             "across tiered vs baseline runs.")
     parser.add_argument("--output_dir", type=str, required=True)
 
     # Training
@@ -87,7 +86,7 @@ def parse_args():
     # Validation / early stopping
     parser.add_argument("--eval_interval", type=int, default=100)
     parser.add_argument("--patience", type=int, default=5000,
-                        help="Stop if no improvement toward target for this many steps")
+                        help="Stop if train_people memorization does not improve for this many steps")
 
     # Logging
     parser.add_argument("--log_interval", type=int, default=10)
@@ -99,8 +98,8 @@ def parse_args():
     # Memorization eval (synthetic bios)
     parser.add_argument("--bio_metadata", type=str, default=None,
                         help="Path to bios_metadata.json. When provided, "
-                             "attribute-level memorization accuracy is measured "
-                             "on the full train set at each eval step (rank 0).")
+                             "memorization is measured on both train_people "
+                             "(for early stopping) and test_people (for reporting).")
 
     return parser.parse_args()
 
@@ -111,9 +110,6 @@ def main():
 
     if args.bio_metadata is None:
         raise ValueError("--bio_metadata is required for memorization-based stopping")
-    if args.target_memo is None and (args.tiered_checkpoint is None or args.key_path is None):
-        raise ValueError("Must provide --target_memo, or --tiered_checkpoint + --key_path "
-                         "+ --bio_metadata to measure it")
 
     # ── Distributed setup ──
     local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -144,28 +140,59 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
     collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
-    # Load bio metadata for memorization eval (optional, rank 0 only)
-    # Evaluate memorization on test_people (held-out 50%)
-    memo_bios = None
-    memo_spans = None
+    # Load bio metadata for memorization eval (rank 0 only):
+    # - train_people: used for early stopping
+    # - test_people: held-out reporting set
+    memo_train_bios = None
+    memo_train_spans = None
+    memo_test_bios = None
+    memo_test_spans = None
     if args.bio_metadata and is_main:
         with open(args.bio_metadata) as f:
             bio_meta = json.load(f)
+        bios = bio_meta["bios"]
         test_people = set(bio_meta.get("test_people", []))
-        memo_bios = [b for b in bio_meta["bios"] if b["person_id"] in test_people]
-        memo_spans = [_bio_value_span(tokenizer, b) for b in memo_bios]
-        valid = sum(1 for s in memo_spans if s is not None)
-        print(f"Memorization eval: {len(memo_bios)} test bios, {valid} with valid spans")
+        train_people = set(bio_meta.get("train_people", []))
+        if not test_people:
+            raise ValueError("bio_metadata must include non-empty test_people")
 
-    # Load the train split (50% of people) — extraction attack trains on
-    # fractions of this split, memorization is evaluated on the other 50%.
+        # If train_people is not explicitly stored, infer as complement of test_people.
+        if train_people:
+            memo_train_bios = [b for b in bios if b["person_id"] in train_people]
+        else:
+            memo_train_bios = [b for b in bios if b["person_id"] not in test_people]
+        memo_test_bios = [b for b in bios if b["person_id"] in test_people]
+        if not memo_train_bios:
+            raise ValueError("No train_people bios found in bio_metadata")
+        if not memo_test_bios:
+            raise ValueError("No test_people bios found in bio_metadata")
+
+        memo_train_spans = [_bio_value_span(tokenizer, b) for b in memo_train_bios]
+        memo_test_spans = [_bio_value_span(tokenizer, b) for b in memo_test_bios]
+        valid_train = sum(1 for s in memo_train_spans if s is not None)
+        valid_test = sum(1 for s in memo_test_spans if s is not None)
+        print(
+            "Memorization eval: "
+            f"train_people={len(memo_train_bios)} ({valid_train} valid spans), "
+            f"test_people={len(memo_test_bios)} ({valid_test} valid spans)"
+        )
+
+    # Load train split only: data_fraction is applied to train_people data.
     full_dataset = load_from_disk(args.private_data)
     if "train" in full_dataset:
         train_full = full_dataset["train"]
     else:
-        train_full = full_dataset
+        raise ValueError(
+            "--private_data must contain a 'train' split. "
+            "Use the synthetic_bios tokenized dataset (train/test), "
+            "since data_fraction is defined on train_people only."
+        )
 
-    # Subset training data
+    # Subset training data.
+    # Shuffle once with a fixed seed, then take a prefix; this guarantees that
+    # runs using the same (data_fraction, subset_seed) get exactly the same
+    # sampled examples (e.g., tiered vs baseline).
+    train_full = train_full.shuffle(seed=args.subset_seed)
     n_train = max(1, int(len(train_full) * args.data_fraction))
     train_data = train_full.select(range(n_train))
 
@@ -175,7 +202,10 @@ def main():
         train_data = train_data.remove_columns(cols_to_remove)
 
     if is_main:
-        print(f"Data fraction: {args.data_fraction} -> {n_train} / {len(train_full)} train samples")
+        print(
+            f"Data fraction: {args.data_fraction} -> {n_train} / {len(train_full)} train samples "
+            f"(subset_seed={args.subset_seed})"
+        )
 
     # ── Dataloader ──
     train_sampler = DistributedSampler(train_data, shuffle=True) if is_distributed else None
@@ -185,32 +215,13 @@ def main():
         drop_last=False, num_workers=args.num_workers, pin_memory=True,
     )
 
-    # ── Measure C2 memorization target ──
-    target_memo = args.target_memo
-    if target_memo is None and is_main:
-        # Load tiered model temporarily to measure C2 memorization
-        if is_main:
-            print(f"Measuring C2 memorization from {args.tiered_checkpoint}")
-        tiered_model = GPTNeoForCausalLMTiered.from_pretrained(args.tiered_checkpoint)
-        tiered_model.to(device)
-        tiered_key = load_key(args.key_path)
-        tiered_plan = build_swap_plan(tiered_model, tiered_key, device)
-        c2_memo = evaluate_memorization(
-            tiered_model, tokenizer, memo_bios, memo_spans, device,
-            key=tiered_key, swap_plan=tiered_plan)
-        target_memo = c2_memo["top1_acc"]
-        if is_main:
-            print(f"C2 target memorization: top1={target_memo:.4f}, "
-                  f"exact={c2_memo['exact_match']:.4f}")
-        del tiered_model, tiered_key, tiered_plan
-        torch.cuda.empty_cache()
-
-    # Broadcast target to all ranks
+    # Optional train-memorization target for early stop.
+    target_memo_train = args.target_memo
     if is_distributed:
-        t = torch.tensor([target_memo if target_memo is not None else 0.0],
+        t = torch.tensor([target_memo_train if target_memo_train is not None else -1.0],
                          device=device)
         dist.broadcast(t, src=0)
-        target_memo = t.item()
+        target_memo_train = None if t.item() < 0 else t.item()
 
     # ── Optimizer / scheduler ──
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate,
@@ -231,50 +242,77 @@ def main():
     if is_main:
         run_name = args.run_name or f"attack_frac{args.data_fraction}"
         wandb.init(project=args.wandb_project, name=run_name, config={
-            **vars(args), "target_memo": target_memo, "n_train": n_train,
+            **vars(args),
+            "target_memo_train": target_memo_train,
+            "n_train": n_train,
         })
         wandb.define_metric("train/step")
         wandb.define_metric("*", step_metric="train/step")
-        print(f"\nTarget memorization (top1_acc): {target_memo:.4f}")
-        print(f"Training for up to {args.max_steps} steps (early stop when memo >= target)")
+        if target_memo_train is not None:
+            print(f"\nTarget train memorization (top1_acc): {target_memo_train:.4f}")
+            print(
+                f"Training for up to {args.max_steps} steps "
+                "(early stop when train_people memo >= target)"
+            )
+        else:
+            print(f"\nTraining for up to {args.max_steps} steps")
+            print(f"Early stopping: patience={args.patience} on train_people memorization")
 
     # ── Initial memorization eval ──
-    init_memo_top1 = 0.0
-    if is_main and memo_bios is not None:
-        init_memo = evaluate_memorization(
-            raw_model, tokenizer, memo_bios, memo_spans, device)
-        if init_memo:
-            init_memo_top1 = init_memo["top1_acc"]
-            print(f"Initial memorization: top1={init_memo_top1:.4f}, "
-                  f"exact={init_memo['exact_match']:.4f}")
-            log_dict = {"target_memo": target_memo, "train/step": 0}
-            for mk, mv in init_memo.items():
-                log_dict[f"memo/{mk}"] = mv
-            wandb.log(log_dict)
+    init_train_memo_top1 = 0.0
+    init_test_memo_top1 = 0.0
+    if is_main:
+        log_dict = {"train/step": 0}
+        if target_memo_train is not None:
+            log_dict["target_memo_train"] = target_memo_train
 
-    # Check if already at target
-    if is_main and init_memo_top1 >= target_memo:
-        print(f"Already at target! memo top1 {init_memo_top1:.4f} >= {target_memo:.4f}")
-        wandb.log({"steps_to_target": 0, "reached_target": True, "train/step": 0})
+        if memo_train_bios is not None:
+            init_train_memo = evaluate_memorization(
+                raw_model, tokenizer, memo_train_bios, memo_train_spans, device)
+            if init_train_memo:
+                init_train_memo_top1 = init_train_memo["top1_acc"]
+                print(f"Initial train_people memo: top1={init_train_memo_top1:.4f}, "
+                      f"exact={init_train_memo['exact_match']:.4f}")
+                for mk, mv in init_train_memo.items():
+                    log_dict[f"memo_train/{mk}"] = mv
+
+        if memo_test_bios is not None:
+            init_test_memo = evaluate_memorization(
+                raw_model, tokenizer, memo_test_bios, memo_test_spans, device)
+            if init_test_memo:
+                init_test_memo_top1 = init_test_memo["top1_acc"]
+                print(f"Initial test_people memo:  top1={init_test_memo_top1:.4f}, "
+                      f"exact={init_test_memo['exact_match']:.4f}")
+                for mk, mv in init_test_memo.items():
+                    log_dict[f"memo_test/{mk}"] = mv
+
+        wandb.log(log_dict)
+
+    # Check if already at optional train target
+    should_exit_now = 0.0
+    if is_main and target_memo_train is not None and init_train_memo_top1 >= target_memo_train:
+        print(
+            "Already at train target! "
+            f"train memo top1 {init_train_memo_top1:.4f} >= {target_memo_train:.4f}"
+        )
+        wandb.log({"steps_to_target_train": 0, "reached_target_train": True, "train/step": 0})
         wandb.finish()
-        # Signal other ranks to exit
-        if is_distributed:
-            t = torch.tensor([1.0], device=device)
-            dist.broadcast(t, src=0)
-        return
+        should_exit_now = 1.0
     if is_distributed:
-        t = torch.tensor([0.0], device=device)
+        t = torch.tensor([should_exit_now], device=device)
         dist.broadcast(t, src=0)
         if t.item() > 0:
             return
+    elif should_exit_now > 0:
+        return
 
     # ── Training loop ──
     data_iter = iter(train_loader)
     data_epoch = 0
     global_step = 0
-    best_memo = init_memo_top1 if is_main else 0.0
+    best_train_memo = init_train_memo_top1 if is_main else 0.0
     steps_since_improvement = 0
-    reached_target = False
+    reached_target_train = False
 
     pbar = tqdm(total=args.max_steps, desc="Attack finetune") if is_main else None
 
@@ -315,45 +353,63 @@ def main():
             pbar.update(1)
             pbar.set_postfix({"loss": f"{loss.item():.3f}"})
 
-        # Eval + early stopping (memorization on test set only)
+        # Eval + early stopping
         if global_step % args.eval_interval == 0:
-            current_memo_top1 = 0.0
+            current_train_memo_top1 = 0.0
+            current_test_memo_top1 = 0.0
             if is_main:
                 sys.stdout.flush()
-                log_dict = {"target_memo": target_memo, "train/step": global_step}
+                log_dict = {"train/step": global_step}
+                if target_memo_train is not None:
+                    log_dict["target_memo_train"] = target_memo_train
 
-                if memo_bios is not None:
-                    memo = evaluate_memorization(
-                        raw_model, tokenizer, memo_bios, memo_spans, device)
-                    if memo:
-                        current_memo_top1 = memo["top1_acc"]
-                        print(f"\n[Step {global_step}] Memorization: "
-                              f"top1={current_memo_top1:.4f}, "
-                              f"exact={memo['exact_match']:.4f} "
-                              f"(target={target_memo:.4f})")
-                        for mk, mv in memo.items():
-                            log_dict[f"memo/{mk}"] = mv
+                if memo_train_bios is not None:
+                    memo_train = evaluate_memorization(
+                        raw_model, tokenizer, memo_train_bios, memo_train_spans, device)
+                    if memo_train:
+                        current_train_memo_top1 = memo_train["top1_acc"]
+                        for mk, mv in memo_train.items():
+                            log_dict[f"memo_train/{mk}"] = mv
+
+                if memo_test_bios is not None:
+                    memo_test = evaluate_memorization(
+                        raw_model, tokenizer, memo_test_bios, memo_test_spans, device)
+                    if memo_test:
+                        current_test_memo_top1 = memo_test["top1_acc"]
+                        for mk, mv in memo_test.items():
+                            log_dict[f"memo_test/{mk}"] = mv
+
+                print(
+                    f"\n[Step {global_step}] "
+                    f"train_people top1={current_train_memo_top1:.4f}, "
+                    f"test_people top1={current_test_memo_top1:.4f}"
+                )
+                if target_memo_train is not None:
+                    print(f"  train target={target_memo_train:.4f}")
 
                 wandb.log(log_dict)
 
-            # Broadcast memo result to all ranks for synchronized stopping
+            # Broadcast train memo to all ranks for synchronized stopping
             if is_distributed:
-                t = torch.tensor([current_memo_top1], device=device)
+                t = torch.tensor([current_train_memo_top1], device=device)
                 dist.broadcast(t, src=0)
-                current_memo_top1 = t.item()
+                current_train_memo_top1 = t.item()
 
-            if current_memo_top1 > best_memo:
-                best_memo = current_memo_top1
+            if current_train_memo_top1 > best_train_memo:
+                best_train_memo = current_train_memo_top1
                 steps_since_improvement = 0
             else:
                 steps_since_improvement += args.eval_interval
 
-            # Reached target?
-            if current_memo_top1 >= target_memo:
-                reached_target = True
+            # Reached optional train target?
+            if target_memo_train is not None and current_train_memo_top1 >= target_memo_train:
+                reached_target_train = True
                 if is_main:
-                    print(f"\n*** TARGET REACHED at step {global_step}! "
-                          f"memo top1={current_memo_top1:.4f} >= {target_memo:.4f} ***")
+                    print(
+                        f"\n*** TRAIN TARGET REACHED at step {global_step}! "
+                        f"train memo top1={current_train_memo_top1:.4f} "
+                        f">= {target_memo_train:.4f} ***"
+                    )
                     save_path = os.path.join(args.output_dir, "target-reached")
                     save_checkpoint(raw_model, tokenizer, optimizer, save_path,
                                     scheduler=scheduler, global_step=global_step)
@@ -363,8 +419,10 @@ def main():
             # Patience
             if steps_since_improvement >= args.patience:
                 if is_main:
-                    print(f"\nPatience exhausted ({args.patience} steps). "
-                          f"Best memo: {best_memo:.4f}, target: {target_memo:.4f}")
+                    print(
+                        f"\nPatience exhausted ({args.patience} steps). "
+                        f"Best train memo: {best_train_memo:.4f}"
+                    )
                 break
 
         # Periodic save
@@ -377,19 +435,26 @@ def main():
         pbar.close()
 
     if is_main:
-        # Final memorization eval
-        final_memo_top1 = 0.0
-        if memo_bios is not None:
-            final_memo = evaluate_memorization(
-                raw_model, tokenizer, memo_bios, memo_spans, device)
-            if final_memo:
-                final_memo_top1 = final_memo["top1_acc"]
+        # Final memorization eval (both splits)
+        final_train_memo_top1 = 0.0
+        final_test_memo_top1 = 0.0
+        if memo_train_bios is not None:
+            final_train_memo = evaluate_memorization(
+                raw_model, tokenizer, memo_train_bios, memo_train_spans, device)
+            if final_train_memo:
+                final_train_memo_top1 = final_train_memo["top1_acc"]
+        if memo_test_bios is not None:
+            final_test_memo = evaluate_memorization(
+                raw_model, tokenizer, memo_test_bios, memo_test_spans, device)
+            if final_test_memo:
+                final_test_memo_top1 = final_test_memo["top1_acc"]
 
         wandb.log({
-            "final/memo_top1": final_memo_top1,
-            "steps_to_target": global_step if reached_target else -1,
-            "reached_target": reached_target,
-            "best_memo": best_memo,
+            "final/train_memo_top1": final_train_memo_top1,
+            "final/test_memo_top1": final_test_memo_top1,
+            "steps_to_target_train": global_step if reached_target_train else -1,
+            "reached_target_train": reached_target_train,
+            "best_train_memo": best_train_memo,
             "train/step": global_step,
         })
 
@@ -402,12 +467,14 @@ def main():
         print(f"{'='*60}")
         print(f"  Data fraction:    {args.data_fraction} ({n_train} samples)")
         print(f"  Steps:            {global_step}")
-        print(f"  Target memo:      {target_memo:.4f}")
-        print(f"  Best memo:        {best_memo:.4f}")
-        print(f"  Final memo:       {final_memo_top1:.4f}")
-        print(f"  Reached target:   {reached_target}")
-        if reached_target:
-            print(f"  Steps to target:  {global_step}")
+        if target_memo_train is not None:
+            print(f"  Train target:     {target_memo_train:.4f}")
+            print(f"  Reached target:   {reached_target_train}")
+            if reached_target_train:
+                print(f"  Steps to target:  {global_step}")
+        print(f"  Best train memo:  {best_train_memo:.4f}")
+        print(f"  Final train memo: {final_train_memo_top1:.4f}")
+        print(f"  Final test memo:  {final_test_memo_top1:.4f}")
         print(f"{'='*60}")
 
         wandb.finish()

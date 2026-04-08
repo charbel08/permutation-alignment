@@ -16,7 +16,8 @@ mkdir -p logs
 # For each data fraction, finetune:
 #   1. Tiered-finetuned model (attack C1 without key)
 #   2. Baseline pretrained model
-# Both early-stop when eval loss reaches C2 target.
+# Early-stop on train_people memorization; report held-out test_people memorization.
+# data_fraction is applied to the train split only.
 # ---------------------------------------------------------------------------
 
 KEY_SIZE=${KEY_SIZE:-5}
@@ -39,6 +40,7 @@ EVAL_INTERVAL=${EVAL_INTERVAL:-100}
 PATIENCE=${PATIENCE:-5000}
 NUM_WORKERS=${NUM_WORKERS:-4}
 WANDB_PROJECT=${WANDB_PROJECT:-extraction-attack}
+SUBSET_SEED=${SUBSET_SEED:-42}
 
 FRACTIONS=${FRACTIONS:-"0.01 0.02 0.05 0.10 0.20 0.30 0.40 0.50 0.75 1.00"}
 
@@ -58,11 +60,12 @@ echo "  Fractions:           ${FRACTIONS}"
 echo "  GPUs:                ${NGPUS}"
 echo "  Max steps/run:       ${MAX_STEPS}"
 echo "  Patience:            ${PATIENCE}"
+echo "  Subset seed:         ${SUBSET_SEED}"
 echo "  Bio metadata:        ${BIO_METADATA}"
 echo "=========================================================="
 echo ""
-echo "C2 memorization target will be measured by the Python script"
-echo "from tiered checkpoint + key on first run."
+echo "Early stopping uses train_people memorization."
+echo "Held-out test_people memorization is logged for reporting."
 echo ""
 
 for FRAC in $FRACTIONS; do
@@ -84,6 +87,7 @@ for FRAC in $FRACTIONS; do
             --key_path "$KEY_PATH" \
             --private_data "$PRIVATE_DATA" \
             --data_fraction "$FRAC" \
+            --subset_seed "$SUBSET_SEED" \
             --output_dir "$OUT_DIR" \
             --batch_size "$BATCH_SIZE" \
             --learning_rate "$LR" \
@@ -115,6 +119,7 @@ for FRAC in $FRACTIONS; do
             --key_path "$KEY_PATH" \
             --private_data "$PRIVATE_DATA" \
             --data_fraction "$FRAC" \
+            --subset_seed "$SUBSET_SEED" \
             --output_dir "$OUT_DIR" \
             --batch_size "$BATCH_SIZE" \
             --learning_rate "$LR" \
