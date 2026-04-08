@@ -924,22 +924,15 @@ def main():
                 print(f"  Resumed cumulative wall time: {cumulative_wall_secs / 3600:.2f}h")
 
     # Wandb — resume on same graphs if we have a run ID (rank 0 only)
-    wandb_resume_step = 0
-    wall_since_launch_offset_secs = 0.0
     if is_main:
         if wandb_run_id:
             wandb.init(
                 project=args.wandb_project,
                 id=wandb_run_id,
-                resume="must",
+                resume="allow",
                 config=vars(args),
             )
-            summary_step = wandb.run.summary.get("train/step")
-            wandb_resume_step = int(summary_step) if summary_step is not None else global_step
-            summary_wall = wandb.run.summary.get("perf/wall_since_launch_hrs")
-            if summary_wall is not None:
-                wall_since_launch_offset_secs = float(summary_wall) * 3600.0
-            print(f"Resumed wandb run: {wandb_run_id} (last logged step: {wandb_resume_step})")
+            print(f"Resumed wandb run: {wandb_run_id}")
         else:
             wandb.init(project=args.wandb_project, name=args.run_name, config=vars(args))
         wandb_run_id = wandb.run.id
@@ -1010,9 +1003,6 @@ def main():
             "compute/gpu_name": gpu_name,
             "compute/gpu_peak_bf16_flops": gpu_peak_flops,
         }, allow_val_change=True)
-
-    if args.resume_from and wall_since_launch_offset_secs <= 0 and cumulative_wall_secs > 0:
-        wall_since_launch_offset_secs = cumulative_wall_secs
 
     # Cumulative trackers
     cumulative_tokens = global_step * (tokens_private_per_step + tokens_public_per_step)
@@ -1110,8 +1100,7 @@ def main():
         if is_main:
             import sys
             sys.stdout.flush()
-            if step_for_logging >= wandb_resume_step:
-                wandb.log(val_log)
+            wandb.log(val_log)
             print(flush=True)
         # Prefer private val loss for best-model tracking, fall back to retain
         active_loss = val_log.get(f"Val Private/{active_tier_label} Loss",
@@ -1222,9 +1211,7 @@ def main():
                 # Timing
                 "perf/step_time_sec": step_elapsed,
                 "perf/wall_clock_hrs": cumulative_wall_secs / 3600,
-                "perf/wall_since_launch_hrs": (
-                    wall_since_launch_offset_secs + (time.time() - train_start_wall)
-                ) / 3600,
+                "perf/wall_since_launch_hrs": cumulative_wall_secs / 3600,
                 # Throughput
                 "perf/tokens_per_sec": tokens_per_sec,
                 # FLOPs
@@ -1237,8 +1224,7 @@ def main():
                 "perf/cumulative_petaflops": (flops_per_step * global_step) / 1e15,
             }
             log_dict.update(get_gpu_memory_stats(device))
-            if global_step > wandb_resume_step:
-                wandb.log(log_dict)
+            wandb.log(log_dict)
         
         # Validation (all ranks participate, rank 0 logs)
         if global_step % args.eval_interval == 0:

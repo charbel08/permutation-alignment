@@ -419,7 +419,7 @@ def main():
         wandb.init(
             project=args.wandb_project,
             id=wandb_run_id,
-            resume="must",
+            resume="allow",
             config=vars(args),
         )
         print(f"Resumed wandb run: {wandb_run_id}")

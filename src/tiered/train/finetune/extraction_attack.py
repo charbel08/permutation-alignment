@@ -107,6 +107,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
     if args.bio_metadata is None:
         raise ValueError("--bio_metadata is required for memorization-based stopping")
@@ -181,7 +182,7 @@ def main():
     train_loader = DataLoader(
         train_data, batch_size=args.batch_size, sampler=train_sampler,
         shuffle=(train_sampler is None), collate_fn=collator,
-        drop_last=True, num_workers=args.num_workers, pin_memory=True,
+        drop_last=False, num_workers=args.num_workers, pin_memory=True,
     )
 
     # ── Measure C2 memorization target ──

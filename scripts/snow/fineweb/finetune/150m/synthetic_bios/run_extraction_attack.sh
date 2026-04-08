@@ -5,6 +5,7 @@ source /work/.bashrc
 
 export HF_HOME=/work/scratch/hf
 export TRANSFORMERS_CACHE=/work/scratch/hf
+export TOKENIZERS_PARALLELISM=false
 
 cd /work/permutation-alignment
 mkdir -p logs
