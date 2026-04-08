@@ -4,10 +4,9 @@ These tests cover:
 1. CLI defaults and required args
 2. Data split invariants (train-only fractioning for optimization)
 3. Deterministic subset sampling via subset_seed
-4. Scheduler configuration in early-stop-only mode (no max-steps cap)
-5. Fixed patience policy (2 epochs)
-6. Early stopping semantics driven by train_people memo, not test_people
-7. W&B logging contains both memo_train/* and memo_test/* metrics
+4. Scheduler configuration in fixed-step mode (warmup + cosine decay)
+5. Fixed-step training reaches exactly max_steps (no early stop path)
+6. W&B logging contains both memo_train/* and memo_test/* metrics
 """
 
 from __future__ import annotations
@@ -185,7 +184,6 @@ def _write_bio_metadata(path: Path, n_train_people=4, n_test_people=4):
 def _default_args(tmp_path: Path, **overrides):
     args = SimpleNamespace(
         model_checkpoint="unused-model",
-        target_memo=None,
         key_path=None,
         tiered_checkpoint=None,
         private_data="unused-dataset",
@@ -195,13 +193,11 @@ def _default_args(tmp_path: Path, **overrides):
         batch_size=2,
         learning_rate=1e-3,
         min_lr=1e-4,
-        max_steps=None,
-        max_epochs=3,
+        max_steps=4,
         warmup_steps=2,
         weight_decay=0.0,
         max_grad_norm=1.0,
         eval_interval=1,
-        patience=1,  # deprecated/no-op
         log_interval=1,
         save_interval=10_000,
         wandb_project="test-proj",
@@ -266,7 +262,7 @@ def _run_main_and_get_selected_ids(monkeypatch, tmp_path, subset_seed):
         tmp_path,
         subset_seed=subset_seed,
         data_fraction=0.25,
-        target_memo=0.0,  # immediate early-exit after initial eval; no training needed
+        max_steps=1,
         eval_interval=1,
         log_interval=1000,
     )
@@ -288,16 +284,18 @@ def test_parse_args_defaults(monkeypatch):
             "0.1",
             "--output_dir",
             "o",
+            "--max_steps",
+            "12",
             "--bio_metadata",
             "b",
         ],
     )
     args = ea.parse_args()
-    assert args.max_epochs is None
-    assert args.max_steps is None
+    assert args.max_steps == 12
     assert args.subset_seed == 42
-    # kept for compatibility, ignored in logic
-    assert hasattr(args, "patience")
+    assert not hasattr(args, "target_memo")
+    assert not hasattr(args, "disable_early_stopping")
+    assert not hasattr(args, "patience")
 
 
 def test_main_requires_bio_metadata(monkeypatch, tmp_path):
@@ -328,16 +326,15 @@ def test_subset_sampling_is_deterministic_by_seed(monkeypatch, tmp_path):
     assert ids_seed_42_a != ids_seed_43
 
 
-def test_scheduler_uses_warmup_and_cycle_without_max_steps_cap(monkeypatch, tmp_path):
+def test_scheduler_uses_warmup_and_cosine_decay(monkeypatch, tmp_path):
     _write_bio_metadata(tmp_path / "bios_metadata.json")
-    ds = _TinyDataset.build(n_items=5)  # with batch_size=2 => steps_per_epoch=3
+    ds = _TinyDataset.build(n_items=5)
     args = _default_args(
         tmp_path,
         data_fraction=1.0,
         batch_size=2,
-        max_steps=None,
-        warmup_steps=7,
-        target_memo=0.0,   # immediate exit after init eval; scheduler already created
+        max_steps=11,
+        warmup_steps=3,
         eval_interval=1000,
         log_interval=1000,
     )
@@ -358,91 +355,61 @@ def test_scheduler_uses_warmup_and_cycle_without_max_steps_cap(monkeypatch, tmp_
             return None
 
     monkeypatch.setattr(ea, "LinearLR", _FakeScheduler)
-    monkeypatch.setattr(ea, "CosineAnnealingWarmRestarts", _FakeScheduler)
+    monkeypatch.setattr(ea, "CosineAnnealingLR", _FakeScheduler)
     monkeypatch.setattr(ea, "SequentialLR", _FakeScheduler)
 
     _install_common_patches(monkeypatch, args, dataset_obj=ds)
     ea.main()
 
-    # LinearLR uses configured warmup directly in early-stop-only mode.
+    # LinearLR uses configured warmup directly.
     linear_kwargs = next(k for _a, k in captured["calls"] if "total_iters" in k)
-    assert linear_kwargs["total_iters"] == 7
+    assert linear_kwargs["total_iters"] == 3
+    assert linear_kwargs["start_factor"] == pytest.approx(0.1)
+    assert linear_kwargs["end_factor"] == pytest.approx(1.0)
 
-    # Cosine warm-restarts cycle is tied to steps_per_epoch (10 epochs/cycle).
-    cosine_kwargs = next(k for _a, k in captured["calls"] if "T_0" in k)
-    assert cosine_kwargs["T_0"] == 30
+    # Cosine decay spans the remaining steps after warmup.
+    cosine_kwargs = next(k for _a, k in captured["calls"] if "T_max" in k)
+    assert cosine_kwargs["T_max"] == 8
 
 
-def test_patience_is_fixed_to_two_epochs_and_train_drives_stopping(monkeypatch, tmp_path):
+def test_training_runs_to_max_steps_without_early_stopping(monkeypatch, tmp_path):
     meta = _write_bio_metadata(tmp_path / "bios_metadata.json", n_train_people=2, n_test_people=2)
     train_ids = set(meta["train_people"])
-    ds = _TinyDataset.build(n_items=4)  # batch=2 => 2 steps/epoch => patience_steps=4
+    ds = _TinyDataset.build(n_items=4)
     args = _default_args(
         tmp_path,
         data_fraction=1.0,
         batch_size=2,
-        max_steps=None,
-        max_epochs=30,
+        max_steps=5,
         eval_interval=1,
         log_interval=1000,
-        target_memo=None,
-        patience=1,  # should be ignored
     )
 
     def memo_fn(_model, _tok, bios, _spans, _device, **_kwargs):
         split = "train" if bios and bios[0]["person_id"] in train_ids else "test"
         if split == "train":
-            return _default_memo_metrics(0.1)  # never improves
-        return _default_memo_metrics(0.99)     # very high but should not drive stopping
+            return _default_memo_metrics(0.1)
+        return _default_memo_metrics(0.99)
 
     ctx = _install_common_patches(monkeypatch, args, dataset_obj=ds, memo_fn=memo_fn)
     ea.main()
 
-    # Should stop after 2 epochs => 4 steps (not after deprecated patience=1).
-    assert ctx["save_calls"][-1]["global_step"] == 4
+    # Must always run full fixed-step budget.
+    assert ctx["save_calls"][-1]["global_step"] == 5
 
     # Final log should include both train/test memo summaries.
     final_logs = [x for x in ctx["wandb"].logged if "final/train_memo_top1" in x]
     assert final_logs, "Expected final memo log"
     assert final_logs[-1]["final/train_memo_top1"] == pytest.approx(0.1)
     assert final_logs[-1]["final/test_memo_top1"] == pytest.approx(0.99)
-    assert final_logs[-1]["reached_target_train"] is False
 
 
-def test_target_threshold_applies_to_train_people_only(monkeypatch, tmp_path):
-    meta = _write_bio_metadata(tmp_path / "bios_metadata.json", n_train_people=2, n_test_people=2)
-    train_ids = set(meta["train_people"])
-    ds = _TinyDataset.build(n_items=8)
-    args = _default_args(
-        tmp_path,
-        data_fraction=1.0,
-        batch_size=2,
-        max_steps=None,
-        max_epochs=30,
-        eval_interval=1,
-        log_interval=1000,
-        target_memo=0.5,
-    )
-
-    train_calls = {"n": 0}
-
-    def memo_fn(_model, _tok, bios, _spans, _device, **_kwargs):
-        split = "train" if bios and bios[0]["person_id"] in train_ids else "test"
-        if split == "train":
-            train_calls["n"] += 1
-            # call 1 = initial eval, call 2 = step 1 eval
-            return _default_memo_metrics(0.1 if train_calls["n"] == 1 else 0.6)
-        # test memo stays low; should not affect target stopping
-        return _default_memo_metrics(0.0)
-
-    ctx = _install_common_patches(monkeypatch, args, dataset_obj=ds, memo_fn=memo_fn)
-    ea.main()
-
-    # Should stop as soon as train memo crosses target (step 1).
-    assert ctx["save_calls"][-1]["global_step"] == 1
-    final_logs = [x for x in ctx["wandb"].logged if "reached_target_train" in x]
-    assert final_logs
-    assert final_logs[-1]["reached_target_train"] is True
+def test_main_requires_positive_max_steps(monkeypatch, tmp_path):
+    _write_bio_metadata(tmp_path / "bios_metadata.json")
+    args = _default_args(tmp_path, max_steps=0)
+    _install_common_patches(monkeypatch, args, dataset_obj=_TinyDataset.build(n_items=8))
+    with pytest.raises(ValueError, match="--max_steps must be > 0"):
+        ea.main()
 
 
 def test_eval_logs_include_both_train_and_test_memo_keys(monkeypatch, tmp_path):
@@ -454,7 +421,6 @@ def test_eval_logs_include_both_train_and_test_memo_keys(monkeypatch, tmp_path):
         data_fraction=1.0,
         batch_size=2,
         max_steps=2,
-        max_epochs=30,
         eval_interval=1,
         log_interval=1000,
     )
@@ -521,6 +487,8 @@ def test_e2e_entrypoint_runs_via_module_main(monkeypatch, tmp_path):
             "0.5",
             "--output_dir",
             str(tmp_path / "out"),
+            "--max_steps",
+            "2",
             "--bio_metadata",
             str(tmp_path / "bios_metadata.json"),
             "--batch_size",

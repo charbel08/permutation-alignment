@@ -9,9 +9,8 @@ Two conditions:
   2. **Baseline attack**: Start from the baseline pretrained model, finetune
      all params with the same fraction.
 
-Early stopping is driven by C1 memorization on train_people (from
-bio metadata), while reporting focuses on C1 memorization on held-out
-test_people.
+Training always runs for a fixed `max_steps` token budget. Memorization is
+evaluated on train_people and test_people for reporting.
 
 Usage:
     torchrun --standalone --nproc_per_node=N -m tiered.train.finetune.extraction_attack \
@@ -19,6 +18,7 @@ Usage:
         --private_data /path/to/private \
         --output_dir /path/to/output \
         --data_fraction 0.1 \
+        --max_steps 4050 \
         --bio_metadata /path/to/bios_metadata.json
 """
 
@@ -34,7 +34,7 @@ import torch.optim as optim
 import wandb
 from datasets import load_from_disk
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR, SequentialLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 from transformers import AutoTokenizer, DataCollatorForLanguageModeling
@@ -53,10 +53,6 @@ def parse_args():
     parser.add_argument("--model_checkpoint", type=str, required=True,
                         help="Model to finetune (tiered-finetuned or baseline pretrained)")
 
-    # Optional train-memorization target for early stopping
-    parser.add_argument("--target_memo", type=float, default=None,
-                        help="Optional train_people memorization top1_acc target for "
-                             "early stopping. If omitted, stopping is patience-only.")
     parser.add_argument("--key_path", type=str, default=None,
                         help="Deprecated/unused (kept for CLI compatibility).")
     parser.add_argument("--tiered_checkpoint", type=str, default=None,
@@ -77,18 +73,14 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=3e-5)
     parser.add_argument("--min_lr", type=float, default=1e-6)
-    parser.add_argument("--max_steps", type=int, default=None,
-                        help=argparse.SUPPRESS)  # deprecated; ignored (early-stop only)
-    parser.add_argument("--max_epochs", type=int, default=None,
-                        help=argparse.SUPPRESS)  # deprecated; ignored (early-stop only)
+    parser.add_argument("--max_steps", type=int, required=True,
+                        help="Train for exactly this many optimizer steps.")
     parser.add_argument("--warmup_steps", type=int, default=100)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
 
-    # Validation / early stopping
+    # Validation
     parser.add_argument("--eval_interval", type=int, default=100)
-    parser.add_argument("--patience", type=int, default=None,
-                        help=argparse.SUPPRESS)  # deprecated; ignored (fixed to 2 epochs)
 
     # Logging
     parser.add_argument("--log_interval", type=int, default=10)
@@ -101,7 +93,7 @@ def parse_args():
     parser.add_argument("--bio_metadata", type=str, default=None,
                         help="Path to bios_metadata.json. When provided, "
                              "memorization is measured on both train_people "
-                             "(for early stopping) and test_people (for reporting).")
+                             "and test_people.")
 
     return parser.parse_args()
 
@@ -111,7 +103,7 @@ def main():
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
     if args.bio_metadata is None:
-        raise ValueError("--bio_metadata is required for memorization-based stopping")
+        raise ValueError("--bio_metadata is required for memorization evaluation")
 
     # ── Distributed setup ──
     local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -143,7 +135,7 @@ def main():
     collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
     # Load bio metadata for memorization eval (rank 0 only):
-    # - train_people: used for early stopping
+    # - train_people: in-training reporting
     # - test_people: held-out reporting set
     memo_train_bios = None
     memo_train_spans = None
@@ -221,34 +213,23 @@ def main():
         raise ValueError("Train dataloader has zero batches; increase data fraction or reduce batch size.")
     if args.eval_interval <= 0:
         raise ValueError("--eval_interval must be > 0")
-    # Fixed patience policy: 2 epochs for all runs.
-    patience_epochs = 2
-    patience_steps = patience_epochs * steps_per_epoch
-
-    # Optional train-memorization target for early stop.
-    target_memo_train = args.target_memo
-    if is_distributed:
-        t = torch.tensor([target_memo_train if target_memo_train is not None else -1.0],
-                         device=device)
-        dist.broadcast(t, src=0)
-        target_memo_train = None if t.item() < 0 else t.item()
+    if args.max_steps <= 0:
+        raise ValueError("--max_steps must be > 0")
 
     # ── Optimizer / scheduler ──
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate,
                             weight_decay=args.weight_decay)
-    # Early-stop-only loop: use warmup + cosine restarts (no fixed max-steps cap).
-    effective_warmup_steps = max(0, args.warmup_steps)
-    cosine_cycle_steps = max(1, 10 * steps_per_epoch)
-    cosine = CosineAnnealingWarmRestarts(
-        optimizer,
-        T_0=cosine_cycle_steps,
-        T_mult=1,
-        eta_min=args.min_lr,
+    # Match finetune LR schedule: linear warmup + cosine decay over max_steps.
+    effective_warmup_steps = max(0, min(args.warmup_steps, max(0, args.max_steps - 1)))
+    cosine_total_steps = max(1, args.max_steps - effective_warmup_steps)
+    cosine = CosineAnnealingLR(
+        optimizer, T_max=cosine_total_steps, eta_min=args.min_lr
     )
     if effective_warmup_steps > 0:
         warmup = LinearLR(
             optimizer,
-            start_factor=1e-8 / args.learning_rate,
+            start_factor=0.1,
+            end_factor=1.0,
             total_iters=effective_warmup_steps,
         )
         scheduler = SequentialLR(
@@ -269,34 +250,24 @@ def main():
         run_name = args.run_name or f"attack_frac{args.data_fraction}"
         wandb.init(project=args.wandb_project, name=run_name, config={
             **vars(args),
-            "target_memo_train": target_memo_train,
             "n_train": n_train,
             "steps_per_epoch": steps_per_epoch,
-            "lr_schedule": "linear_warmup+cosine_warm_restarts",
+            "lr_schedule": "linear_warmup+cosine_decay",
             "lr_warmup_steps_effective": effective_warmup_steps,
-            "lr_cosine_cycle_steps": cosine_cycle_steps,
-            "patience_epochs_effective": patience_epochs,
-            "patience_steps_effective": patience_steps,
+            "lr_cosine_total_steps": cosine_total_steps,
         })
         wandb.define_metric("train/step")
         wandb.define_metric("*", step_metric="train/step")
-        if target_memo_train is not None:
-            print(f"\nTarget train memorization (top1_acc): {target_memo_train:.4f}")
-            print("Training until early stopping.")
-            print("Stop when train_people memo >= target or patience is exhausted.")
-        else:
-            print(
-                f"Early stopping: patience={patience_epochs} epochs "
-                f"({patience_steps} steps) on train_people memorization"
-            )
+        print(
+            f"Fixed-step training: max_steps={args.max_steps}, "
+            f"eval_interval={args.eval_interval}"
+        )
 
     # ── Initial memorization eval ──
     init_train_memo_top1 = 0.0
     init_test_memo_top1 = 0.0
     if is_main:
         log_dict = {"train/step": 0}
-        if target_memo_train is not None:
-            log_dict["target_memo_train"] = target_memo_train
 
         if memo_train_bios is not None:
             init_train_memo = evaluate_memorization(
@@ -320,35 +291,15 @@ def main():
 
         wandb.log(log_dict)
 
-    # Check if already at optional train target
-    should_exit_now = 0.0
-    if is_main and target_memo_train is not None and init_train_memo_top1 >= target_memo_train:
-        print(
-            "Already at train target! "
-            f"train memo top1 {init_train_memo_top1:.4f} >= {target_memo_train:.4f}"
-        )
-        wandb.log({"steps_to_target_train": 0, "reached_target_train": True, "train/step": 0})
-        wandb.finish()
-        should_exit_now = 1.0
-    if is_distributed:
-        t = torch.tensor([should_exit_now], device=device)
-        dist.broadcast(t, src=0)
-        if t.item() > 0:
-            return
-    elif should_exit_now > 0:
-        return
-
     # ── Training loop ──
     data_iter = iter(train_loader)
     data_epoch = 0
     global_step = 0
     best_train_memo = init_train_memo_top1 if is_main else 0.0
-    steps_since_improvement = 0
-    reached_target_train = False
+    pbar = tqdm(total=args.max_steps, desc="Attack finetune") if is_main else None
 
-    pbar = tqdm(desc="Attack finetune") if is_main else None
+    while global_step < args.max_steps:
 
-    while True:
         # Get batch
         try:
             batch = next(data_iter)
@@ -385,21 +336,20 @@ def main():
             pbar.update(1)
             pbar.set_postfix({"loss": f"{loss.item():.3f}"})
 
-        # Eval + early stopping
+        # Eval metrics
         if global_step % args.eval_interval == 0:
             current_train_memo_top1 = 0.0
             current_test_memo_top1 = 0.0
             if is_main:
                 sys.stdout.flush()
                 log_dict = {"train/step": global_step}
-                if target_memo_train is not None:
-                    log_dict["target_memo_train"] = target_memo_train
 
                 if memo_train_bios is not None:
                     memo_train = evaluate_memorization(
                         raw_model, tokenizer, memo_train_bios, memo_train_spans, device)
                     if memo_train:
                         current_train_memo_top1 = memo_train["top1_acc"]
+                        best_train_memo = max(best_train_memo, current_train_memo_top1)
                         for mk, mv in memo_train.items():
                             log_dict[f"memo_train/{mk}"] = mv
 
@@ -416,46 +366,8 @@ def main():
                     f"train_people top1={current_train_memo_top1:.4f}, "
                     f"test_people top1={current_test_memo_top1:.4f}"
                 )
-                if target_memo_train is not None:
-                    print(f"  train target={target_memo_train:.4f}")
 
                 wandb.log(log_dict)
-
-            # Broadcast train memo to all ranks for synchronized stopping
-            if is_distributed:
-                t = torch.tensor([current_train_memo_top1], device=device)
-                dist.broadcast(t, src=0)
-                current_train_memo_top1 = t.item()
-
-            if current_train_memo_top1 > best_train_memo:
-                best_train_memo = current_train_memo_top1
-                steps_since_improvement = 0
-            else:
-                steps_since_improvement += args.eval_interval
-
-            # Reached optional train target?
-            if target_memo_train is not None and current_train_memo_top1 >= target_memo_train:
-                reached_target_train = True
-                if is_main:
-                    print(
-                        f"\n*** TRAIN TARGET REACHED at step {global_step}! "
-                        f"train memo top1={current_train_memo_top1:.4f} "
-                        f">= {target_memo_train:.4f} ***"
-                    )
-                    save_path = os.path.join(args.output_dir, "target-reached")
-                    save_checkpoint(raw_model, tokenizer, optimizer, save_path,
-                                    scheduler=scheduler, global_step=global_step)
-                    print(f"Saved to {save_path}")
-                break
-
-            # Patience
-            if steps_since_improvement >= patience_steps:
-                if is_main:
-                    print(
-                        f"\nPatience exhausted ({patience_epochs} epochs / {patience_steps} steps). "
-                        f"Best train memo: {best_train_memo:.4f}"
-                    )
-                break
 
         # Periodic save
         if is_main and global_step % args.save_interval == 0:
@@ -484,8 +396,6 @@ def main():
         wandb.log({
             "final/train_memo_top1": final_train_memo_top1,
             "final/test_memo_top1": final_test_memo_top1,
-            "steps_to_target_train": global_step if reached_target_train else -1,
-            "reached_target_train": reached_target_train,
             "best_train_memo": best_train_memo,
             "train/step": global_step,
         })
@@ -499,11 +409,6 @@ def main():
         print(f"{'='*60}")
         print(f"  Data fraction:    {args.data_fraction} ({n_train} samples)")
         print(f"  Steps:            {global_step}")
-        if target_memo_train is not None:
-            print(f"  Train target:     {target_memo_train:.4f}")
-            print(f"  Reached target:   {reached_target_train}")
-            if reached_target_train:
-                print(f"  Steps to target:  {global_step}")
         print(f"  Best train memo:  {best_train_memo:.4f}")
         print(f"  Final train memo: {final_train_memo_top1:.4f}")
         print(f"  Final test memo:  {final_test_memo_top1:.4f}")
