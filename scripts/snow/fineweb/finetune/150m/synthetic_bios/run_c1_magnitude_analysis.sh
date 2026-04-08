@@ -33,6 +33,7 @@ NUM_WORKERS=${NUM_WORKERS:-4}
 SEED=${SEED:-0}
 
 OUTPUT_PATH=${OUTPUT_PATH:-/work/scratch/checkpoints/fineweb/analysis_150m_synbios_key${KEY_SIZE}pct_kl${KL_TAG}_c1_magnitudes.json}
+PLOT_DIR=${PLOT_DIR:-/work/permutation-alignment/outputs}
 
 echo "=========================================================="
 echo "C1 Magnitude Analysis (150M synthetic bios)"
@@ -44,6 +45,7 @@ echo "  Batches:        ${NUM_BATCHES}"
 echo "  Batch size:     ${BATCH_SIZE}"
 echo "  Max length:     ${MAX_LENGTH}"
 echo "  Output JSON:    ${OUTPUT_PATH}"
+echo "  Plot dir:       ${PLOT_DIR}"
 echo "=========================================================="
 
 if [ ! -d "$CHECKPOINT" ]; then
@@ -80,9 +82,11 @@ PYTHONPATH=./src python scripts/eval/analyze_c1_keyed_magnitudes.py \
     --max_length "$MAX_LENGTH" \
     --num_workers "$NUM_WORKERS" \
     --seed "$SEED" \
-    --output_path "$OUTPUT_PATH" 2>&1 | tee "$LOG_FILE"
+    --output_path "$OUTPUT_PATH" \
+    ${PLOT_DIR:+--plot_dir "$PLOT_DIR"} 2>&1 | tee "$LOG_FILE"
 
 echo ""
 echo "Done."
 echo "Summary JSON: $OUTPUT_PATH"
+echo "Plots dir:    $PLOT_DIR"
 echo "Log file:     $LOG_FILE"

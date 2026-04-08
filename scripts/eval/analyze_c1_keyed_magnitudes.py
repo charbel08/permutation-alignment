@@ -26,6 +26,10 @@ import torch
 from datasets import load_from_disk
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from tiered.model import GPTNeoForCausalLMTiered
 from tiered.permutation import load_key, build_mask_plan
@@ -101,6 +105,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="outputs/analysis/150m_c1_keyed_magnitude_summary.json",
         help="Where to write JSON summary",
+    )
+    parser.add_argument(
+        "--plot_dir",
+        type=str,
+        default=None,
+        help="Directory to write plots (default: <output_path without .json>_plots)",
     )
     return parser.parse_args()
 
@@ -403,6 +413,125 @@ def print_summary(title: str, stats: dict) -> None:
         )
 
 
+def _ordered_components(stats: dict, include_overall: bool = True) -> list[str]:
+    keys = [k for k in stats.keys() if not k.startswith("_")]
+    if not include_overall:
+        keys = [k for k in keys if k != "overall"]
+    keys.sort()
+    if include_overall and "overall" in keys:
+        keys = [k for k in keys if k != "overall"] + ["overall"]
+    return keys
+
+
+def _plot_key_vs_non_abs(stats: dict, title: str, out_path: str) -> None:
+    comps = _ordered_components(stats, include_overall=True)
+    keyed = [stats[c]["keyed_mean_abs"] for c in comps]
+    non = [stats[c]["non_keyed_mean_abs"] for c in comps]
+    x = list(range(len(comps)))
+    w = 0.38
+
+    plt.figure(figsize=(max(10, len(comps) * 0.9), 5))
+    plt.bar([i - w / 2 for i in x], keyed, width=w, label="Keyed")
+    plt.bar([i + w / 2 for i in x], non, width=w, label="Non-keyed")
+    plt.yscale("log")
+    plt.xticks(x, comps, rotation=35, ha="right")
+    plt.ylabel("Mean |x| (log scale)")
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=160)
+    plt.close()
+
+
+def _plot_ratio(stats: dict, title: str, key_name: str, ylabel: str, out_path: str) -> None:
+    comps = _ordered_components(stats, include_overall=True)
+    vals = [stats[c][key_name] for c in comps]
+    x = list(range(len(comps)))
+
+    plt.figure(figsize=(max(10, len(comps) * 0.9), 5))
+    plt.bar(x, vals)
+    plt.axhline(1.0, color="black", linestyle="--", linewidth=1)
+    plt.xticks(x, comps, rotation=35, ha="right")
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=160)
+    plt.close()
+
+
+def _plot_private_vs_public_ratios(private_stats: dict, public_stats: dict, key_name: str, title: str, out_path: str) -> None:
+    shared = [
+        c
+        for c in _ordered_components(private_stats, include_overall=True)
+        if c in public_stats and not c.startswith("_")
+    ]
+    pvals = [private_stats[c][key_name] for c in shared]
+    uvals = [public_stats[c][key_name] for c in shared]
+    x = list(range(len(shared)))
+    w = 0.38
+
+    plt.figure(figsize=(max(10, len(shared) * 0.9), 5))
+    plt.bar([i - w / 2 for i in x], pvals, width=w, label="Private")
+    plt.bar([i + w / 2 for i in x], uvals, width=w, label="Public")
+    plt.axhline(1.0, color="black", linestyle="--", linewidth=1)
+    plt.xticks(x, shared, rotation=35, ha="right")
+    plt.ylabel("Keyed / Non-keyed ratio")
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=160)
+    plt.close()
+
+
+def save_plots(weight_stats: dict, private_activation_stats: dict, public_activation_stats: dict, plot_dir: str) -> list[str]:
+    os.makedirs(plot_dir, exist_ok=True)
+    paths: list[str] = []
+
+    p = os.path.join(plot_dir, "weights_mean_abs_key_vs_non.png")
+    _plot_key_vs_non_abs(weight_stats, "Weights: keyed vs non-keyed mean |w|", p)
+    paths.append(p)
+
+    p = os.path.join(plot_dir, "weights_mean_abs_ratio.png")
+    _plot_ratio(
+        weight_stats,
+        "Weights: keyed/non-keyed mean |w| ratio",
+        "mean_abs_ratio_key_over_non",
+        "Keyed / Non-keyed mean |w|",
+        p,
+    )
+    paths.append(p)
+
+    p = os.path.join(plot_dir, "private_activations_mean_abs_key_vs_non.png")
+    _plot_key_vs_non_abs(private_activation_stats, "Private activations: keyed vs non-keyed mean |a|", p)
+    paths.append(p)
+
+    p = os.path.join(plot_dir, "public_activations_mean_abs_key_vs_non.png")
+    _plot_key_vs_non_abs(public_activation_stats, "Public activations: keyed vs non-keyed mean |a|", p)
+    paths.append(p)
+
+    p = os.path.join(plot_dir, "activations_mean_abs_ratio_private_vs_public.png")
+    _plot_private_vs_public_ratios(
+        private_activation_stats,
+        public_activation_stats,
+        "mean_abs_ratio_key_over_non",
+        "Activation keyed/non-keyed mean |a| ratio: private vs public",
+        p,
+    )
+    paths.append(p)
+
+    p = os.path.join(plot_dir, "activations_rms_ratio_private_vs_public.png")
+    _plot_private_vs_public_ratios(
+        private_activation_stats,
+        public_activation_stats,
+        "rms_ratio_key_over_non",
+        "Activation keyed/non-keyed RMS ratio: private vs public",
+        p,
+    )
+    paths.append(p)
+
+    return paths
+
+
 def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
@@ -478,10 +607,20 @@ def main() -> None:
     with open(args.output_path, "w") as f:
         json.dump(summary, f, indent=2)
 
+    if args.plot_dir:
+        plot_dir = args.plot_dir
+    else:
+        base = args.output_path[:-5] if args.output_path.endswith(".json") else args.output_path
+        plot_dir = f"{base}_plots"
+    plot_paths = save_plots(weight_stats, private_activation_stats, public_activation_stats, plot_dir)
+
     print_summary("Weight Magnitudes (C1)", weight_stats)
     print_summary("Activation Magnitudes (C1, Private Data)", private_activation_stats)
     print_summary("Activation Magnitudes (C1, Public Data)", public_activation_stats)
     print(f"\nSaved summary: {args.output_path}")
+    print("Saved plots:")
+    for p in plot_paths:
+        print(f"  - {p}")
 
 
 if __name__ == "__main__":
