@@ -30,11 +30,20 @@ from transformers import AutoTokenizer
 from tiered.model import GPTNeoForCausalLMTiered
 from tiered.permutation import build_mask_plan, load_key
 
-from scripts.eval.analyze_c1_keyed_magnitudes import (
-    _build_loader,
-    compute_activation_stats,
-    compute_weight_stats,
-)
+try:
+    # Works when executed as a package/module from repo root.
+    from scripts.eval.analyze_c1_keyed_magnitudes import (
+        _build_loader,
+        compute_activation_stats,
+        compute_weight_stats,
+    )
+except ModuleNotFoundError:
+    # Works when executed directly as a file path.
+    from analyze_c1_keyed_magnitudes import (
+        _build_loader,
+        compute_activation_stats,
+        compute_weight_stats,
+    )
 
 
 @dataclass(frozen=True)
