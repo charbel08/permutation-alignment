@@ -34,7 +34,6 @@ NGPUS=${NGPUS:-8}
 BATCH_SIZE=${BATCH_SIZE:-8}
 LR=${LR:-3e-5}
 MIN_LR=${MIN_LR:-1e-6}
-MAX_EPOCHS=${MAX_EPOCHS:-100}
 WARMUP_STEPS=${WARMUP_STEPS:-100}
 EVAL_INTERVAL=${EVAL_INTERVAL:-100}
 NUM_WORKERS=${NUM_WORKERS:-4}
@@ -57,7 +56,6 @@ echo "  Key path:            ${KEY_PATH}"
 echo "  Private data:        ${PRIVATE_DATA}"
 echo "  Fractions:           ${FRACTIONS}"
 echo "  GPUs:                ${NGPUS}"
-echo "  Max epochs/run:      ${MAX_EPOCHS}"
 echo "  Patience:            2 epochs (fixed in python)"
 echo "  Subset seed:         ${SUBSET_SEED}"
 echo "  Bio metadata:        ${BIO_METADATA}"
@@ -91,7 +89,6 @@ for FRAC in $FRACTIONS; do
             --batch_size "$BATCH_SIZE" \
             --learning_rate "$LR" \
             --min_lr "$MIN_LR" \
-            --max_epochs "$MAX_EPOCHS" \
             --warmup_steps "$WARMUP_STEPS" \
             --eval_interval "$EVAL_INTERVAL" \
             --num_workers "$NUM_WORKERS" \
@@ -122,7 +119,6 @@ for FRAC in $FRACTIONS; do
             --batch_size "$BATCH_SIZE" \
             --learning_rate "$LR" \
             --min_lr "$MIN_LR" \
-            --max_epochs "$MAX_EPOCHS" \
             --warmup_steps "$WARMUP_STEPS" \
             --eval_interval "$EVAL_INTERVAL" \
             --num_workers "$NUM_WORKERS" \

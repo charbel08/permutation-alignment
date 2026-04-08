@@ -4,7 +4,7 @@ These tests cover:
 1. CLI defaults and required args
 2. Data split invariants (train-only fractioning for optimization)
 3. Deterministic subset sampling via subset_seed
-4. Epoch-derived max_steps and scheduler configuration when max_steps=None
+4. Scheduler configuration in early-stop-only mode (no max-steps cap)
 5. Fixed patience policy (2 epochs)
 6. Early stopping semantics driven by train_people memo, not test_people
 7. W&B logging contains both memo_train/* and memo_test/* metrics
@@ -266,9 +266,8 @@ def _run_main_and_get_selected_ids(monkeypatch, tmp_path, subset_seed):
         tmp_path,
         subset_seed=subset_seed,
         data_fraction=0.25,
-        max_steps=1,
-        max_epochs=1,
-        eval_interval=1000,
+        target_memo=0.0,  # immediate early-exit after initial eval; no training needed
+        eval_interval=1,
         log_interval=1000,
     )
     _install_common_patches(monkeypatch, args, dataset_obj=ds)
@@ -294,7 +293,7 @@ def test_parse_args_defaults(monkeypatch):
         ],
     )
     args = ea.parse_args()
-    assert args.max_epochs == 100
+    assert args.max_epochs is None
     assert args.max_steps is None
     assert args.subset_seed == 42
     # kept for compatibility, ignored in logic
@@ -329,7 +328,7 @@ def test_subset_sampling_is_deterministic_by_seed(monkeypatch, tmp_path):
     assert ids_seed_42_a != ids_seed_43
 
 
-def test_scheduler_uses_effective_steps_when_max_steps_is_none(monkeypatch, tmp_path):
+def test_scheduler_uses_warmup_and_cycle_without_max_steps_cap(monkeypatch, tmp_path):
     _write_bio_metadata(tmp_path / "bios_metadata.json")
     ds = _TinyDataset.build(n_items=5)  # with batch_size=2 => steps_per_epoch=3
     args = _default_args(
@@ -337,8 +336,8 @@ def test_scheduler_uses_effective_steps_when_max_steps_is_none(monkeypatch, tmp_
         data_fraction=1.0,
         batch_size=2,
         max_steps=None,
-        max_epochs=2,      # max_steps_from_epochs = 6
-        warmup_steps=20,   # clipped to 6
+        warmup_steps=7,
+        target_memo=0.0,   # immediate exit after init eval; scheduler already created
         eval_interval=1000,
         log_interval=1000,
     )
@@ -359,19 +358,19 @@ def test_scheduler_uses_effective_steps_when_max_steps_is_none(monkeypatch, tmp_
             return None
 
     monkeypatch.setattr(ea, "LinearLR", _FakeScheduler)
-    monkeypatch.setattr(ea, "CosineAnnealingLR", _FakeScheduler)
+    monkeypatch.setattr(ea, "CosineAnnealingWarmRestarts", _FakeScheduler)
     monkeypatch.setattr(ea, "SequentialLR", _FakeScheduler)
 
     _install_common_patches(monkeypatch, args, dataset_obj=ds)
     ea.main()
 
-    # LinearLR total_iters should be clipped to effective max_steps (6)
-    linear_kwargs = captured["calls"][0][1]
-    assert linear_kwargs["total_iters"] == 6
+    # LinearLR uses configured warmup directly in early-stop-only mode.
+    linear_kwargs = next(k for _a, k in captured["calls"] if "total_iters" in k)
+    assert linear_kwargs["total_iters"] == 7
 
-    # CosineLR T_max must be >=1 and based on effective steps
-    cosine_kwargs = captured["calls"][1][1]
-    assert cosine_kwargs["T_max"] == 1
+    # Cosine warm-restarts cycle is tied to steps_per_epoch (10 epochs/cycle).
+    cosine_kwargs = next(k for _a, k in captured["calls"] if "T_0" in k)
+    assert cosine_kwargs["T_0"] == 30
 
 
 def test_patience_is_fixed_to_two_epochs_and_train_drives_stopping(monkeypatch, tmp_path):
@@ -526,8 +525,6 @@ def test_e2e_entrypoint_runs_via_module_main(monkeypatch, tmp_path):
             str(tmp_path / "bios_metadata.json"),
             "--batch_size",
             "2",
-            "--max_epochs",
-            "1",
             "--eval_interval",
             "1",
             "--log_interval",

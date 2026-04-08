@@ -34,7 +34,7 @@ import torch.optim as optim
 import wandb
 from datasets import load_from_disk
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 from transformers import AutoTokenizer, DataCollatorForLanguageModeling
@@ -78,10 +78,9 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=3e-5)
     parser.add_argument("--min_lr", type=float, default=1e-6)
     parser.add_argument("--max_steps", type=int, default=None,
-                        help="Optional hard cap in steps. Effective max is "
-                             "min(max_steps, max_epochs * steps_per_epoch).")
-    parser.add_argument("--max_epochs", type=int, default=100,
-                        help="Maximum number of epochs to run (default: 100).")
+                        help=argparse.SUPPRESS)  # deprecated; ignored (early-stop only)
+    parser.add_argument("--max_epochs", type=int, default=None,
+                        help=argparse.SUPPRESS)  # deprecated; ignored (early-stop only)
     parser.add_argument("--warmup_steps", type=int, default=100)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
@@ -220,10 +219,8 @@ def main():
     steps_per_epoch = len(train_loader)
     if steps_per_epoch <= 0:
         raise ValueError("Train dataloader has zero batches; increase data fraction or reduce batch size.")
-    max_steps_from_epochs = args.max_epochs * steps_per_epoch
-    max_steps = max_steps_from_epochs if args.max_steps is None else min(args.max_steps, max_steps_from_epochs)
-    # Normalize for any downstream code paths still reading args.max_steps.
-    args.max_steps = max_steps
+    if args.eval_interval <= 0:
+        raise ValueError("--eval_interval must be > 0")
     # Fixed patience policy: 2 epochs for all runs.
     patience_epochs = 2
     patience_steps = patience_epochs * steps_per_epoch
@@ -239,24 +236,28 @@ def main():
     # ── Optimizer / scheduler ──
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate,
                             weight_decay=args.weight_decay)
-    # Scheduler is defined on effective max_steps (epoch-capped).
-    effective_warmup_steps = min(args.warmup_steps, max_steps)
-    cosine_t_max = max(1, max_steps - effective_warmup_steps)
-    warmup = LinearLR(
+    # Early-stop-only loop: use warmup + cosine restarts (no fixed max-steps cap).
+    effective_warmup_steps = max(0, args.warmup_steps)
+    cosine_cycle_steps = max(1, 10 * steps_per_epoch)
+    cosine = CosineAnnealingWarmRestarts(
         optimizer,
-        start_factor=1e-8 / args.learning_rate,
-        total_iters=effective_warmup_steps,
-    )
-    cosine = CosineAnnealingLR(
-        optimizer,
-        T_max=cosine_t_max,
+        T_0=cosine_cycle_steps,
+        T_mult=1,
         eta_min=args.min_lr,
     )
-    scheduler = SequentialLR(
-        optimizer,
-        [warmup, cosine],
-        milestones=[effective_warmup_steps],
-    )
+    if effective_warmup_steps > 0:
+        warmup = LinearLR(
+            optimizer,
+            start_factor=1e-8 / args.learning_rate,
+            total_iters=effective_warmup_steps,
+        )
+        scheduler = SequentialLR(
+            optimizer,
+            [warmup, cosine],
+            milestones=[effective_warmup_steps],
+        )
+    else:
+        scheduler = cosine
 
     # ── DDP ──
     if is_distributed:
@@ -271,7 +272,9 @@ def main():
             "target_memo_train": target_memo_train,
             "n_train": n_train,
             "steps_per_epoch": steps_per_epoch,
-            "max_steps_effective": max_steps,
+            "lr_schedule": "linear_warmup+cosine_warm_restarts",
+            "lr_warmup_steps_effective": effective_warmup_steps,
+            "lr_cosine_cycle_steps": cosine_cycle_steps,
             "patience_epochs_effective": patience_epochs,
             "patience_steps_effective": patience_steps,
         })
@@ -279,13 +282,9 @@ def main():
         wandb.define_metric("*", step_metric="train/step")
         if target_memo_train is not None:
             print(f"\nTarget train memorization (top1_acc): {target_memo_train:.4f}")
-            print(
-                f"Training for up to {max_steps} steps "
-                f"({args.max_epochs} epochs max) "
-                "(early stop when train_people memo >= target)"
-            )
+            print("Training until early stopping.")
+            print("Stop when train_people memo >= target or patience is exhausted.")
         else:
-            print(f"\nTraining for up to {max_steps} steps ({args.max_epochs} epochs max)")
             print(
                 f"Early stopping: patience={patience_epochs} epochs "
                 f"({patience_steps} steps) on train_people memorization"
@@ -347,9 +346,9 @@ def main():
     steps_since_improvement = 0
     reached_target_train = False
 
-    pbar = tqdm(total=max_steps, desc="Attack finetune") if is_main else None
+    pbar = tqdm(desc="Attack finetune") if is_main else None
 
-    while global_step < max_steps:
+    while True:
         # Get batch
         try:
             batch = next(data_iter)
