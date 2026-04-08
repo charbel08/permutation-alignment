@@ -152,29 +152,37 @@ def evaluate_memorization(model, tokenizer, bios, bio_spans, device,
         batch = valid_items[batch_start:batch_start + batch_size]
         bs = len(batch)
 
-        # Left-pad prefixes to equal length for batched generation
+        # Left-pad prefixes to equal length for batched generation.
+        # GPT-Neo uses absolute positional embeddings, so we must pass
+        # position_ids explicitly to avoid wrong embeddings on pad tokens.
         prefixes = [item[1][:item[2]] for item in batch]  # enc[:vs]
         max_prefix_len = max(p.shape[0] for p in prefixes)
 
         pad_id = tokenizer.pad_token_id
         input_ids = torch.full((bs, max_prefix_len), pad_id, dtype=torch.long)
         attn_mask = torch.zeros(bs, max_prefix_len, dtype=torch.long)
+        position_ids = torch.zeros(bs, max_prefix_len, dtype=torch.long)
         for j, p in enumerate(prefixes):
             offset = max_prefix_len - p.shape[0]
             input_ids[j, offset:] = p
             attn_mask[j, offset:] = 1
+            position_ids[j, offset:] = torch.arange(p.shape[0])
 
         input_ids = input_ids.to(device)
         attn_mask = attn_mask.to(device)
+        position_ids = position_ids.to(device)
 
         # Greedy decode max_gen_len tokens
         for _ in range(max_gen_len):
-            logits = model(input_ids, attention_mask=attn_mask).logits
+            logits = model(input_ids, attention_mask=attn_mask,
+                           position_ids=position_ids).logits
             next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
             input_ids = torch.cat([input_ids, next_token], dim=1)
             attn_mask = torch.cat([attn_mask,
                                    torch.ones(bs, 1, dtype=torch.long,
                                               device=device)], dim=1)
+            next_pos = position_ids[:, -1:] + 1
+            position_ids = torch.cat([position_ids, next_pos], dim=1)
 
         # Extract generated tokens (after the prefix)
         for j, (idx, enc, vs, ve) in enumerate(batch):
