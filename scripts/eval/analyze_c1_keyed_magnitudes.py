@@ -22,6 +22,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict
 
+import numpy as np
 import torch
 from datasets import load_from_disk
 from torch.utils.data import DataLoader
@@ -30,6 +31,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.colors import TwoSlopeNorm
 
 from tiered.model import GPTNeoForCausalLMTiered
 from tiered.permutation import load_key, build_mask_plan
@@ -315,6 +317,47 @@ def compute_weight_stats(model: GPTNeoForCausalLMTiered, mask_plan) -> Dict[str,
 
 
 @torch.no_grad()
+def compute_weight_stats_per_layer(model: GPTNeoForCausalLMTiered, mask_plan) -> Dict[str, dict]:
+    stats: Dict[str, PartitionStats] = defaultdict(PartitionStats)
+
+    all_attn_layers = set(mask_plan.keyed_attn_indices.keys()) | set(mask_plan.keyed_attn_out_indices.keys())
+    for layer_idx in sorted(all_attn_layers):
+        attn = _get_attention_module(model, layer_idx)
+        idx_rows = mask_plan.keyed_attn_indices.get(layer_idx)
+        idx_cols = _merge_idx(idx_rows, mask_plan.keyed_attn_out_indices.get(layer_idx))
+        tag = f"L{layer_idx:02d}"
+
+        if idx_rows is not None and idx_rows.numel() > 0:
+            _accumulate_partition_rows(attn.q_proj.weight, idx_rows, stats[f"{tag}_attn_q_weight_rows"])
+            _accumulate_partition_rows(attn.k_proj.weight, idx_rows, stats[f"{tag}_attn_k_weight_rows"])
+            _accumulate_partition_rows(attn.v_proj.weight, idx_rows, stats[f"{tag}_attn_v_weight_rows"])
+
+        if idx_cols is not None and idx_cols.numel() > 0:
+            _accumulate_partition_cols(attn.out_proj.weight, idx_cols, stats[f"{tag}_attn_out_weight_cols"])
+
+    all_mlp_layers = (
+        set(mask_plan.keyed_mlp_indices.keys())
+        | set(mask_plan.keyed_mlp_up_indices.keys())
+        | set(mask_plan.keyed_mlp_down_indices.keys())
+    )
+    for layer_idx in sorted(all_mlp_layers):
+        mlp = _get_mlp_module(model, layer_idx)
+        idx_rows = _merge_idx(mask_plan.keyed_mlp_indices.get(layer_idx), mask_plan.keyed_mlp_up_indices.get(layer_idx))
+        idx_cols = _merge_idx(mask_plan.keyed_mlp_indices.get(layer_idx), mask_plan.keyed_mlp_down_indices.get(layer_idx))
+        tag = f"L{layer_idx:02d}"
+
+        if idx_rows is not None and idx_rows.numel() > 0:
+            _accumulate_partition_rows(mlp.c_fc.weight, idx_rows, stats[f"{tag}_mlp_fc_weight_rows"])
+            if mlp.c_fc.bias is not None:
+                _accumulate_partition_vec(mlp.c_fc.bias, idx_rows, stats[f"{tag}_mlp_fc_bias"])
+
+        if idx_cols is not None and idx_cols.numel() > 0:
+            _accumulate_partition_cols(mlp.c_proj.weight, idx_cols, stats[f"{tag}_mlp_proj_weight_cols"])
+
+    return {name: acc.to_dict() for name, acc in stats.items()}
+
+
+@torch.no_grad()
 def compute_activation_stats(
     model: GPTNeoForCausalLMTiered,
     mask_plan,
@@ -398,6 +441,82 @@ def compute_activation_stats(
     return out
 
 
+@torch.no_grad()
+def compute_activation_stats_per_layer(
+    model: GPTNeoForCausalLMTiered,
+    mask_plan,
+    dataloader: DataLoader,
+    device: torch.device,
+    num_batches: int,
+) -> Dict[str, dict]:
+    stats: Dict[str, PartitionStats] = defaultdict(PartitionStats)
+    handles = []
+
+    def register_out_hook(module, keyed_idx: torch.Tensor, stat_name: str):
+        def _hook(_module, _inputs, output):
+            tensor = output[0] if isinstance(output, tuple) else output
+            _accumulate_partition_last_dim(tensor, keyed_idx, stats[stat_name])
+
+        handles.append(module.register_forward_hook(_hook))
+
+    def register_in_hook(module, keyed_idx: torch.Tensor, stat_name: str):
+        def _hook(_module, inputs, _output):
+            tensor = inputs[0]
+            _accumulate_partition_last_dim(tensor, keyed_idx, stats[stat_name])
+
+        handles.append(module.register_forward_hook(_hook))
+
+    all_attn_layers = set(mask_plan.keyed_attn_indices.keys()) | set(mask_plan.keyed_attn_out_indices.keys())
+    for layer_idx in sorted(all_attn_layers):
+        attn = _get_attention_module(model, layer_idx)
+        idx_rows = mask_plan.keyed_attn_indices.get(layer_idx)
+        idx_cols = _merge_idx(idx_rows, mask_plan.keyed_attn_out_indices.get(layer_idx))
+        tag = f"L{layer_idx:02d}"
+
+        if idx_rows is not None and idx_rows.numel() > 0:
+            register_out_hook(attn.q_proj, idx_rows, f"{tag}_attn_q_out")
+            register_out_hook(attn.k_proj, idx_rows, f"{tag}_attn_k_out")
+            register_out_hook(attn.v_proj, idx_rows, f"{tag}_attn_v_out")
+
+        if idx_cols is not None and idx_cols.numel() > 0:
+            register_in_hook(attn.out_proj, idx_cols, f"{tag}_attn_out_in")
+
+    all_mlp_layers = (
+        set(mask_plan.keyed_mlp_indices.keys())
+        | set(mask_plan.keyed_mlp_up_indices.keys())
+        | set(mask_plan.keyed_mlp_down_indices.keys())
+    )
+    for layer_idx in sorted(all_mlp_layers):
+        mlp = _get_mlp_module(model, layer_idx)
+        idx_rows = _merge_idx(mask_plan.keyed_mlp_indices.get(layer_idx), mask_plan.keyed_mlp_up_indices.get(layer_idx))
+        idx_cols = _merge_idx(mask_plan.keyed_mlp_indices.get(layer_idx), mask_plan.keyed_mlp_down_indices.get(layer_idx))
+        tag = f"L{layer_idx:02d}"
+
+        if idx_rows is not None and idx_rows.numel() > 0:
+            register_out_hook(mlp.c_fc, idx_rows, f"{tag}_mlp_fc_out")
+        if idx_cols is not None and idx_cols.numel() > 0:
+            register_in_hook(mlp.c_proj, idx_cols, f"{tag}_mlp_proj_in")
+
+    model.eval()
+    batches_run = 0
+    tokens_seen = 0
+    for batch in dataloader:
+        if batches_run >= num_batches:
+            break
+        input_ids = batch["input_ids"].to(device, non_blocking=True)
+        attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+        tokens_seen += int(attention_mask.sum().item())
+        _ = model(input_ids=input_ids, attention_mask=attention_mask)
+        batches_run += 1
+
+    for h in handles:
+        h.remove()
+
+    out = {name: acc.to_dict() for name, acc in stats.items()}
+    out["_meta"] = {"batches_run": batches_run, "tokens_seen": tokens_seen}
+    return out
+
+
 def print_summary(title: str, stats: dict) -> None:
     print(f"\n{title}")
     print("-" * len(title))
@@ -421,6 +540,104 @@ def _ordered_components(stats: dict, include_overall: bool = True) -> list[str]:
     if include_overall and "overall" in keys:
         keys = [k for k in keys if k != "overall"] + ["overall"]
     return keys
+
+
+def _ordered_layered_components(stats: dict, component_order: list[str]) -> tuple[list[str], list[str]]:
+    pairs = []
+    for key in stats.keys():
+        if key.startswith("_"):
+            continue
+        layer_tag, component = key.split("_", 1)
+        pairs.append((layer_tag, component))
+
+    layer_tags = sorted({layer for layer, _ in pairs})
+    ordered_components = [c for c in component_order if any(component == c for _, component in pairs)]
+    return layer_tags, ordered_components
+
+
+def _display_name(component: str) -> str:
+    return {
+        "attn_q_weight_rows": "attn_q_w",
+        "attn_k_weight_rows": "attn_k_w",
+        "attn_v_weight_rows": "attn_v_w",
+        "attn_out_weight_cols": "attn_out_w",
+        "mlp_fc_weight_rows": "mlp_fc_w",
+        "mlp_fc_bias": "mlp_fc_b",
+        "mlp_proj_weight_cols": "mlp_proj_w",
+        "attn_q_out": "attn_q",
+        "attn_k_out": "attn_k",
+        "attn_v_out": "attn_v",
+        "attn_out_in": "attn_out",
+        "mlp_fc_out": "mlp_fc",
+        "mlp_proj_in": "mlp_proj",
+    }.get(component, component)
+
+
+def _plot_per_layer_ratio_heatmap(
+    stats: dict,
+    title: str,
+    component_order: list[str],
+    out_path: str,
+) -> None:
+    layer_tags, ordered_components = _ordered_layered_components(stats, component_order)
+    if not layer_tags or not ordered_components:
+        return
+
+    matrix = np.full((len(ordered_components), len(layer_tags)), np.nan, dtype=float)
+    all_vals: list[float] = []
+    for row_idx, component in enumerate(ordered_components):
+        for col_idx, layer_tag in enumerate(layer_tags):
+            key = f"{layer_tag}_{component}"
+            if key not in stats:
+                continue
+            ratio = float(stats[key]["mean_abs_ratio_key_over_non"])
+            matrix[row_idx, col_idx] = ratio
+            if math.isfinite(ratio):
+                all_vals.append(ratio)
+
+    if not all_vals:
+        return
+
+    finite = matrix[np.isfinite(matrix)]
+    min_ratio = float(np.min(finite))
+    max_ratio = float(np.max(finite))
+    if min_ratio == max_ratio:
+        pad = 0.05 if min_ratio == 1.0 else abs(min_ratio) * 0.05
+        min_ratio -= pad
+        max_ratio += pad
+    if min_ratio >= 1.0:
+        min_ratio = 1.0 - max(0.05, (max_ratio - 1.0) * 0.25)
+    if max_ratio <= 1.0:
+        max_ratio = 1.0 + max(0.05, (1.0 - min_ratio) * 0.25)
+
+    fig, ax = plt.subplots(
+        figsize=(max(10, len(layer_tags) * 0.7), max(4.5, len(ordered_components) * 0.7)),
+        facecolor="#f6f2e8",
+    )
+    norm = TwoSlopeNorm(vmin=min_ratio, vcenter=1.0, vmax=max_ratio)
+    im = ax.imshow(matrix, aspect="auto", cmap="RdBu_r", norm=norm)
+
+    ax.set_xticks(range(len(layer_tags)))
+    ax.set_xticklabels(layer_tags, rotation=0)
+    ax.set_yticks(range(len(ordered_components)))
+    ax.set_yticklabels([_display_name(component) for component in ordered_components])
+    ax.set_title(title, fontsize=15, pad=12)
+    ax.set_xlabel("Layer")
+    ax.set_ylabel("Weight family" if "Weight" in title else "Activation family")
+
+    for row_idx in range(len(ordered_components)):
+        for col_idx in range(len(layer_tags)):
+            value = matrix[row_idx, col_idx]
+            if not np.isfinite(value):
+                continue
+            text_color = "white" if abs(value - 1.0) > 0.18 else "#111111"
+            ax.text(col_idx, row_idx, f"{value:.2f}", ha="center", va="center", fontsize=8, color=text_color)
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.035, pad=0.02)
+    cbar.set_label("Keyed / Non-keyed mean |x|")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=170)
+    plt.close()
 
 
 def _plot_key_vs_non_abs(stats: dict, title: str, out_path: str) -> None:
@@ -483,9 +700,62 @@ def _plot_private_vs_public_ratios(private_stats: dict, public_stats: dict, key_
     plt.close()
 
 
-def save_plots(weight_stats: dict, private_activation_stats: dict, public_activation_stats: dict, plot_dir: str) -> list[str]:
+def save_plots(
+    weight_stats: dict,
+    private_activation_stats: dict,
+    public_activation_stats: dict,
+    per_layer_weight_stats: dict,
+    private_per_layer_activation_stats: dict,
+    public_per_layer_activation_stats: dict,
+    plot_dir: str,
+) -> list[str]:
     os.makedirs(plot_dir, exist_ok=True)
     paths: list[str] = []
+
+    weight_component_order = [
+        "attn_q_weight_rows",
+        "attn_k_weight_rows",
+        "attn_v_weight_rows",
+        "attn_out_weight_cols",
+        "mlp_fc_weight_rows",
+        "mlp_fc_bias",
+        "mlp_proj_weight_cols",
+    ]
+    activation_component_order = [
+        "attn_q_out",
+        "attn_k_out",
+        "attn_v_out",
+        "attn_out_in",
+        "mlp_fc_out",
+        "mlp_proj_in",
+    ]
+
+    p = os.path.join(plot_dir, "weights_per_layer_ratio_heatmap.png")
+    _plot_per_layer_ratio_heatmap(
+        per_layer_weight_stats,
+        "Per-Layer Weight Ratio Heatmap",
+        weight_component_order,
+        p,
+    )
+    paths.append(p)
+
+    p = os.path.join(plot_dir, "private_activations_per_layer_ratio_heatmap.png")
+    _plot_per_layer_ratio_heatmap(
+        private_per_layer_activation_stats,
+        "Per-Layer Private Activation Ratio Heatmap",
+        activation_component_order,
+        p,
+    )
+    paths.append(p)
+
+    p = os.path.join(plot_dir, "public_activations_per_layer_ratio_heatmap.png")
+    _plot_per_layer_ratio_heatmap(
+        public_per_layer_activation_stats,
+        "Per-Layer Public Activation Ratio Heatmap",
+        activation_component_order,
+        p,
+    )
+    paths.append(p)
 
     p = os.path.join(plot_dir, "weights_mean_abs_key_vs_non.png")
     _plot_key_vs_non_abs(weight_stats, "Weights: keyed vs non-keyed mean |w|", p)
@@ -576,8 +846,15 @@ def main() -> None:
     print(f"Activation analysis: num_batches={args.num_batches}, batch_size={args.batch_size}, max_length={args.max_length}")
 
     weight_stats = compute_weight_stats(model, mask_plan)
+    per_layer_weight_stats = compute_weight_stats_per_layer(model, mask_plan)
     private_activation_stats = compute_activation_stats(model, mask_plan, private_loader, device, args.num_batches)
+    private_per_layer_activation_stats = compute_activation_stats_per_layer(
+        model, mask_plan, private_loader, device, args.num_batches
+    )
     public_activation_stats = compute_activation_stats(model, mask_plan, public_loader, device, args.num_batches)
+    public_per_layer_activation_stats = compute_activation_stats_per_layer(
+        model, mask_plan, public_loader, device, args.num_batches
+    )
 
     summary = {
         "checkpoint": args.checkpoint,
@@ -595,9 +872,14 @@ def main() -> None:
             "device": str(device),
         },
         "weight_stats": weight_stats,
+        "per_layer_weight_stats": per_layer_weight_stats,
         "activation_stats": {
             "private": private_activation_stats,
             "public": public_activation_stats,
+        },
+        "per_layer_activation_stats": {
+            "private": private_per_layer_activation_stats,
+            "public": public_per_layer_activation_stats,
         },
     }
 
@@ -612,7 +894,15 @@ def main() -> None:
     else:
         base = args.output_path[:-5] if args.output_path.endswith(".json") else args.output_path
         plot_dir = f"{base}_plots"
-    plot_paths = save_plots(weight_stats, private_activation_stats, public_activation_stats, plot_dir)
+    plot_paths = save_plots(
+        weight_stats,
+        private_activation_stats,
+        public_activation_stats,
+        per_layer_weight_stats,
+        private_per_layer_activation_stats,
+        public_per_layer_activation_stats,
+        plot_dir,
+    )
 
     print_summary("Weight Magnitudes (C1)", weight_stats)
     print_summary("Activation Magnitudes (C1, Private Data)", private_activation_stats)
