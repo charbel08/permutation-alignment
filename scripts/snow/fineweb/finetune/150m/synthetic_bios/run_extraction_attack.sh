@@ -34,10 +34,9 @@ NGPUS=${NGPUS:-8}
 BATCH_SIZE=${BATCH_SIZE:-8}
 LR=${LR:-1e-5}
 MIN_LR=${MIN_LR:-1e-6}
-MAX_STEPS=${MAX_STEPS:-50000}
+MAX_EPOCHS=${MAX_EPOCHS:-30}
 WARMUP_STEPS=${WARMUP_STEPS:-100}
 EVAL_INTERVAL=${EVAL_INTERVAL:-100}
-PATIENCE=${PATIENCE:-5000}
 NUM_WORKERS=${NUM_WORKERS:-4}
 WANDB_PROJECT=${WANDB_PROJECT:-extraction-attack}
 SUBSET_SEED=${SUBSET_SEED:-42}
@@ -58,8 +57,8 @@ echo "  Key path:            ${KEY_PATH}"
 echo "  Private data:        ${PRIVATE_DATA}"
 echo "  Fractions:           ${FRACTIONS}"
 echo "  GPUs:                ${NGPUS}"
-echo "  Max steps/run:       ${MAX_STEPS}"
-echo "  Patience:            ${PATIENCE}"
+echo "  Max epochs/run:      ${MAX_EPOCHS}"
+echo "  Patience:            2 epochs (fixed in python)"
 echo "  Subset seed:         ${SUBSET_SEED}"
 echo "  Bio metadata:        ${BIO_METADATA}"
 echo "=========================================================="
@@ -92,10 +91,9 @@ for FRAC in $FRACTIONS; do
             --batch_size "$BATCH_SIZE" \
             --learning_rate "$LR" \
             --min_lr "$MIN_LR" \
-            --max_steps "$MAX_STEPS" \
+            --max_epochs "$MAX_EPOCHS" \
             --warmup_steps "$WARMUP_STEPS" \
             --eval_interval "$EVAL_INTERVAL" \
-            --patience "$PATIENCE" \
             --num_workers "$NUM_WORKERS" \
             --wandb_project "$WANDB_PROJECT" \
             --run_name "$RUN_NAME" \
@@ -124,10 +122,9 @@ for FRAC in $FRACTIONS; do
             --batch_size "$BATCH_SIZE" \
             --learning_rate "$LR" \
             --min_lr "$MIN_LR" \
-            --max_steps "$MAX_STEPS" \
+            --max_epochs "$MAX_EPOCHS" \
             --warmup_steps "$WARMUP_STEPS" \
             --eval_interval "$EVAL_INTERVAL" \
-            --patience "$PATIENCE" \
             --num_workers "$NUM_WORKERS" \
             --wandb_project "$WANDB_PROJECT" \
             --run_name "$RUN_NAME" \

@@ -902,6 +902,7 @@ def main():
     global_step = 0
     wandb_run_id = None
     cumulative_wall_secs = 0.0
+    data_epoch = 0
     if args.resume_from:
         training_state_path = os.path.join(args.resume_from, "training_state.pt")
         if os.path.exists(training_state_path):
@@ -919,7 +920,11 @@ def main():
             global_step = training_state["global_step"]
             wandb_run_id = training_state.get("wandb_run_id")
             cumulative_wall_secs = training_state.get("cumulative_wall_secs", 0.0)
+            data_epoch = training_state.get("data_epoch", 0)
+            if global_step > 0 and data_epoch == 0 and len(private_loader) > 0:
+                data_epoch = global_step // len(private_loader)
             print(f"Resumed finetuning state from step {global_step}")
+            print(f"  Resumed data_epoch: {data_epoch}")
             if cumulative_wall_secs > 0:
                 print(f"  Resumed cumulative wall time: {cumulative_wall_secs / 3600:.2f}h")
 
@@ -1109,10 +1114,36 @@ def main():
         return active_loss
     
     # Training loop
+    if private_sampler is not None and global_step > 0:
+        private_sampler.set_epoch(data_epoch)
     private_iter = iter(private_loader)
-    public_iter = iter(public_loader) if public_loader else None
+    if global_step > 0 and len(private_loader) > 0:
+        private_batches_consumed = global_step % len(private_loader)
+        if private_batches_consumed > 0:
+            if is_main:
+                print(
+                    f"  Fast-forwarding private dataloader: skipping {private_batches_consumed} "
+                    f"batches ({private_batches_consumed}/{len(private_loader)} in epoch {data_epoch})"
+                )
+            for _ in range(private_batches_consumed):
+                next(private_iter)
+
+    public_iter = None
+    if public_loader:
+        if public_sampler is not None and global_step > 0:
+            public_sampler.set_epoch(data_epoch)
+        public_iter = iter(public_loader)
+        if global_step > 0 and len(public_loader) > 0:
+            public_batches_consumed = global_step % len(public_loader)
+            if public_batches_consumed > 0:
+                if is_main:
+                    print(
+                        f"  Fast-forwarding public dataloader: skipping {public_batches_consumed} "
+                        f"batches ({public_batches_consumed}/{len(public_loader)} in epoch {data_epoch})"
+                    )
+                for _ in range(public_batches_consumed):
+                    next(public_iter)
     best_val_loss = float('inf')
-    data_epoch = 0
     
     if is_main:
         print(f"Starting finetuning for {args.max_steps} steps...")
@@ -1137,7 +1168,8 @@ def main():
             save_checkpoint(raw_model, tokenizer, optimizer, save_path,
                           scheduler=scheduler, global_step=global_step,
                           wandb_run_id=wandb_run_id,
-                          cumulative_wall_secs=cumulative_wall_secs)
+                          cumulative_wall_secs=cumulative_wall_secs,
+                          data_epoch=data_epoch)
             print(f"Initial best model saved to {save_path}")
     
     while global_step < args.max_steps:
@@ -1235,7 +1267,8 @@ def main():
                 save_checkpoint(raw_model, tokenizer, optimizer, save_path,
                               scheduler=scheduler, global_step=global_step,
                               wandb_run_id=wandb_run_id,
-                              cumulative_wall_secs=cumulative_wall_secs)
+                              cumulative_wall_secs=cumulative_wall_secs,
+                              data_epoch=data_epoch)
                 print(f"New best model saved to {save_path}")
         
         # Save checkpoint (rank 0 only)
@@ -1244,7 +1277,8 @@ def main():
             save_checkpoint(raw_model, tokenizer, optimizer, save_path,
                           scheduler=scheduler, global_step=global_step,
                           wandb_run_id=wandb_run_id,
-                          cumulative_wall_secs=cumulative_wall_secs)
+                          cumulative_wall_secs=cumulative_wall_secs,
+                          data_epoch=data_epoch)
             print(f"Saved checkpoint to {save_path}")
     
     if pbar is not None:
@@ -1256,7 +1290,8 @@ def main():
         save_checkpoint(raw_model, tokenizer, optimizer, save_path,
                        scheduler=scheduler, global_step=global_step,
                        wandb_run_id=wandb_run_id,
-                       cumulative_wall_secs=cumulative_wall_secs)
+                       cumulative_wall_secs=cumulative_wall_secs,
+                       data_epoch=data_epoch)
 
         total_flops = flops_per_step * global_step
         print(f"\n{'='*60}")

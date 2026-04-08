@@ -487,6 +487,7 @@ def train(args):
     wandb_run_id = None
     cumulative_wall_secs = 0.0
     tier_step_counts = None
+    data_epoch = 0
     if args.checkpoint:
         training_state_path = os.path.join(args.checkpoint, "training_state.pt")
         if not os.path.exists(training_state_path):
@@ -501,6 +502,7 @@ def train(args):
         wandb_run_id = training_state.get("wandb_run_id")
         cumulative_wall_secs = training_state.get("cumulative_wall_secs", 0.0)
         tier_step_counts = training_state.get("tier_step_counts")
+        data_epoch = training_state.get("data_epoch", 0)
 
         if tier_step_counts and len(tier_step_counts) == len(tiers):
             for tier, count in zip(tiers, tier_step_counts):
@@ -512,6 +514,7 @@ def train(args):
 
         if is_main:
             print(f"Resumed training state from step {global_step}")
+            print(f"  Resumed data_epoch: {data_epoch}")
 
     # ── W&B ──
     if is_main:
@@ -613,10 +616,21 @@ def train(args):
                 initial=global_step) if is_main else None
 
     # ── Training loop ──
-    data_epoch = 0
     if local_rank != -1 and global_step > 0:
         sampler.set_epoch(data_epoch)
     data_iter = iter(dataloader)
+    # Fast-forward dataloader past batches already consumed in this epoch.
+    if args.checkpoint and global_step > 0:
+        batches_per_epoch = len(dataloader)
+        steps_per_epoch = batches_per_epoch // grad_accum_steps
+        if steps_per_epoch > 0:
+            batches_consumed = (global_step % steps_per_epoch) * grad_accum_steps
+            if batches_consumed > 0 and batches_consumed < batches_per_epoch:
+                if is_main:
+                    print(f"  Fast-forwarding dataloader: skipping {batches_consumed} batches "
+                          f"({batches_consumed}/{batches_per_epoch} in epoch {data_epoch})")
+                for _ in range(batches_consumed):
+                    next(data_iter)
 
     while global_step < args.max_steps:
         optimizer.zero_grad()
@@ -825,7 +839,8 @@ def train(args):
                 scheduler=scheduler, global_step=global_step,
                 wandb_run_id=wandb_run_id,
                 tier_step_counts=[t.steps_sampled for t in tiers],
-                cumulative_wall_secs=cumulative_wall_secs)
+                cumulative_wall_secs=cumulative_wall_secs,
+                data_epoch=data_epoch)
             print(f"Saved checkpoint to {save_path}")
 
     if pbar is not None:
@@ -839,7 +854,8 @@ def train(args):
             scheduler=scheduler, global_step=global_step,
             wandb_run_id=wandb_run_id,
             tier_step_counts=[t.steps_sampled for t in tiers],
-            cumulative_wall_secs=cumulative_wall_secs)
+            cumulative_wall_secs=cumulative_wall_secs,
+            data_epoch=data_epoch)
 
         total_flops = 2 * flops_per_token * cumulative_tokens
         print(f"\n{'='*60}")

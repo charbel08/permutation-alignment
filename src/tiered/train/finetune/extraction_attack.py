@@ -77,16 +77,19 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--min_lr", type=float, default=1e-6)
-    parser.add_argument("--max_steps", type=int, default=50000,
-                        help="Max steps before giving up (early stop may trigger sooner)")
+    parser.add_argument("--max_steps", type=int, default=None,
+                        help="Optional hard cap in steps. Effective max is "
+                             "min(max_steps, max_epochs * steps_per_epoch).")
+    parser.add_argument("--max_epochs", type=int, default=30,
+                        help="Maximum number of epochs to run (default: 30).")
     parser.add_argument("--warmup_steps", type=int, default=100)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
 
     # Validation / early stopping
     parser.add_argument("--eval_interval", type=int, default=100)
-    parser.add_argument("--patience", type=int, default=5000,
-                        help="Stop if train_people memorization does not improve for this many steps")
+    parser.add_argument("--patience", type=int, default=None,
+                        help=argparse.SUPPRESS)  # deprecated; ignored (fixed to 2 epochs)
 
     # Logging
     parser.add_argument("--log_interval", type=int, default=10)
@@ -214,6 +217,14 @@ def main():
         shuffle=(train_sampler is None), collate_fn=collator,
         drop_last=False, num_workers=args.num_workers, pin_memory=True,
     )
+    steps_per_epoch = len(train_loader)
+    if steps_per_epoch <= 0:
+        raise ValueError("Train dataloader has zero batches; increase data fraction or reduce batch size.")
+    max_steps_from_epochs = args.max_epochs * steps_per_epoch
+    max_steps = max_steps_from_epochs if args.max_steps is None else min(args.max_steps, max_steps_from_epochs)
+    # Fixed patience policy: 2 epochs for all runs.
+    patience_epochs = 2
+    patience_steps = patience_epochs * steps_per_epoch
 
     # Optional train-memorization target for early stop.
     target_memo_train = args.target_memo
@@ -245,18 +256,26 @@ def main():
             **vars(args),
             "target_memo_train": target_memo_train,
             "n_train": n_train,
+            "steps_per_epoch": steps_per_epoch,
+            "max_steps_effective": max_steps,
+            "patience_epochs_effective": patience_epochs,
+            "patience_steps_effective": patience_steps,
         })
         wandb.define_metric("train/step")
         wandb.define_metric("*", step_metric="train/step")
         if target_memo_train is not None:
             print(f"\nTarget train memorization (top1_acc): {target_memo_train:.4f}")
             print(
-                f"Training for up to {args.max_steps} steps "
+                f"Training for up to {max_steps} steps "
+                f"({args.max_epochs} epochs max) "
                 "(early stop when train_people memo >= target)"
             )
         else:
-            print(f"\nTraining for up to {args.max_steps} steps")
-            print(f"Early stopping: patience={args.patience} on train_people memorization")
+            print(f"\nTraining for up to {max_steps} steps ({args.max_epochs} epochs max)")
+            print(
+                f"Early stopping: patience={patience_epochs} epochs "
+                f"({patience_steps} steps) on train_people memorization"
+            )
 
     # ── Initial memorization eval ──
     init_train_memo_top1 = 0.0
@@ -314,9 +333,9 @@ def main():
     steps_since_improvement = 0
     reached_target_train = False
 
-    pbar = tqdm(total=args.max_steps, desc="Attack finetune") if is_main else None
+    pbar = tqdm(total=max_steps, desc="Attack finetune") if is_main else None
 
-    while global_step < args.max_steps:
+    while global_step < max_steps:
         # Get batch
         try:
             batch = next(data_iter)
@@ -417,10 +436,10 @@ def main():
                 break
 
             # Patience
-            if steps_since_improvement >= args.patience:
+            if steps_since_improvement >= patience_steps:
                 if is_main:
                     print(
-                        f"\nPatience exhausted ({args.patience} steps). "
+                        f"\nPatience exhausted ({patience_epochs} epochs / {patience_steps} steps). "
                         f"Best train memo: {best_train_memo:.4f}"
                     )
                 break

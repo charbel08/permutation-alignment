@@ -629,6 +629,7 @@ def train(args):
     global_step = 0
     wandb_run_id = None
     c2_passes_cumulative = 0
+    data_epoch = 0
     if args.checkpoint:
         training_state_path = os.path.join(args.checkpoint, "training_state.pt")
         if not os.path.exists(training_state_path):
@@ -643,8 +644,10 @@ def train(args):
         wandb_run_id = training_state.get("wandb_run_id")
         inferred_c2_passes = ((global_step - 1) // args.c2_every_k + 1) if global_step > 0 else 0
         c2_passes_cumulative = int(training_state.get("c2_passes_cumulative", inferred_c2_passes))
+        data_epoch = training_state.get("data_epoch", 0)
         if is_main:
             print(f"Resumed training state from step {global_step}")
+            print(f"  Resumed data_epoch: {data_epoch}")
 
     # Setup wandb
     if is_main:
@@ -670,13 +673,24 @@ def train(args):
     # Monotonic epoch counter for DistributedSampler shuffling. Using a
     # dedicated counter (rather than global_step) gives deterministic
     # shuffle order regardless of batch size or dataset size changes.
-    data_epoch = 0
     if local_rank != -1 and global_step > 0:
         sampler.set_epoch(data_epoch)
     data_iter = iter(dataloader)
 
     is_distributed = local_rank != -1
     grad_accum_steps = args.grad_accum_steps
+    # Fast-forward dataloader past batches already consumed in this epoch.
+    if args.checkpoint and global_step > 0:
+        batches_per_epoch = len(dataloader)
+        steps_per_epoch = batches_per_epoch // grad_accum_steps
+        if steps_per_epoch > 0:
+            batches_consumed = (global_step % steps_per_epoch) * grad_accum_steps
+            if batches_consumed > 0 and batches_consumed < batches_per_epoch:
+                if is_main:
+                    print(f"  Fast-forwarding dataloader: skipping {batches_consumed} batches "
+                          f"({batches_consumed}/{batches_per_epoch} in epoch {data_epoch})")
+                for _ in range(batches_consumed):
+                    next(data_iter)
     loss_scale = 1.0 / grad_accum_steps
     effective_batch = args.batch_size * grad_accum_steps * world_size
 
@@ -1054,6 +1068,7 @@ def train(args):
                 cumulative_wall_secs=cumulative_wall_secs,
                 c2_passes_cumulative=c2_passes_cumulative,
                 cumulative_flops=cumulative_flops,
+                data_epoch=data_epoch,
             )
             print(f"Saved checkpoint to {save_path}")
 
@@ -1074,6 +1089,7 @@ def train(args):
             cumulative_wall_secs=cumulative_wall_secs,
             c2_passes_cumulative=c2_passes_cumulative,
             cumulative_flops=cumulative_flops,
+            data_epoch=data_epoch,
         )
 
         total_flops = cumulative_flops
