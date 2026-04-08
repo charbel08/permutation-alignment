@@ -10,7 +10,7 @@ on:
 
 Outputs:
   - One combined JSON summary
-  - Unified, styled plots in one directory
+  - Unified, styled plots in one directory (including cluster scatter)
 """
 
 from __future__ import annotations
@@ -31,14 +31,12 @@ from tiered.model import GPTNeoForCausalLMTiered
 from tiered.permutation import build_mask_plan, load_key
 
 try:
-    # Works when executed as a package/module from repo root.
     from scripts.eval.analyze_c1_keyed_magnitudes import (
         _build_loader,
         compute_activation_stats,
         compute_weight_stats,
     )
 except ModuleNotFoundError:
-    # Works when executed directly as a file path.
     from analyze_c1_keyed_magnitudes import (
         _build_loader,
         compute_activation_stats,
@@ -64,11 +62,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Unified C1 keyed/non-keyed analysis for 2 models x 2 datasets.")
 
     # Model A: synthetic bios finetuned
-    p.add_argument(
-        "--model_a_name",
-        type=str,
-        default="synbios_ft",
-    )
+    p.add_argument("--model_a_name", type=str, default="synbios_ft")
     p.add_argument(
         "--model_a_checkpoint",
         type=str,
@@ -81,11 +75,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Model B: FineWeb2 Spanish finetuned
-    p.add_argument(
-        "--model_b_name",
-        type=str,
-        default="fineweb2_spa_ft",
-    )
+    p.add_argument("--model_b_name", type=str, default="fineweb2_spa_ft")
     p.add_argument(
         "--model_b_checkpoint",
         type=str,
@@ -98,11 +88,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Dataset X: synthetic-bios private
-    p.add_argument(
-        "--dataset_x_name",
-        type=str,
-        default="synbios_private",
-    )
+    p.add_argument("--dataset_x_name", type=str, default="synbios_private")
     p.add_argument(
         "--dataset_x_path",
         type=str,
@@ -111,11 +97,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset_x_split", type=str, default="train")
 
     # Dataset Y: FineWeb2 Spanish private
-    p.add_argument(
-        "--dataset_y_name",
-        type=str,
-        default="fineweb2_spa_private",
-    )
+    p.add_argument("--dataset_y_name", type=str, default="fineweb2_spa_private")
     p.add_argument(
         "--dataset_y_path",
         type=str,
@@ -168,8 +150,8 @@ def save_unified_plots(summary: dict, plot_dir: str, prefix: str) -> list[str]:
 
     models = list(summary["models"].keys())
     datasets = list(summary["datasets"].keys())
-    combo_stats = summary["activation_stats"]  # model -> dataset -> stats
-    weight_stats = summary["weight_stats"]  # model -> stats
+    combo_stats = summary["activation_stats"]
+    weight_stats = summary["weight_stats"]
 
     # --- Plot 1: 2x2 heatmap (overall activation keyed/non-keyed ratios) ---
     heat = []
@@ -181,7 +163,13 @@ def save_unified_plots(summary: dict, plot_dir: str, prefix: str) -> list[str]:
 
     fig = plt.figure(figsize=(8, 6), facecolor="#f6f2e8")
     ax = fig.add_subplot(111)
-    im = ax.imshow(heat, cmap="YlGnBu", aspect="auto", vmin=min(min(r) for r in heat) * 0.95, vmax=max(max(r) for r in heat) * 1.05)
+    im = ax.imshow(
+        heat,
+        cmap="YlGnBu",
+        aspect="auto",
+        vmin=min(min(r) for r in heat) * 0.95,
+        vmax=max(max(r) for r in heat) * 1.05,
+    )
     ax.set_xticks(range(len(datasets)))
     ax.set_xticklabels(datasets, rotation=20, ha="right")
     ax.set_yticks(range(len(models)))
@@ -189,7 +177,10 @@ def save_unified_plots(summary: dict, plot_dir: str, prefix: str) -> list[str]:
     ax.set_title("C1 Activation Ratio Map\n(keyed/non-keyed mean |a|)", fontsize=16, pad=14)
     for i, m in enumerate(models):
         for j, d in enumerate(datasets):
-            ax.text(j, i, f"{heat[i][j]:.3f}", ha="center", va="center", color="#111111", fontsize=11, fontweight="bold")
+            ax.text(
+                j, i, f"{heat[i][j]:.3f}",
+                ha="center", va="center", color="#111111", fontsize=11, fontweight="bold",
+            )
     cbar = fig.colorbar(im, ax=ax, fraction=0.05, pad=0.04)
     cbar.set_label("Ratio")
     plt.tight_layout()
@@ -200,10 +191,11 @@ def save_unified_plots(summary: dict, plot_dir: str, prefix: str) -> list[str]:
 
     # --- Plot 2: grouped bars (overall weight ratio by model) ---
     weight_overall = [_overall_mean_ratio(weight_stats[m]) for m in models]
+    colors = ["#ef6c00", "#00897b"]
+
     fig = plt.figure(figsize=(8, 5), facecolor="#f6f2e8")
     ax = fig.add_subplot(111)
     _style_axes(ax)
-    colors = ["#ef6c00", "#00897b"]
     ax.bar(models, weight_overall, color=colors[: len(models)], alpha=0.9)
     ax.axhline(1.0, color="#111111", linestyle="--", linewidth=1.2)
     ax.set_ylabel("Keyed / Non-keyed mean |w|")
@@ -218,21 +210,19 @@ def save_unified_plots(summary: dict, plot_dir: str, prefix: str) -> list[str]:
 
     # --- Plot 3: component fingerprint lines (all 4 combinations) ---
     components = _component_order(combo_stats[models[0]][datasets[0]])
+    palette = ["#ef6c00", "#ffb74d", "#00897b", "#4db6ac"]
+
     fig = plt.figure(figsize=(14, 6), facecolor="#f6f2e8")
     ax = fig.add_subplot(111)
     _style_axes(ax)
-    palette = ["#ef6c00", "#ffb74d", "#00897b", "#4db6ac"]
     k = 0
     for m in models:
         for d in datasets:
             s = combo_stats[m][d]
             vals = [float(s[c]["mean_abs_ratio_key_over_non"]) for c in components]
             ax.plot(
-                components,
-                vals,
-                marker="o",
-                linewidth=2.2,
-                markersize=5,
+                components, vals,
+                marker="o", linewidth=2.2, markersize=5,
                 color=palette[k % len(palette)],
                 label=f"{m} on {d}",
             )
@@ -256,7 +246,11 @@ def save_unified_plots(summary: dict, plot_dir: str, prefix: str) -> list[str]:
     ax_lines = fig.add_subplot(gs[1, :])
 
     # heat
-    im = ax_heat.imshow(heat, cmap="YlGnBu", aspect="auto", vmin=min(min(r) for r in heat) * 0.95, vmax=max(max(r) for r in heat) * 1.05)
+    im = ax_heat.imshow(
+        heat, cmap="YlGnBu", aspect="auto",
+        vmin=min(min(r) for r in heat) * 0.95,
+        vmax=max(max(r) for r in heat) * 1.05,
+    )
     ax_heat.set_xticks(range(len(datasets)))
     ax_heat.set_xticklabels(datasets, rotation=20, ha="right")
     ax_heat.set_yticks(range(len(models)))
@@ -264,7 +258,10 @@ def save_unified_plots(summary: dict, plot_dir: str, prefix: str) -> list[str]:
     ax_heat.set_title("Activation Ratio Matrix", fontsize=13)
     for i in range(len(models)):
         for j in range(len(datasets)):
-            ax_heat.text(j, i, f"{heat[i][j]:.3f}", ha="center", va="center", color="#111111", fontsize=10, fontweight="bold")
+            ax_heat.text(
+                j, i, f"{heat[i][j]:.3f}",
+                ha="center", va="center", color="#111111", fontsize=10, fontweight="bold",
+            )
     fig.colorbar(im, ax=ax_heat, fraction=0.05, pad=0.04)
 
     # weights
@@ -284,11 +281,8 @@ def save_unified_plots(summary: dict, plot_dir: str, prefix: str) -> list[str]:
             s = combo_stats[m][d]
             vals = [float(s[c]["mean_abs_ratio_key_over_non"]) for c in components]
             ax_lines.plot(
-                components,
-                vals,
-                marker="o",
-                linewidth=2.1,
-                markersize=5,
+                components, vals,
+                marker="o", linewidth=2.1, markersize=5,
                 color=palette[k % len(palette)],
                 label=f"{m} on {d}",
             )
@@ -299,7 +293,10 @@ def save_unified_plots(summary: dict, plot_dir: str, prefix: str) -> list[str]:
     ax_lines.tick_params(axis="x", rotation=24)
     ax_lines.legend(ncol=2, frameon=True)
 
-    fig.suptitle("Unified C1 Identifiability Canvas: 150M Dual-Model Dual-Dataset", fontsize=18, y=0.98, fontweight="bold")
+    fig.suptitle(
+        "Unified C1 Identifiability Canvas: 150M Dual-Model Dual-Dataset",
+        fontsize=18, y=0.98, fontweight="bold",
+    )
     plt.tight_layout(rect=[0, 0, 1, 0.965])
     p = os.path.join(plot_dir, f"{prefix}_poster.png")
     fig.savefig(p, dpi=180)
@@ -307,6 +304,68 @@ def save_unified_plots(summary: dict, plot_dir: str, prefix: str) -> list[str]:
     saved.append(p)
 
     return saved
+
+
+def save_cluster_plot(summary: dict, plot_dir: str, prefix: str) -> str:
+    """Scatter keyed vs non-keyed mean |activation| per component,
+    one point per component per model x dataset combo.
+
+    Points above the y=x diagonal indicate keyed neurons are louder.
+    Clustering by colour (model) or marker (dataset) reveals whether
+    the signal is model-driven or data-driven.
+    """
+    os.makedirs(plot_dir, exist_ok=True)
+
+    models = list(summary["models"].keys())
+    datasets = list(summary["datasets"].keys())
+    combo = summary["activation_stats"]
+
+    palette = {
+        (0, 0): "#ef6c00",
+        (0, 1): "#ffb74d",
+        (1, 0): "#00897b",
+        (1, 1): "#4db6ac",
+    }
+    marker_shapes = ["o", "s"]
+
+    fig, ax = plt.subplots(figsize=(9, 8), facecolor="#f6f2e8")
+    _style_axes(ax)
+
+    all_vals: list[float] = []
+    for mi, m in enumerate(models):
+        for di, d in enumerate(datasets):
+            s = combo[m][d]
+            comps = _component_order(s)
+            keyed = [float(s[c]["keyed_mean_abs"]) for c in comps]
+            non_keyed = [float(s[c]["non_keyed_mean_abs"]) for c in comps]
+            all_vals.extend(keyed + non_keyed)
+            ax.scatter(
+                non_keyed,
+                keyed,
+                c=palette[(mi, di)],
+                marker=marker_shapes[di],
+                s=60,
+                alpha=0.75,
+                edgecolors="white",
+                linewidths=0.5,
+                label=f"{m} / {d}",
+            )
+
+    lo, hi = min(all_vals) * 0.92, max(all_vals) * 1.08
+    ax.plot([lo, hi], [lo, hi], "--", color="#111", linewidth=1.2, label="y = x (no difference)")
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+    ax.set_xlabel("Non-keyed mean |activation|")
+    ax.set_ylabel("Keyed mean |activation|")
+    ax.set_title("Keyed vs Non-keyed Activation Cluster", fontsize=15)
+    ax.legend(fontsize=9, frameon=True)
+    ax.set_aspect("equal")
+    plt.tight_layout()
+
+    p = os.path.join(plot_dir, f"{prefix}_cluster_scatter.png")
+    fig.savefig(p, dpi=170)
+    plt.close(fig)
+    return p
 
 
 def main() -> None:
@@ -414,6 +473,8 @@ def main() -> None:
         json.dump(summary, f, indent=2)
 
     plot_paths = save_unified_plots(summary, args.plot_dir, args.plot_prefix)
+    plot_paths.append(save_cluster_plot(summary, args.plot_dir, args.plot_prefix))
+
     summary["plot_paths"] = plot_paths
     with open(args.output_json, "w") as f:
         json.dump(summary, f, indent=2)
