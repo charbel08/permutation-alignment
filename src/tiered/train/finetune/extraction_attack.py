@@ -237,12 +237,24 @@ def main():
     # ── Optimizer / scheduler ──
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate,
                             weight_decay=args.weight_decay)
-    warmup = LinearLR(optimizer, start_factor=1e-8 / args.learning_rate,
-                      total_iters=args.warmup_steps)
-    cosine = CosineAnnealingLR(optimizer, T_max=args.max_steps - args.warmup_steps,
-                               eta_min=args.min_lr)
-    scheduler = SequentialLR(optimizer, [warmup, cosine],
-                             milestones=[args.warmup_steps])
+    # Scheduler is defined on effective max_steps (epoch-capped).
+    effective_warmup_steps = min(args.warmup_steps, max_steps)
+    cosine_t_max = max(1, max_steps - effective_warmup_steps)
+    warmup = LinearLR(
+        optimizer,
+        start_factor=1e-8 / args.learning_rate,
+        total_iters=effective_warmup_steps,
+    )
+    cosine = CosineAnnealingLR(
+        optimizer,
+        T_max=cosine_t_max,
+        eta_min=args.min_lr,
+    )
+    scheduler = SequentialLR(
+        optimizer,
+        [warmup, cosine],
+        milestones=[effective_warmup_steps],
+    )
 
     # ── DDP ──
     if is_distributed:
