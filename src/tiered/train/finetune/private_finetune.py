@@ -105,57 +105,103 @@ def evaluate_memorization(model, tokenizer, bios, bio_spans, device,
                           key=None, swap_plan=None, batch_size=32):
     """Measure attribute-value prediction accuracy on synthetic bios.
 
-    Returns dict with overall and per-attribute top1/top3 accuracy and
-    exact match rate.  Runs on a single device (rank 0 only).
+    Uses batched greedy autoregressive decoding (no teacher forcing):
+      1. Left-pad all prefixes (tokens before value span) to equal length.
+      2. Greedily decode for max_value_len tokens (longest target in batch).
+      3. Compare generated tokens against ground truth at value positions.
+
+    Metrics:
+      - top1_acc: fraction of value tokens predicted correctly
+      - exact_match: all value tokens predicted correctly
+      - contains: target string (stripped, lowercased) is a substring of
+        the generated text (stripped, lowercased)
+      - prefix_match: target appears at the start of generated text
+        (both stripped and lowercased)
+
+    Runs on a single device (rank 0 only).
     """
     model.eval()
     if key is not None:
         apply_permutation(model, key, plan=swap_plan)
 
+    # Pre-filter valid bios and find max value span length
+    valid_items = []
+    for i in range(len(bios)):
+        span = bio_spans[i]
+        if span is None:
+            continue
+        vs, ve = span
+        enc = tokenizer(bios[i]["text"], add_special_tokens=False,
+                        return_tensors="pt")["input_ids"].squeeze(0)
+        if vs < 1 or ve > enc.shape[0]:
+            continue
+        n_val = ve - vs
+        if n_val == 0:
+            continue
+        valid_items.append((i, enc, vs, ve))
+
+    if not valid_items:
+        if key is not None:
+            unapply_permutation(model, key, plan=swap_plan)
+        return {}
+
+    max_gen_len = max(ve - vs for _, _, vs, ve in valid_items)
+
     results = []
-    for i in range(0, len(bios), batch_size):
-        batch_bios = bios[i:i + batch_size]
-        batch_spans = bio_spans[i:i + batch_size]
+    for batch_start in range(0, len(valid_items), batch_size):
+        batch = valid_items[batch_start:batch_start + batch_size]
+        bs = len(batch)
 
-        encodings = [
-            tokenizer(b["text"], add_special_tokens=False,
-                      return_tensors="pt")["input_ids"].squeeze(0)
-            for b in batch_bios
-        ]
-        max_len = max(e.shape[0] for e in encodings)
-        ids = torch.full((len(batch_bios), max_len), tokenizer.pad_token_id,
-                         dtype=torch.long)
-        mask = torch.zeros(len(batch_bios), max_len, dtype=torch.long)
-        for j, enc in enumerate(encodings):
-            ids[j, :enc.shape[0]] = enc
-            mask[j, :enc.shape[0]] = 1
+        # Left-pad prefixes to equal length for batched generation
+        prefixes = [item[1][:item[2]] for item in batch]  # enc[:vs]
+        max_prefix_len = max(p.shape[0] for p in prefixes)
 
-        logits = model(ids.to(device), attention_mask=mask.to(device)).logits
+        pad_id = tokenizer.pad_token_id
+        input_ids = torch.full((bs, max_prefix_len), pad_id, dtype=torch.long)
+        attn_mask = torch.zeros(bs, max_prefix_len, dtype=torch.long)
+        for j, p in enumerate(prefixes):
+            offset = max_prefix_len - p.shape[0]
+            input_ids[j, offset:] = p
+            attn_mask[j, offset:] = 1
 
-        for j, (bio, span) in enumerate(zip(batch_bios, batch_spans)):
-            if span is None:
-                continue
-            vs, ve = span
-            seq_len = encodings[j].shape[0]
-            if vs < 1 or ve > seq_len:
-                continue
+        input_ids = input_ids.to(device)
+        attn_mask = attn_mask.to(device)
 
-            pred_logits = logits[j, vs - 1:ve - 1, :]
-            targets = ids[j, vs:ve].to(device)
-            n_val = targets.shape[0]
-            if n_val == 0:
-                continue
+        # Greedy decode max_gen_len tokens
+        for _ in range(max_gen_len):
+            logits = model(input_ids, attention_mask=attn_mask).logits
+            next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            input_ids = torch.cat([input_ids, next_token], dim=1)
+            attn_mask = torch.cat([attn_mask,
+                                   torch.ones(bs, 1, dtype=torch.long,
+                                              device=device)], dim=1)
 
-            top3 = pred_logits.topk(3, dim=-1).indices
-            top1_hits = (top3[:, 0] == targets).float().mean().item()
-            top3_hits = (top3 == targets.unsqueeze(-1)).any(dim=-1).float().mean().item()
-            exact = (top3[:, 0] == targets).all().item()
+        # Extract generated tokens (after the prefix)
+        for j, (idx, enc, vs, ve) in enumerate(batch):
+            bio = bios[idx]
+            target_tokens = enc[vs:ve]
+            n_val = target_tokens.shape[0]
+
+            gen_tokens = input_ids[j, max_prefix_len:max_prefix_len + n_val].cpu()
+            gen_all = input_ids[j, max_prefix_len:].cpu()
+
+            # Token-level accuracy
+            top1_hits = (gen_tokens == target_tokens).float().mean().item()
+            exact = (gen_tokens == target_tokens).all().item()
+
+            # String-level metrics
+            target_str = _bio_value_string(bio).strip().lower()
+            gen_str = tokenizer.decode(gen_all.tolist()).strip().lower()
+
+            contains = 1.0 if target_str in gen_str else 0.0
+            prefix_match = 1.0 if gen_str.startswith(target_str) else 0.0
 
             results.append({
                 "target_attr": bio["target_attr"],
                 "top1_acc": top1_hits,
-                "top3_acc": top3_hits,
                 "exact_match": exact,
+                "contains": contains,
+                "prefix_match": prefix_match,
             })
 
     if key is not None:
@@ -168,8 +214,9 @@ def evaluate_memorization(model, tokenizer, bios, bio_spans, device,
     n = len(results)
     metrics = {
         "top1_acc": sum(r["top1_acc"] for r in results) / n,
-        "top3_acc": sum(r["top3_acc"] for r in results) / n,
         "exact_match": sum(r["exact_match"] for r in results) / n,
+        "contains": sum(r["contains"] for r in results) / n,
+        "prefix_match": sum(r["prefix_match"] for r in results) / n,
     }
     by_attr = defaultdict(list)
     for r in results:
@@ -178,6 +225,8 @@ def evaluate_memorization(model, tokenizer, bios, bio_spans, device,
         na = len(recs)
         metrics[f"{attr}/top1_acc"] = sum(r["top1_acc"] for r in recs) / na
         metrics[f"{attr}/exact_match"] = sum(r["exact_match"] for r in recs) / na
+        metrics[f"{attr}/contains"] = sum(r["contains"] for r in recs) / na
+        metrics[f"{attr}/prefix_match"] = sum(r["prefix_match"] for r in recs) / na
 
     return metrics
 
@@ -1023,7 +1072,9 @@ def main():
                 raw_model, tokenizer, memo_bios, memo_spans, device)
             if c1_memo:
                 print(f"  Memorization (C1): top1={c1_memo['top1_acc']:.4f}, "
-                      f"exact={c1_memo['exact_match']:.4f}")
+                      f"exact={c1_memo['exact_match']:.4f}, "
+                      f"contains={c1_memo['contains']:.4f}, "
+                      f"prefix={c1_memo['prefix_match']:.4f}")
                 for mk, mv in c1_memo.items():
                     val_log[f"Memo C1/{mk}"] = mv
 
@@ -1033,7 +1084,9 @@ def main():
                 key=key, swap_plan=memo_swap_plan)
             if c2_memo:
                 print(f"  Memorization (C2): top1={c2_memo['top1_acc']:.4f}, "
-                      f"exact={c2_memo['exact_match']:.4f}")
+                      f"exact={c2_memo['exact_match']:.4f}, "
+                      f"contains={c2_memo['contains']:.4f}, "
+                      f"prefix={c2_memo['prefix_match']:.4f}")
                 for mk, mv in c2_memo.items():
                     val_log[f"Memo C2/{mk}"] = mv
 

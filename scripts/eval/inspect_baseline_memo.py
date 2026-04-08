@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Inspect which bios have non-zero memorization accuracy at baseline.
 
-Loads a pretrained model (no finetuning), runs memorization eval,
-and prints the bios where the model gets any value tokens right.
+Loads a pretrained model (no finetuning), runs greedy-decode memorization
+eval, and prints the bios where the model gets any value tokens right.
 
 Usage:
     PYTHONPATH=./src python scripts/eval/inspect_baseline_memo.py \
@@ -32,7 +32,6 @@ def main():
     parser.add_argument("--key_path", type=str, default=None)
     parser.add_argument("--eval_split", type=str, default="test",
                         choices=["train", "test", "all"])
-    parser.add_argument("--batch_size", type=int, default=32)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -64,80 +63,84 @@ def main():
 
     for config_name, cfg_key in configs:
         print(f"\n{'='*70}")
-        print(f"  {config_name} evaluation")
+        print(f"  {config_name} evaluation (greedy decoding)")
         print(f"{'='*70}")
 
         if cfg_key is not None:
             apply_permutation(model, cfg_key, plan=plan)
 
         hits = []
+        total_results = []
         with torch.no_grad():
-            for i in range(0, len(bios), args.batch_size):
-                batch_bios = bios[i:i + args.batch_size]
-                batch_spans = spans[i:i + args.batch_size]
+            for i in range(len(bios)):
+                bio = bios[i]
+                span = spans[i]
+                if span is None:
+                    continue
+                vs, ve = span
 
-                encodings = [
-                    tokenizer(b["text"], add_special_tokens=False,
-                              return_tensors="pt")["input_ids"].squeeze(0)
-                    for b in batch_bios
-                ]
-                max_len = max(e.shape[0] for e in encodings)
-                ids = torch.full((len(batch_bios), max_len),
-                                 tokenizer.pad_token_id, dtype=torch.long)
-                mask = torch.zeros(len(batch_bios), max_len, dtype=torch.long)
-                for j, enc in enumerate(encodings):
-                    ids[j, :enc.shape[0]] = enc
-                    mask[j, :enc.shape[0]] = 1
+                enc = tokenizer(bio["text"], add_special_tokens=False,
+                                return_tensors="pt")["input_ids"].squeeze(0)
+                seq_len = enc.shape[0]
+                if vs < 1 or ve > seq_len:
+                    continue
 
-                logits = model(ids.to(device), attention_mask=mask.to(device)).logits
+                target_tokens = enc[vs:ve]
+                n_tok = target_tokens.shape[0]
+                if n_tok == 0:
+                    continue
 
-                for j, (bio, span) in enumerate(zip(batch_bios, batch_spans)):
-                    if span is None:
-                        continue
-                    vs, ve = span
-                    seq_len = encodings[j].shape[0]
-                    if vs < 1 or ve > seq_len:
-                        continue
+                # Feed prefix, greedy decode the rest
+                prefix_ids = enc[:vs].unsqueeze(0).to(device)
+                n_generate = seq_len - vs
 
-                    pred_logits = logits[j, vs - 1:ve - 1, :]
-                    targets = ids[j, vs:ve].to(device)
-                    n_tok = targets.shape[0]
-                    if n_tok == 0:
-                        continue
+                generated = prefix_ids
+                for _ in range(n_generate):
+                    logits = model(generated).logits
+                    next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                    generated = torch.cat([generated, next_token], dim=1)
 
-                    top3 = pred_logits.topk(3, dim=-1).indices
-                    top1_hits = (top3[:, 0] == targets).float()
-                    top3_hits = (top3 == targets.unsqueeze(-1)).any(dim=-1).float()
+                gen_value = generated[0, vs:ve].cpu()
+                gen_all = generated[0, vs:].cpu()
 
-                    top1_acc = top1_hits.mean().item()
-                    top3_acc = top3_hits.mean().item()
+                # Token-level accuracy
+                token_hits = (gen_value == target_tokens).float()
+                top1_acc = token_hits.mean().item()
+                exact = (gen_value == target_tokens).all().item()
 
-                    if top1_acc > 0 or top3_acc > 0:
-                        # Decode token-by-token details
-                        token_details = []
-                        for t in range(n_tok):
-                            target_tok = tokenizer.decode([targets[t].item()])
-                            pred1 = tokenizer.decode([top3[t, 0].item()])
-                            pred2 = tokenizer.decode([top3[t, 1].item()])
-                            pred3 = tokenizer.decode([top3[t, 2].item()])
-                            hit1 = "✓" if top1_hits[t] > 0 else "✗"
-                            hit3 = "✓" if top3_hits[t] > 0 else "✗"
-                            token_details.append({
-                                "target": target_tok,
-                                "top3": [pred1, pred2, pred3],
-                                "top1_hit": hit1,
-                                "top3_hit": hit3,
-                            })
+                # String-level metrics
+                target_str = _bio_value_string(bio).strip().lower()
+                gen_str = tokenizer.decode(gen_all.tolist()).strip().lower()
+                contains = target_str in gen_str
+                prefix_match = gen_str.startswith(target_str)
 
-                        hits.append({
-                            "name": bio["name"],
-                            "target_attr": bio["target_attr"],
-                            "value": _bio_value_string(bio),
-                            "top1_acc": top1_acc,
-                            "top3_acc": top3_acc,
-                            "token_details": token_details,
-                            "prefix": bio["prefix"],
+                result = {
+                    "name": bio["name"],
+                    "target_attr": bio["target_attr"],
+                    "value": _bio_value_string(bio),
+                    "top1_acc": top1_acc,
+                    "exact_match": exact,
+                    "contains": contains,
+                    "prefix_match": prefix_match,
+                    "gen_str": tokenizer.decode(gen_all.tolist()),
+                    "prefix": bio["prefix"],
+                }
+                total_results.append(result)
+
+                if top1_acc > 0 or contains or prefix_match:
+                    # Token-by-token details
+                    token_details = []
+                    for t in range(n_tok):
+                        target_tok = tokenizer.decode([target_tokens[t].item()])
+                        pred_tok = tokenizer.decode([gen_value[t].item()])
+                        hit = "Y" if token_hits[t] > 0 else "N"
+                        token_details.append({
+                            "target": target_tok,
+                            "predicted": pred_tok,
+                            "hit": hit,
                         })
+                    result["token_details"] = token_details
+                    hits.append(result)
 
         if cfg_key is not None:
             unapply_permutation(model, cfg_key, plan=plan)
@@ -153,26 +156,40 @@ def main():
         for attr in sorted(by_attr):
             attr_hits = by_attr[attr]
             print(f"\n--- {attr} ({len(attr_hits)} hits) ---")
-            # Sort by top3_acc descending
-            for h in sorted(attr_hits, key=lambda x: -x["top3_acc"])[:10]:
+            for h in sorted(attr_hits, key=lambda x: -x["top1_acc"])[:10]:
                 print(f"\n  {h['name']} | value={h['value']!r} | "
-                      f"top1={h['top1_acc']:.2f} top3={h['top3_acc']:.2f}")
-                print(f"  prefix: {h['prefix'][:80]}...")
-                for td in h["token_details"]:
-                    print(f"    target={td['target']!r:>12}  "
-                          f"top3={td['top3']}  "
-                          f"top1={td['top1_hit']} top3={td['top3_hit']}")
+                      f"top1={h['top1_acc']:.2f} exact={h['exact_match']} "
+                      f"contains={h['contains']} prefix={h['prefix_match']}")
+                print(f"  generated: {h['gen_str']!r}")
+                print(f"  context:   ...{h['prefix'][-60:]}")
+                if "token_details" in h:
+                    for td in h["token_details"]:
+                        print(f"    target={td['target']!r:>12}  "
+                              f"pred={td['predicted']!r:>12}  {td['hit']}")
 
         # Summary stats
         print(f"\n--- Summary ---")
-        total_valid = valid
-        total_hits = len(hits)
-        print(f"  Bios with any top1 hit: "
-              f"{sum(1 for h in hits if h['top1_acc'] > 0)}/{total_valid}")
-        print(f"  Bios with any top3 hit: "
-              f"{total_hits}/{total_valid}")
-        for attr in sorted(by_attr):
-            print(f"  {attr:>12}: {len(by_attr[attr])} hits")
+        n_total = len(total_results)
+        print(f"  Total evaluated:      {n_total}")
+        print(f"  Any token hit:        "
+              f"{sum(1 for r in total_results if r['top1_acc'] > 0)}/{n_total}")
+        print(f"  Exact match:          "
+              f"{sum(1 for r in total_results if r['exact_match'])}/{n_total}")
+        print(f"  Contains:             "
+              f"{sum(1 for r in total_results if r['contains'])}/{n_total}")
+        print(f"  Prefix match:         "
+              f"{sum(1 for r in total_results if r['prefix_match'])}/{n_total}")
+
+        all_by_attr = defaultdict(list)
+        for r in total_results:
+            all_by_attr[r["target_attr"]].append(r)
+        for attr in sorted(all_by_attr):
+            recs = all_by_attr[attr]
+            na = len(recs)
+            print(f"  {attr:>12}: top1={sum(r['top1_acc'] for r in recs)/na:.3f}  "
+                  f"exact={sum(r['exact_match'] for r in recs)/na:.3f}  "
+                  f"contains={sum(r['contains'] for r in recs)/na:.3f}  "
+                  f"prefix={sum(r['prefix_match'] for r in recs)/na:.3f}")
 
 
 if __name__ == "__main__":
