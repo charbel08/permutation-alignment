@@ -10,7 +10,7 @@ on:
 
 Outputs:
   - One combined JSON summary
-  - Unified, styled plots in one directory (including cluster scatter)
+  - Unified, styled plots in one directory (including per-layer cluster scatter)
 """
 
 from __future__ import annotations
@@ -18,27 +18,37 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from collections import defaultdict
 from dataclasses import dataclass
+from typing import Dict
 
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 from transformers import AutoTokenizer
 
 from tiered.model import GPTNeoForCausalLMTiered
 from tiered.permutation import build_mask_plan, load_key
+from tiered.permutation.utils import _get_attention_module, _get_mlp_module
 
 try:
     from scripts.eval.analyze_c1_keyed_magnitudes import (
+        PartitionStats,
+        _accumulate_partition_last_dim,
         _build_loader,
+        _merge_idx,
         compute_activation_stats,
         compute_weight_stats,
     )
 except ModuleNotFoundError:
     from analyze_c1_keyed_magnitudes import (
+        PartitionStats,
+        _accumulate_partition_last_dim,
         _build_loader,
+        _merge_idx,
         compute_activation_stats,
         compute_weight_stats,
     )
@@ -129,6 +139,99 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+# ---------------------------------------------------------------------------
+# Per-layer activation stats (used for the dense cluster scatter plot)
+# ---------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def compute_activation_stats_per_layer(
+    model: GPTNeoForCausalLMTiered,
+    mask_plan,
+    dataloader,
+    device: torch.device,
+    num_batches: int,
+) -> Dict[str, dict]:
+    """Like compute_activation_stats but keys stats by layer, e.g.
+    'L00_attn_q_out', 'L03_mlp_fc_out', giving many more data points."""
+    stats: Dict[str, PartitionStats] = defaultdict(PartitionStats)
+    handles = []
+
+    def register_out_hook(module, keyed_idx: torch.Tensor, stat_name: str):
+        def _hook(_module, _inputs, output):
+            tensor = output[0] if isinstance(output, tuple) else output
+            _accumulate_partition_last_dim(tensor, keyed_idx, stats[stat_name])
+
+        handles.append(module.register_forward_hook(_hook))
+
+    def register_in_hook(module, keyed_idx: torch.Tensor, stat_name: str):
+        def _hook(_module, inputs, _output):
+            tensor = inputs[0]
+            _accumulate_partition_last_dim(tensor, keyed_idx, stats[stat_name])
+
+        handles.append(module.register_forward_hook(_hook))
+
+    # --- attention layers ---
+    all_attn_layers = set(mask_plan.keyed_attn_indices.keys()) | set(
+        mask_plan.keyed_attn_out_indices.keys()
+    )
+    for layer_idx in sorted(all_attn_layers):
+        attn = _get_attention_module(model, layer_idx)
+        idx_rows = mask_plan.keyed_attn_indices.get(layer_idx)
+        idx_cols = _merge_idx(idx_rows, mask_plan.keyed_attn_out_indices.get(layer_idx))
+        tag = f"L{layer_idx:02d}"
+
+        if idx_rows is not None and idx_rows.numel() > 0:
+            register_out_hook(attn.q_proj, idx_rows, f"{tag}_attn_q_out")
+            register_out_hook(attn.k_proj, idx_rows, f"{tag}_attn_k_out")
+            register_out_hook(attn.v_proj, idx_rows, f"{tag}_attn_v_out")
+        if idx_cols is not None and idx_cols.numel() > 0:
+            register_in_hook(attn.out_proj, idx_cols, f"{tag}_attn_out_in")
+
+    # --- MLP layers ---
+    all_mlp_layers = (
+        set(mask_plan.keyed_mlp_indices.keys())
+        | set(mask_plan.keyed_mlp_up_indices.keys())
+        | set(mask_plan.keyed_mlp_down_indices.keys())
+    )
+    for layer_idx in sorted(all_mlp_layers):
+        mlp = _get_mlp_module(model, layer_idx)
+        idx_rows = _merge_idx(
+            mask_plan.keyed_mlp_indices.get(layer_idx),
+            mask_plan.keyed_mlp_up_indices.get(layer_idx),
+        )
+        idx_cols = _merge_idx(
+            mask_plan.keyed_mlp_indices.get(layer_idx),
+            mask_plan.keyed_mlp_down_indices.get(layer_idx),
+        )
+        tag = f"L{layer_idx:02d}"
+
+        if idx_rows is not None and idx_rows.numel() > 0:
+            register_out_hook(mlp.c_fc, idx_rows, f"{tag}_mlp_fc_out")
+        if idx_cols is not None and idx_cols.numel() > 0:
+            register_in_hook(mlp.c_proj, idx_cols, f"{tag}_mlp_proj_in")
+
+    model.eval()
+    batches_run = 0
+    for batch in dataloader:
+        if batches_run >= num_batches:
+            break
+        input_ids = batch["input_ids"].to(device, non_blocking=True)
+        attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+        _ = model(input_ids=input_ids, attention_mask=attention_mask)
+        batches_run += 1
+
+    for h in handles:
+        h.remove()
+
+    return {name: acc.to_dict() for name, acc in stats.items()}
+
+
+# ---------------------------------------------------------------------------
+# Helpers shared by all plots
+# ---------------------------------------------------------------------------
+
+
 def _component_order(stats: dict) -> list[str]:
     return sorted(k for k in stats.keys() if not k.startswith("_") and k != "overall")
 
@@ -144,6 +247,11 @@ def _style_axes(ax):
         spine.set_alpha(0.4)
 
 
+# ---------------------------------------------------------------------------
+# Original unified plots (heatmap, weight bar, fingerprint, poster)
+# ---------------------------------------------------------------------------
+
+
 def save_unified_plots(summary: dict, plot_dir: str, prefix: str) -> list[str]:
     os.makedirs(plot_dir, exist_ok=True)
     saved: list[str] = []
@@ -153,7 +261,7 @@ def save_unified_plots(summary: dict, plot_dir: str, prefix: str) -> list[str]:
     combo_stats = summary["activation_stats"]
     weight_stats = summary["weight_stats"]
 
-    # --- Plot 1: 2x2 heatmap (overall activation keyed/non-keyed ratios) ---
+    # --- Plot 1: 2x2 heatmap ---
     heat = []
     for m in models:
         row = []
@@ -178,8 +286,14 @@ def save_unified_plots(summary: dict, plot_dir: str, prefix: str) -> list[str]:
     for i, m in enumerate(models):
         for j, d in enumerate(datasets):
             ax.text(
-                j, i, f"{heat[i][j]:.3f}",
-                ha="center", va="center", color="#111111", fontsize=11, fontweight="bold",
+                j,
+                i,
+                f"{heat[i][j]:.3f}",
+                ha="center",
+                va="center",
+                color="#111111",
+                fontsize=11,
+                fontweight="bold",
             )
     cbar = fig.colorbar(im, ax=ax, fraction=0.05, pad=0.04)
     cbar.set_label("Ratio")
@@ -189,7 +303,7 @@ def save_unified_plots(summary: dict, plot_dir: str, prefix: str) -> list[str]:
     plt.close(fig)
     saved.append(p)
 
-    # --- Plot 2: grouped bars (overall weight ratio by model) ---
+    # --- Plot 2: weight ratio bars ---
     weight_overall = [_overall_mean_ratio(weight_stats[m]) for m in models]
     colors = ["#ef6c00", "#00897b"]
 
@@ -208,7 +322,7 @@ def save_unified_plots(summary: dict, plot_dir: str, prefix: str) -> list[str]:
     plt.close(fig)
     saved.append(p)
 
-    # --- Plot 3: component fingerprint lines (all 4 combinations) ---
+    # --- Plot 3: component fingerprint lines ---
     components = _component_order(combo_stats[models[0]][datasets[0]])
     palette = ["#ef6c00", "#ffb74d", "#00897b", "#4db6ac"]
 
@@ -221,8 +335,11 @@ def save_unified_plots(summary: dict, plot_dir: str, prefix: str) -> list[str]:
             s = combo_stats[m][d]
             vals = [float(s[c]["mean_abs_ratio_key_over_non"]) for c in components]
             ax.plot(
-                components, vals,
-                marker="o", linewidth=2.2, markersize=5,
+                components,
+                vals,
+                marker="o",
+                linewidth=2.2,
+                markersize=5,
                 color=palette[k % len(palette)],
                 label=f"{m} on {d}",
             )
@@ -245,9 +362,10 @@ def save_unified_plots(summary: dict, plot_dir: str, prefix: str) -> list[str]:
     ax_weight = fig.add_subplot(gs[0, 1])
     ax_lines = fig.add_subplot(gs[1, :])
 
-    # heat
     im = ax_heat.imshow(
-        heat, cmap="YlGnBu", aspect="auto",
+        heat,
+        cmap="YlGnBu",
+        aspect="auto",
         vmin=min(min(r) for r in heat) * 0.95,
         vmax=max(max(r) for r in heat) * 1.05,
     )
@@ -259,12 +377,17 @@ def save_unified_plots(summary: dict, plot_dir: str, prefix: str) -> list[str]:
     for i in range(len(models)):
         for j in range(len(datasets)):
             ax_heat.text(
-                j, i, f"{heat[i][j]:.3f}",
-                ha="center", va="center", color="#111111", fontsize=10, fontweight="bold",
+                j,
+                i,
+                f"{heat[i][j]:.3f}",
+                ha="center",
+                va="center",
+                color="#111111",
+                fontsize=10,
+                fontweight="bold",
             )
     fig.colorbar(im, ax=ax_heat, fraction=0.05, pad=0.04)
 
-    # weights
     _style_axes(ax_weight)
     ax_weight.bar(models, weight_overall, color=colors[: len(models)], alpha=0.92)
     ax_weight.axhline(1.0, color="#111111", linestyle="--", linewidth=1.0)
@@ -273,7 +396,6 @@ def save_unified_plots(summary: dict, plot_dir: str, prefix: str) -> list[str]:
     for i, v in enumerate(weight_overall):
         ax_weight.text(i, v + 0.01, f"{v:.3f}", ha="center", va="bottom", fontsize=9)
 
-    # lines
     _style_axes(ax_lines)
     k = 0
     for m in models:
@@ -281,8 +403,11 @@ def save_unified_plots(summary: dict, plot_dir: str, prefix: str) -> list[str]:
             s = combo_stats[m][d]
             vals = [float(s[c]["mean_abs_ratio_key_over_non"]) for c in components]
             ax_lines.plot(
-                components, vals,
-                marker="o", linewidth=2.1, markersize=5,
+                components,
+                vals,
+                marker="o",
+                linewidth=2.1,
+                markersize=5,
                 color=palette[k % len(palette)],
                 label=f"{m} on {d}",
             )
@@ -295,7 +420,9 @@ def save_unified_plots(summary: dict, plot_dir: str, prefix: str) -> list[str]:
 
     fig.suptitle(
         "Unified C1 Identifiability Canvas: 150M Dual-Model Dual-Dataset",
-        fontsize=18, y=0.98, fontweight="bold",
+        fontsize=18,
+        y=0.98,
+        fontweight="bold",
     )
     plt.tight_layout(rect=[0, 0, 1, 0.965])
     p = os.path.join(plot_dir, f"{prefix}_poster.png")
@@ -306,19 +433,27 @@ def save_unified_plots(summary: dict, plot_dir: str, prefix: str) -> list[str]:
     return saved
 
 
-def save_cluster_plot(summary: dict, plot_dir: str, prefix: str) -> str:
-    """Scatter keyed vs non-keyed mean |activation| per component,
-    one point per component per model x dataset combo.
+# ---------------------------------------------------------------------------
+# Per-layer cluster scatter plot
+# ---------------------------------------------------------------------------
 
+
+def save_cluster_plot(
+    per_layer_stats: dict,  # model -> dataset -> {L00_attn_q_out: {...}, ...}
+    models: list[str],
+    datasets: list[str],
+    plot_dir: str,
+    prefix: str,
+    jitter_scale: float = 0.002,
+) -> str:
+    """Scatter keyed vs non-keyed mean |activation| per layer per component.
+
+    Each dot is one (layer, component_type) pair for a given model x dataset,
+    giving ~72 points per combo instead of ~6.  Slight jitter prevents overlap.
     Points above the y=x diagonal indicate keyed neurons are louder.
-    Clustering by colour (model) or marker (dataset) reveals whether
-    the signal is model-driven or data-driven.
     """
     os.makedirs(plot_dir, exist_ok=True)
-
-    models = list(summary["models"].keys())
-    datasets = list(summary["datasets"].keys())
-    combo = summary["activation_stats"]
+    rng = np.random.default_rng(42)
 
     palette = {
         (0, 0): "#ef6c00",
@@ -334,38 +469,163 @@ def save_cluster_plot(summary: dict, plot_dir: str, prefix: str) -> str:
     all_vals: list[float] = []
     for mi, m in enumerate(models):
         for di, d in enumerate(datasets):
-            s = combo[m][d]
-            comps = _component_order(s)
-            keyed = [float(s[c]["keyed_mean_abs"]) for c in comps]
-            non_keyed = [float(s[c]["non_keyed_mean_abs"]) for c in comps]
-            all_vals.extend(keyed + non_keyed)
+            s = per_layer_stats[m][d]
+            comps = sorted(s.keys())
+            keyed = np.array([float(s[c]["keyed_mean_abs"]) for c in comps])
+            non_keyed = np.array([float(s[c]["non_keyed_mean_abs"]) for c in comps])
+
+            # slight jitter to separate overlapping points
+            jk = rng.normal(0, jitter_scale, size=len(keyed)) * keyed
+            jn = rng.normal(0, jitter_scale, size=len(non_keyed)) * non_keyed
+
+            all_vals.extend(keyed.tolist() + non_keyed.tolist())
             ax.scatter(
-                non_keyed,
-                keyed,
+                non_keyed + jn,
+                keyed + jk,
                 c=palette[(mi, di)],
                 marker=marker_shapes[di],
-                s=60,
-                alpha=0.75,
+                s=36,
+                alpha=0.7,
                 edgecolors="white",
-                linewidths=0.5,
+                linewidths=0.4,
                 label=f"{m} / {d}",
             )
 
     lo, hi = min(all_vals) * 0.92, max(all_vals) * 1.08
-    ax.plot([lo, hi], [lo, hi], "--", color="#111", linewidth=1.2, label="y = x (no difference)")
+    ax.plot([lo, hi], [lo, hi], "--", color="#111", linewidth=1.2, label="y = x")
     ax.set_xlim(lo, hi)
     ax.set_ylim(lo, hi)
     ax.set_xlabel("Non-keyed mean |activation|")
     ax.set_ylabel("Keyed mean |activation|")
-    ax.set_title("Keyed vs Non-keyed Activation Cluster", fontsize=15)
-    ax.legend(fontsize=9, frameon=True)
+    ax.set_title("Per-Layer Keyed vs Non-keyed Activation Cluster", fontsize=15)
+    ax.legend(fontsize=9, frameon=True, markerscale=1.4)
     ax.set_aspect("equal")
     plt.tight_layout()
 
-    p = os.path.join(plot_dir, f"{prefix}_cluster_scatter.png")
+    p = os.path.join(plot_dir, f"{prefix}_cluster_scatter_perlayer.png")
     fig.savefig(p, dpi=170)
     plt.close(fig)
     return p
+
+
+def save_per_layer_faceted_plot(
+    per_layer_stats: dict,  # model -> dataset -> {L00_attn_q_out: {...}, ...}
+    models: list[str],
+    datasets: list[str],
+    plot_dir: str,
+    prefix: str,
+) -> str:
+    """Small-multiples grid: one keyed-vs-non-keyed scatter per layer.
+
+    Within each subplot the different component types (attn_q, mlp_fc, …)
+    spread across the axes while colour/marker encodes model x dataset.
+    This makes it easy to spot which layers show the most divergence.
+    """
+    os.makedirs(plot_dir, exist_ok=True)
+
+    # Discover layers from the first combo's keys (e.g. "L00_attn_q_out")
+    first_stats = per_layer_stats[models[0]][datasets[0]]
+    layer_ids = sorted({k.split("_", 1)[0] for k in first_stats.keys()})  # ["L00","L01",…]
+
+    n_layers = len(layer_ids)
+    ncols = min(4, n_layers)
+    nrows = int(np.ceil(n_layers / ncols))
+
+    fig, axes = plt.subplots(
+        nrows, ncols,
+        figsize=(4.5 * ncols, 4 * nrows),
+        facecolor="#f6f2e8",
+        squeeze=False,
+    )
+
+    palette = {
+        (0, 0): "#ef6c00",
+        (0, 1): "#ffb74d",
+        (1, 0): "#00897b",
+        (1, 1): "#4db6ac",
+    }
+    marker_shapes = ["o", "s"]
+
+    # Compute shared axis limits across all layers for visual comparability
+    global_vals: list[float] = []
+    for m in models:
+        for d in datasets:
+            s = per_layer_stats[m][d]
+            for v in s.values():
+                global_vals.append(float(v["keyed_mean_abs"]))
+                global_vals.append(float(v["non_keyed_mean_abs"]))
+    g_lo, g_hi = min(global_vals) * 0.90, max(global_vals) * 1.10
+
+    for idx, layer_tag in enumerate(layer_ids):
+        row, col = divmod(idx, ncols)
+        ax = axes[row][col]
+        _style_axes(ax)
+
+        for mi, m in enumerate(models):
+            for di, d in enumerate(datasets):
+                s = per_layer_stats[m][d]
+                # Collect all components belonging to this layer
+                comps = sorted(k for k in s.keys() if k.startswith(layer_tag + "_"))
+                if not comps:
+                    continue
+                keyed = [float(s[c]["keyed_mean_abs"]) for c in comps]
+                non_keyed = [float(s[c]["non_keyed_mean_abs"]) for c in comps]
+                ax.scatter(
+                    non_keyed,
+                    keyed,
+                    c=palette[(mi, di)],
+                    marker=marker_shapes[di],
+                    s=44,
+                    alpha=0.8,
+                    edgecolors="white",
+                    linewidths=0.4,
+                    label=f"{m} / {d}" if idx == 0 else None,
+                )
+
+        ax.plot([g_lo, g_hi], [g_lo, g_hi], "--", color="#111", linewidth=0.9)
+        ax.set_xlim(g_lo, g_hi)
+        ax.set_ylim(g_lo, g_hi)
+        ax.set_aspect("equal")
+        ax.set_title(layer_tag, fontsize=11, fontweight="bold")
+        if col == 0:
+            ax.set_ylabel("Keyed mean |a|", fontsize=8)
+        if row == nrows - 1:
+            ax.set_xlabel("Non-keyed mean |a|", fontsize=8)
+        ax.tick_params(labelsize=7)
+
+    # Turn off unused subplots
+    for idx in range(n_layers, nrows * ncols):
+        row, col = divmod(idx, ncols)
+        axes[row][col].set_visible(False)
+
+    # Single shared legend from first subplot
+    handles, labels = axes[0][0].get_legend_handles_labels()
+    if handles:
+        fig.legend(
+            handles, labels,
+            loc="lower center",
+            ncol=len(models) * len(datasets),
+            fontsize=9,
+            frameon=True,
+            bbox_to_anchor=(0.5, -0.01),
+        )
+
+    fig.suptitle(
+        "Per-Layer Keyed vs Non-keyed Activation Scatter",
+        fontsize=16,
+        fontweight="bold",
+        y=1.01,
+    )
+    plt.tight_layout(rect=[0, 0.03, 1, 0.99])
+    p = os.path.join(plot_dir, f"{prefix}_cluster_faceted_perlayer.png")
+    fig.savefig(p, dpi=170, bbox_inches="tight")
+    plt.close(fig)
+    return p
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 
 def main() -> None:
@@ -418,6 +678,7 @@ def main() -> None:
 
     weight_stats = {}
     activation_stats = {}
+    per_layer_activation_stats = {}
 
     for m in model_specs:
         print(f"\nLoading model {m.name}: {m.checkpoint}")
@@ -429,15 +690,27 @@ def main() -> None:
         print(f"  Computing weight stats for {m.name}")
         weight_stats[m.name] = compute_weight_stats(model, mask_plan)
         activation_stats[m.name] = {}
+        per_layer_activation_stats[m.name] = {}
 
         for d in dataset_specs:
-            print(f"  Computing activations: {m.name} on {d.name}")
+            print(f"  Computing activations (global): {m.name} on {d.name}")
             activation_stats[m.name][d.name] = compute_activation_stats(
                 model=model,
                 mask_plan=mask_plan,
                 dataloader=loaders[d.name],
                 device=device,
                 num_batches=args.num_batches,
+            )
+
+            print(f"  Computing activations (per-layer): {m.name} on {d.name}")
+            per_layer_activation_stats[m.name][d.name] = (
+                compute_activation_stats_per_layer(
+                    model=model,
+                    mask_plan=mask_plan,
+                    dataloader=loaders[d.name],
+                    device=device,
+                    num_batches=args.num_batches,
+                )
             )
 
         del model
@@ -464,6 +737,7 @@ def main() -> None:
         "datasets": dataset_meta,
         "weight_stats": weight_stats,
         "activation_stats": activation_stats,
+        "per_layer_activation_stats": per_layer_activation_stats,
     }
 
     out_dir = os.path.dirname(args.output_json)
@@ -472,8 +746,28 @@ def main() -> None:
     with open(args.output_json, "w") as f:
         json.dump(summary, f, indent=2)
 
+    models = [m.name for m in model_specs]
+    datasets = [d.name for d in dataset_specs]
+
     plot_paths = save_unified_plots(summary, args.plot_dir, args.plot_prefix)
-    plot_paths.append(save_cluster_plot(summary, args.plot_dir, args.plot_prefix))
+    plot_paths.append(
+        save_cluster_plot(
+            per_layer_activation_stats,
+            models,
+            datasets,
+            args.plot_dir,
+            args.plot_prefix,
+        )
+    )
+    plot_paths.append(
+        save_per_layer_faceted_plot(
+            per_layer_activation_stats,
+            models,
+            datasets,
+            args.plot_dir,
+            args.plot_prefix,
+        )
+    )
 
     summary["plot_paths"] = plot_paths
     with open(args.output_json, "w") as f:
