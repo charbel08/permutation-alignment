@@ -75,13 +75,13 @@ def parse_args():
 
     # Training
     parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--learning_rate", type=float, default=1e-5)
+    parser.add_argument("--learning_rate", type=float, default=3e-5)
     parser.add_argument("--min_lr", type=float, default=1e-6)
     parser.add_argument("--max_steps", type=int, default=None,
                         help="Optional hard cap in steps. Effective max is "
                              "min(max_steps, max_epochs * steps_per_epoch).")
-    parser.add_argument("--max_epochs", type=int, default=30,
-                        help="Maximum number of epochs to run (default: 30).")
+    parser.add_argument("--max_epochs", type=int, default=100,
+                        help="Maximum number of epochs to run (default: 100).")
     parser.add_argument("--warmup_steps", type=int, default=100)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)

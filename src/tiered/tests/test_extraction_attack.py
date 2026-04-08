@@ -294,7 +294,7 @@ def test_parse_args_defaults(monkeypatch):
         ],
     )
     args = ea.parse_args()
-    assert args.max_epochs == 30
+    assert args.max_epochs == 100
     assert args.max_steps is None
     assert args.subset_seed == 42
     # kept for compatibility, ignored in logic
