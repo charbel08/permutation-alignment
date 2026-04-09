@@ -640,6 +640,92 @@ def _plot_per_layer_ratio_heatmap(
     plt.close()
 
 
+def _model_key_dims(model) -> tuple[int, int, int]:
+    num_layers = len(model.transformer.h)
+    attn = _get_attention_module(model, 0)
+    mlp = _get_mlp_module(model, 0)
+    num_heads = getattr(attn, "num_heads", attn.q_proj.weight.shape[0] // attn.head_dim)
+    mlp_dim = int(mlp.c_fc.weight.shape[0])
+    return num_layers, int(num_heads), mlp_dim
+
+
+def _accumulate_layer_pair_counts(pair_matrix: np.ndarray, swaps: list[list[list[int]]]) -> None:
+    for (layer_a, _idx_a), (layer_b, _idx_b) in swaps:
+        pair_matrix[layer_a, layer_b] += 1
+        if layer_a != layer_b:
+            pair_matrix[layer_b, layer_a] += 1
+
+
+def _plot_key_structure(key, num_layers: int, num_heads: int, mlp_dim: int, out_path: str) -> None:
+    attn_occ = np.zeros((num_layers, num_heads), dtype=float)
+    mlp_occ = np.zeros((num_layers, mlp_dim), dtype=float)
+    attn_pair_counts = np.zeros((num_layers, num_layers), dtype=float)
+    mlp_pair_counts = np.zeros((num_layers, num_layers), dtype=float)
+
+    for (layer_a, head_a), (layer_b, head_b) in key.attn_heads + key.attn_out_heads:
+        attn_occ[layer_a, head_a] = 1.0
+        attn_occ[layer_b, head_b] = 1.0
+    for (layer_a, col_a), (layer_b, col_b) in key.mlp_cols + key.mlp_up_cols + key.mlp_down_cols:
+        mlp_occ[layer_a, col_a] = 1.0
+        mlp_occ[layer_b, col_b] = 1.0
+
+    _accumulate_layer_pair_counts(attn_pair_counts, key.attn_heads)
+    _accumulate_layer_pair_counts(attn_pair_counts, key.attn_out_heads)
+    _accumulate_layer_pair_counts(mlp_pair_counts, key.mlp_cols)
+    _accumulate_layer_pair_counts(mlp_pair_counts, key.mlp_up_cols)
+    _accumulate_layer_pair_counts(mlp_pair_counts, key.mlp_down_cols)
+
+    fig = plt.figure(figsize=(16, 10), facecolor="#f6f2e8")
+    gs = fig.add_gridspec(2, 2, width_ratios=[1.35, 1.0], hspace=0.28, wspace=0.22)
+
+    ax_attn_occ = fig.add_subplot(gs[0, 0])
+    ax_attn_pair = fig.add_subplot(gs[0, 1])
+    ax_mlp_occ = fig.add_subplot(gs[1, 0])
+    ax_mlp_pair = fig.add_subplot(gs[1, 1])
+
+    im = ax_attn_occ.imshow(attn_occ, aspect="auto", cmap="Greys", vmin=0.0, vmax=1.0)
+    ax_attn_occ.set_title("Attention Head Key Map", fontsize=14)
+    ax_attn_occ.set_xlabel("Head index")
+    ax_attn_occ.set_ylabel("Layer")
+    ax_attn_occ.set_xticks(range(num_heads))
+    ax_attn_occ.set_yticks(range(num_layers))
+    ax_attn_occ.set_yticklabels([f"L{i:02d}" for i in range(num_layers)])
+    fig.colorbar(im, ax=ax_attn_occ, fraction=0.03, pad=0.02, ticks=[0.0, 1.0], label="Keyed")
+
+    im = ax_attn_pair.imshow(attn_pair_counts, aspect="equal", cmap="YlOrRd")
+    ax_attn_pair.set_title("Attention Swap Counts by Layer Pair", fontsize=14)
+    ax_attn_pair.set_xlabel("Layer B")
+    ax_attn_pair.set_ylabel("Layer A")
+    ax_attn_pair.set_xticks(range(num_layers))
+    ax_attn_pair.set_xticklabels([f"L{i:02d}" for i in range(num_layers)], rotation=45, ha="right")
+    ax_attn_pair.set_yticks(range(num_layers))
+    ax_attn_pair.set_yticklabels([f"L{i:02d}" for i in range(num_layers)])
+    fig.colorbar(im, ax=ax_attn_pair, fraction=0.03, pad=0.02, label="Swap count")
+
+    im = ax_mlp_occ.imshow(mlp_occ, aspect="auto", cmap="Greys", vmin=0.0, vmax=1.0, interpolation="nearest")
+    ax_mlp_occ.set_title("MLP Column Key Map", fontsize=14)
+    ax_mlp_occ.set_xlabel("MLP column")
+    ax_mlp_occ.set_ylabel("Layer")
+    ax_mlp_occ.set_yticks(range(num_layers))
+    ax_mlp_occ.set_yticklabels([f"L{i:02d}" for i in range(num_layers)])
+    fig.colorbar(im, ax=ax_mlp_occ, fraction=0.03, pad=0.02, ticks=[0.0, 1.0], label="Keyed")
+
+    im = ax_mlp_pair.imshow(mlp_pair_counts, aspect="equal", cmap="YlOrRd")
+    ax_mlp_pair.set_title("MLP Swap Counts by Layer Pair", fontsize=14)
+    ax_mlp_pair.set_xlabel("Layer B")
+    ax_mlp_pair.set_ylabel("Layer A")
+    ax_mlp_pair.set_xticks(range(num_layers))
+    ax_mlp_pair.set_xticklabels([f"L{i:02d}" for i in range(num_layers)], rotation=45, ha="right")
+    ax_mlp_pair.set_yticks(range(num_layers))
+    ax_mlp_pair.set_yticklabels([f"L{i:02d}" for i in range(num_layers)])
+    fig.colorbar(im, ax=ax_mlp_pair, fraction=0.03, pad=0.02, label="Swap count")
+
+    fig.suptitle("Permutation Key Structure", fontsize=18, fontweight="bold", y=0.98)
+    plt.tight_layout(rect=[0, 0, 1, 0.965])
+    plt.savefig(out_path, dpi=170)
+    plt.close()
+
+
 def _plot_key_vs_non_abs(stats: dict, title: str, out_path: str) -> None:
     comps = _ordered_components(stats, include_overall=True)
     keyed = [stats[c]["keyed_mean_abs"] for c in comps]
@@ -701,6 +787,8 @@ def _plot_private_vs_public_ratios(private_stats: dict, public_stats: dict, key_
 
 
 def save_plots(
+    key,
+    model,
     weight_stats: dict,
     private_activation_stats: dict,
     public_activation_stats: dict,
@@ -711,6 +799,7 @@ def save_plots(
 ) -> list[str]:
     os.makedirs(plot_dir, exist_ok=True)
     paths: list[str] = []
+    num_layers, num_heads, mlp_dim = _model_key_dims(model)
 
     weight_component_order = [
         "attn_q_weight_rows",
@@ -729,6 +818,10 @@ def save_plots(
         "mlp_fc_out",
         "mlp_proj_in",
     ]
+
+    p = os.path.join(plot_dir, "key_structure_map.png")
+    _plot_key_structure(key, num_layers, num_heads, mlp_dim, p)
+    paths.append(p)
 
     p = os.path.join(plot_dir, "weights_per_layer_ratio_heatmap.png")
     _plot_per_layer_ratio_heatmap(
@@ -895,6 +988,8 @@ def main() -> None:
         base = args.output_path[:-5] if args.output_path.endswith(".json") else args.output_path
         plot_dir = f"{base}_plots"
     plot_paths = save_plots(
+        key,
+        model,
         weight_stats,
         private_activation_stats,
         public_activation_stats,
