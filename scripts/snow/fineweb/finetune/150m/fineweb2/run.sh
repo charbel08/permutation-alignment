@@ -12,22 +12,22 @@ mkdir -p logs
 # ---------------------------------------------------------------------------
 # Single private-finetune launch for Spanish FineWeb2 on a 150M tiered model.
 #
-# Defaults are wired to current 150M key-size checkpoints:
-#   KEY_SIZE=2  -> tiered_pretrain_150m_2pct/final-checkpoint
-#   KEY_SIZE=5  -> tiered_pretrain_150m_5pct/final-checkpoint
-#   KEY_SIZE=10 -> tiered_pretrain_150m_10pct/final-checkpoint
+# Defaults are wired to the random-key 150M checkpoints:
+#   KEY_SIZE=5 + KEY_SUFFIX=_random -> tiered_pretrain_150m_5pct_random/final-checkpoint
+# Set KEY_SUFFIX="" to target legacy non-random keys/checkpoints.
 # ---------------------------------------------------------------------------
 
 KEY_SIZE=${KEY_SIZE:-5}               # one of: 2, 5, 10
+KEY_SUFFIX=${KEY_SUFFIX:-_random}     # "_random" for new key, "" for legacy
 KL_LAMBDA=${KL_LAMBDA:-0.1}
 
-BASE_CHECKPOINT=${BASE_CHECKPOINT:-/work/scratch/checkpoints/fineweb/tiered_pretrain_150m_${KEY_SIZE}pct/final-checkpoint}
-KEY_PATH=${KEY_PATH:-/work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct.json}
+BASE_CHECKPOINT=${BASE_CHECKPOINT:-/work/scratch/checkpoints/fineweb/tiered_pretrain_150m_${KEY_SIZE}pct${KEY_SUFFIX}/final-checkpoint}
+KEY_PATH=${KEY_PATH:-/work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct${KEY_SUFFIX}.json}
 PRIVATE_DATA=${PRIVATE_DATA:-/work/scratch/data/datasets/fineweb2_private/spa_Latn/retain}
 PUBLIC_DATA=${PUBLIC_DATA:-/work/scratch/data/datasets/fineweb/retain}
 
 KL_TAG=${KL_LAMBDA//./p}
-OUTPUT_DIR=${OUTPUT_DIR:-/work/scratch/checkpoints/fineweb/private_finetune_150m_fineweb2_spa_key${KEY_SIZE}pct_kl${KL_TAG}}
+OUTPUT_DIR=${OUTPUT_DIR:-/work/scratch/checkpoints/fineweb/private_finetune_150m_fineweb2_spa_key${KEY_SIZE}pct${KEY_SUFFIX}_kl${KL_TAG}}
 
 NGPUS=${NGPUS:-8}
 BATCH_SIZE=${BATCH_SIZE:-8}
@@ -44,7 +44,7 @@ LOG_INTERVAL=${LOG_INTERVAL:-10}
 SAVE_INTERVAL=${SAVE_INTERVAL:-2000}
 NUM_WORKERS=${NUM_WORKERS:-4}
 WANDB_PROJECT=${WANDB_PROJECT:-main-finetune}
-RUN_NAME=${RUN_NAME:-finetune_150m_fineweb2_spa_key${KEY_SIZE}pct_kl${KL_TAG}}
+RUN_NAME=${RUN_NAME:-finetune_150m_fineweb2_spa_key${KEY_SIZE}pct${KEY_SUFFIX}_kl${KL_TAG}}
 RESUME_FROM=${RESUME_FROM:-}
 
 if [ ! -d "$BASE_CHECKPOINT" ]; then
@@ -105,7 +105,7 @@ TARGET_PRIVATE_TOKENS_ACTUAL=$(( RUN_MAX_STEPS * TOKENS_PER_STEP ))
 
 echo "=========================================================="
 echo "Private finetune (Spanish FineWeb2, 150M tiered)"
-echo "  Key size:       ${KEY_SIZE}%"
+echo "  Key size:       ${KEY_SIZE}%${KEY_SUFFIX}"
 echo "  KL lambda:      ${KL_LAMBDA}"
 echo "  Base checkpoint:${BASE_CHECKPOINT}"
 echo "  Key path:       ${KEY_PATH}"
