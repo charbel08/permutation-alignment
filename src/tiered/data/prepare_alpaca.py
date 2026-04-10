@@ -12,7 +12,7 @@ Usage:
     python -m tiered.data.prepare_alpaca \
         --data-path /path/to/alpaca_data.json \
         --output-dir /path/to/output/alpaca_tokenized \
-        --context-size 2048 \
+        --context-size 1024 \
         --test-fraction 0.02
 """
 
@@ -97,7 +97,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Prepare Stanford Alpaca data for instruction tuning")
     parser.add_argument("--data-path", type=str, required=True, help="Path to alpaca_data.json")
     parser.add_argument("--output-dir", type=str, required=True, help="Output directory for tokenized dataset")
-    parser.add_argument("--context-size", type=int, default=2048, help="Sequence length (default: 2048)")
+    parser.add_argument("--context-size", type=int, default=1024, help="Sequence length (default: 1024)")
     parser.add_argument("--test-fraction", type=float, default=0.02, help="Validation split fraction")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(

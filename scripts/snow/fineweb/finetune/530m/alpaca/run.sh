@@ -25,7 +25,7 @@ KL_LAMBDA=${KL_LAMBDA:-0.1}
 
 BASE_CHECKPOINT=${BASE_CHECKPOINT:-/work/scratch/checkpoints/fineweb/tiered_pretrain_530m_${KEY_SIZE}pct/final-checkpoint}
 KEY_PATH=${KEY_PATH:-/work/permutation-alignment/configs/keys/530m/both/key_${KEY_SIZE}pct.json}
-PRIVATE_DATA=${PRIVATE_DATA:-/work/scratch/data/datasets/alpaca/tokenized_gpt2_2048}
+PRIVATE_DATA=${PRIVATE_DATA:-/work/scratch/data/datasets/alpaca/tokenized_gpt2_1024}
 PUBLIC_DATA=${PUBLIC_DATA:-/work/scratch/data/datasets/fineweb/retain}
 
 KL_TAG=${KL_LAMBDA//./p}
@@ -37,7 +37,7 @@ LR=${LR:-1e-5}
 MIN_LR=${MIN_LR:-1e-6}
 EPOCHS=${EPOCHS:-3}
 MAX_STEPS=${MAX_STEPS:-}
-CONTEXT_SIZE=${CONTEXT_SIZE:-2048}
+CONTEXT_SIZE=${CONTEXT_SIZE:-1024}
 WARMUP_STEPS=${WARMUP_STEPS:-100}
 KEYED_L2_LAMBDA=${KEYED_L2_LAMBDA:-0.01}
 EVAL_INTERVAL=${EVAL_INTERVAL:-200}

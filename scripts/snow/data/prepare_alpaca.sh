@@ -10,8 +10,8 @@ cd /work/permutation-alignment
 
 ALPACA_JSON=${ALPACA_JSON:-/work/scratch/data/raw/alpaca/alpaca_data.json}
 ALPACA_JSON_URL=${ALPACA_JSON_URL:-https://raw.githubusercontent.com/tatsu-lab/stanford_alpaca/main/alpaca_data.json}
-OUTPUT_DIR=${OUTPUT_DIR:-/work/scratch/data/datasets/alpaca/tokenized_gpt2_2048}
-CONTEXT_SIZE=${CONTEXT_SIZE:-2048}
+OUTPUT_DIR=${OUTPUT_DIR:-/work/scratch/data/datasets/alpaca/tokenized_gpt2_1024}
+CONTEXT_SIZE=${CONTEXT_SIZE:-1024}
 TEST_FRACTION=${TEST_FRACTION:-0.02}
 SEED=${SEED:-42}
 MAX_EXAMPLES=${MAX_EXAMPLES:-}
