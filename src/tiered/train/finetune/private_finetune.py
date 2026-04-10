@@ -41,7 +41,7 @@ from datasets import load_from_disk
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, DistributedSampler
-from transformers import AutoTokenizer, DataCollatorForLanguageModeling
+from transformers import AutoTokenizer, DataCollatorForLanguageModeling, default_data_collator
 from tqdm import tqdm
 
 from tiered.model import GPTNeoForCausalLMTiered
@@ -548,7 +548,7 @@ def main():
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
-    collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    lm_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
     # Load private/forget data (for L_priv training + optional validation)
     if is_main:
@@ -564,12 +564,19 @@ def main():
     else:
         private_train = private_dataset
 
+    private_has_labels = "labels" in private_train.column_names
     cols_to_keep = ["input_ids", "attention_mask"]
+    if private_has_labels:
+        cols_to_keep.append("labels")
     cols_to_remove = [c for c in private_train.column_names if c not in cols_to_keep]
     if cols_to_remove:
         private_train = private_train.remove_columns(cols_to_remove)
         if private_val is not None:
             private_val = private_val.remove_columns(cols_to_remove)
+
+    private_collator = default_data_collator if private_has_labels else lm_collator
+    if is_main and private_has_labels:
+        print("Private dataset includes labels: using precomputed labels (e.g., response-only masking).")
 
     private_sampler = DistributedSampler(private_train, shuffle=True) if is_distributed else None
     private_loader = DataLoader(
@@ -577,7 +584,7 @@ def main():
         batch_size=args.batch_size,
         sampler=private_sampler,
         shuffle=(private_sampler is None),
-        collate_fn=collator,
+        collate_fn=private_collator,
         drop_last=True,
         num_workers=args.num_workers,
         pin_memory=True,
@@ -591,7 +598,7 @@ def main():
             batch_size=args.batch_size,
             sampler=private_val_sampler,
             shuffle=False,
-            collate_fn=collator,
+            collate_fn=private_collator,
             drop_last=True,
             num_workers=args.num_workers,
             pin_memory=True,
@@ -629,7 +636,7 @@ def main():
                 batch_size=args.batch_size,
                 sampler=public_sampler,
                 shuffle=(public_sampler is None),
-                collate_fn=collator,
+                collate_fn=lm_collator,
                 drop_last=True,
                 num_workers=args.num_workers,
                 pin_memory=True,
@@ -641,7 +648,7 @@ def main():
             batch_size=args.batch_size,
             sampler=retain_val_sampler,
             shuffle=False,
-            collate_fn=collator,
+            collate_fn=lm_collator,
             drop_last=True,
             num_workers=args.num_workers,
             pin_memory=True,

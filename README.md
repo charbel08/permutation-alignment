@@ -43,7 +43,6 @@ L_ft = (1 − λ) · L_priv(C2) + λ · R_KL(C1_current, C1_frozen)
 
 Only keyed weights are updated during finetuning. The KL term regularizes against C1 divergence from the pretrained baseline.
 
-**SuperGLUE finetuning** (`superglue_finetune.py`) demonstrates that C2 can learn NLU capabilities hidden behind the key, using answer-only label masking so only answer tokens contribute to the loss.
 
 ## Installation
 
@@ -64,8 +63,6 @@ PYTHONPATH=./src pytest ./src/tiered/tests -sv
 ```
 ├── configs/
 │   └── keys/                          # Pre-generated permutation keys
-│       ├── 64m/both/                  # 64M model, both-projection swaps
-│       │   └── key_20pct_mixed.json
 │       ├── 150m/both/
 │       │   ├── key_14pct.json
 │       │   └── key_7pct_{1,2,3}.json
@@ -96,14 +93,11 @@ PYTHONPATH=./src pytest ./src/tiered/tests -sv
 │   ├── mila/                          # SLURM sbatch scripts (Mila cluster)
 │   │   ├── pretrain.sbatch
 │   │   ├── tiered_pretrain.sbatch
-│   │   ├── tiered_pretrain_batches.sbatch
-│   │   └── private_finetune_superglue.sbatch
+│   │   └── tiered_pretrain_batches.sbatch
 │   └── snow/                          # SLURM sbatch scripts (Snowflake cluster)
 │       ├── data/                      # dataset prep launchers
 │       ├── wiki/
-│       │   └── pretrain/64m/run.sh
-│       ├── wmdp/
-│       │   └── finetune/150m/run_multi.sh
+│       │   └── pretrain/<size>/run.sh
 │       └── fineweb/
 │           ├── pretrain/<size>/       # baseline + keyed pretraining launchers
 │           ├── finetune/<size>/<dataset>/  # fine-tuning launchers (incl. KL=0 variants)
@@ -124,13 +118,11 @@ PYTHONPATH=./src pytest ./src/tiered/tests -sv
 │   │   ├── multi_tiered_naive.py      # N-tier pretraining (naive, all tiers every step)
 │   │   ├── pretrain.py                # Standard baseline pretraining (no tiered alignment)
 │   │   ├── private_finetune.py        # KL-regularized private finetuning
-│   │   ├── superglue_finetune.py      # SuperGLUE private finetuning (answer-only masking)
 │   │   ├── inference.py               # Compare C1 vs C2 generation
 │   │   └── utils.py                   # Model loading, checkpointing, tokenizer
 │   ├── data/
 │   │   ├── prepare_wikipedia.py       # Wikipedia → forget/adjacent/retain splits
 │   │   ├── prepare_fineweb.py         # FineWeb → tokenized chunks for pretraining
-│   │   ├── prepare_superglue.py       # SuperGLUE → answer-only masked dataset
 │   │   ├── tinystories_tokenize_and_split.py
 │   │   └── explore.py                 # Dataset statistics
 │   └── tests/
@@ -172,7 +164,6 @@ This generates a key covering ~20% of model parameters, split 25% attention / 75
 
 | Key file | Model | Coverage |
 |----------|-------|----------|
-| `64m/key_20pct_mixed.json` | 64M | 20% |
 | `150m/key_14pct.json` | 150M | 14% |
 | `150m/key_7pct_{1,2,3}.json` | 150M | 7% each (for multi-tier) |
 | `530m/key_14pct.json` | 530M | 14% |
@@ -188,7 +179,7 @@ from tiered.model import GPTNeoForCausalLMTiered
 from tiered.permutation import load_key
 
 model = GPTNeoForCausalLMTiered.from_pretrained("path/to/checkpoint")
-key = load_key("configs/keys/64m/both/key_20pct_mixed.json")
+key = load_key("configs/keys/150m/both/key_14pct.json")
 
 # Public configuration (C1)
 outputs_c1 = model.generate(input_ids)
@@ -204,7 +195,7 @@ Or use the inference script directly:
 ```bash
 PYTHONPATH=./src python src/tiered/train/inference.py \
     --checkpoint /path/to/checkpoint \
-    --key_path configs/keys/64m/both/key_20pct_mixed.json \
+    --key_path configs/keys/150m/both/key_14pct.json \
     --prompt "Once upon a time"
 ```
 
@@ -215,7 +206,7 @@ Train a model with asymmetric gradient updates on C1 and C2:
 ```bash
 torchrun --standalone --nproc_per_node=3 -m tiered.train.pretrain.tiered_pretrain \
     --data_path /path/to/tokenized/data \
-    --key_path configs/keys/64m/both/key_20pct_mixed.json \
+    --key_path configs/keys/150m/both/key_14pct.json \
     --output_dir /path/to/output \
     --hidden_size 512 --num_heads 32 --num_layers 12 \
     --context_size 1024 --batch_size 16 \
@@ -272,7 +263,7 @@ Finetune the keyed tier on private data while preserving public behavior:
 ```bash
 PYTHONPATH=./src python src/tiered/train/finetune/private_finetune.py \
     --checkpoint /path/to/tiered/checkpoint \
-    --key_path configs/keys/64m/both/key_20pct_mixed.json \
+    --key_path configs/keys/150m/both/key_14pct.json \
     --private_data /path/to/forget/data \
     --public_data /path/to/retain/data \
     --output_dir /path/to/output \
@@ -305,22 +296,6 @@ Key outputs:
 - `output_dir/final/experiment_metadata.json`: rank/budget metadata
 - `output_dir/comparison_summary.json`: perf + FLOPs comparison summary
 
-### SuperGLUE Private Finetuning
-
-Finetune C2 on SuperGLUE NLU tasks with answer-only label masking:
-
-```bash
-PYTHONPATH=./src python src/tiered/train/finetune/superglue_finetune.py \
-    --checkpoint /path/to/pretrained \
-    --key_path configs/keys/64m/both/key_20pct_mixed.json \
-    --superglue_data /path/to/superglue \
-    --public_data /path/to/wiki_bio/retain \
-    --output_dir /path/to/output \
-    --kl_lambda 0.1 --max_steps 10000
-```
-
-Tracks three validation signals: C1 on retain (stability), C1 on SuperGLUE (no leakage), C2 on SuperGLUE (learning).
-
 ## Data Preparation
 
 ### FineWeb (Large-Scale Pretraining)
@@ -351,18 +326,6 @@ python -m tiered.data.prepare_wikipedia \
 ```
 
 This produces three HuggingFace `DatasetDict`s (forget, adjacent, retain), each with train/test splits, tokenized and chunked to fixed lengths.
-
-### SuperGLUE
-
-Prepares all 8 SuperGLUE tasks (BoolQ, CB, COPA, MultiRC, ReCoRD, RTE, WiC, WSC) with answer-only label masking:
-
-```bash
-PYTHONPATH=./src python src/tiered/data/prepare_superglue.py \
-    --output-dir /path/to/output/superglue \
-    --context-size 1024
-```
-
-Each example stores `input_ids`, `attention_mask`, and `labels` where `labels=-100` for prompt tokens (only answer tokens receive gradient).
 
 ### Synthetic Bios (Memorization Evaluation)
 
@@ -396,14 +359,14 @@ Measures how well the model memorizes synthetic bio attribute values (not filler
 PYTHONPATH=./src python scripts/eval/eval_memorization.py \
     --checkpoint /path/to/checkpoint \
     --bio_metadata /path/to/bios_metadata.json \
-    --key_path configs/keys/64m/both/key_20pct_mixed.json \
+    --key_path configs/keys/150m/both/key_14pct.json \
     --output_dir /path/to/output
 
 # Sweep across all checkpoints
 PYTHONPATH=./src python scripts/eval/eval_memorization.py \
     --checkpoint /path/to/ckpt_dir \
     --bio_metadata /path/to/bios_metadata.json \
-    --key_path configs/keys/64m/both/key_20pct_mixed.json \
+    --key_path configs/keys/150m/both/key_14pct.json \
     --output_dir /path/to/output --sweep
 ```
 
