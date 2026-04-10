@@ -17,11 +17,12 @@ mkdir -p logs
 # ---------------------------------------------------------------------------
 
 KEY_SIZE=${KEY_SIZE:-5}
+KEY_SUFFIX=${KEY_SUFFIX:-_random}
 DATA_LANG=${DATA_LANG:-spa_Latn}
 KL_TAG=${KL_TAG:-0p1}
 
-CHECKPOINT=${CHECKPOINT:-/work/scratch/checkpoints/fineweb/private_finetune_150m_fineweb2_${DATA_LANG%%_*}_key${KEY_SIZE}pct_kl${KL_TAG}/final}
-KEY_PATH=${KEY_PATH:-/work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct.json}
+CHECKPOINT=${CHECKPOINT:-/work/scratch/checkpoints/fineweb/private_finetune_150m_fineweb2_${DATA_LANG%%_*}_key${KEY_SIZE}pct${KEY_SUFFIX}_kl${KL_TAG}/final}
+KEY_PATH=${KEY_PATH:-/work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct${KEY_SUFFIX}.json}
 PRIVATE_DATA=${PRIVATE_DATA:-/work/scratch/data/datasets/fineweb2_private/${DATA_LANG}/retain}
 PUBLIC_DATA=${PUBLIC_DATA:-/work/scratch/data/datasets/fineweb/retain}
 
@@ -33,7 +34,7 @@ MAX_LENGTH=${MAX_LENGTH:-512}
 NUM_WORKERS=${NUM_WORKERS:-4}
 SEED=${SEED:-0}
 
-OUTPUT_PATH=${OUTPUT_PATH:-/work/permutation-alignment/outputs/analysis_150m_fineweb2_${DATA_LANG%%_*}_key${KEY_SIZE}pct_kl${KL_TAG}_c1_magnitudes.json}
+OUTPUT_PATH=${OUTPUT_PATH:-/work/permutation-alignment/outputs/analysis_150m_fineweb2_${DATA_LANG%%_*}_key${KEY_SIZE}pct${KEY_SUFFIX}_kl${KL_TAG}_c1_magnitudes.json}
 PLOT_DIR=${PLOT_DIR:-/work/permutation-alignment/outputs}
 
 echo "=========================================================="
@@ -69,7 +70,7 @@ if [ ! -d "$PUBLIC_DATA" ]; then
     exit 1
 fi
 
-LOG_FILE="logs/c1_magnitude_analysis_150m_fineweb2_${DATA_LANG%%_*}_key${KEY_SIZE}pct_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="logs/c1_magnitude_analysis_150m_fineweb2_${DATA_LANG%%_*}_key${KEY_SIZE}pct${KEY_SUFFIX}_$(date +%Y%m%d_%H%M%S).log"
 
 PYTHONPATH=./src python scripts/eval/analyze_c1_keyed_magnitudes.py \
     --checkpoint "$CHECKPOINT" \

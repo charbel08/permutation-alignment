@@ -273,6 +273,10 @@ def _make_random_cross_layer_swaps(pool: list[tuple[int, int]], max_swaps: int):
     Unlike _make_cross_layer_swaps, this preserves random layer pairing rather
     than imposing a round-robin structure over sorted layers.
 
+    Expects a pool larger than 2*max_swaps so that the random cross-layer
+    constraint has room to breathe.  Stops as soon as max_swaps is reached;
+    unused slots are simply discarded.
+
     Args:
         pool: Shuffled list of (layer, index) tuples.
         max_swaps: Maximum number of swaps to generate.
@@ -436,26 +440,35 @@ def generate_keys(
         "out": "attn_out_heads",
     }[attn_mode]
 
-    # Shuffle and partition attention head slots
+    # Shuffle and partition attention head slots.
+    # For random cross-layer pairing, over-allocate each partition (2x the
+    # needed swap slots) so the random algorithm has slack.  Unused slots
+    # are simply discarded after pairing.
     all_heads = [(l, h) for l in range(num_layers) for h in range(num_heads)]
     random.shuffle(all_heads)
 
-    chunk_size_heads = len(all_heads) // num_keys
+    if random_cross_layer_pairing:
+        oversample_heads = min(4 * swaps_per_key_attn, len(all_heads) // num_keys)
+    else:
+        oversample_heads = len(all_heads) // num_keys
     head_partitions = []
     for k in range(num_keys):
-        start = k * chunk_size_heads
-        end = (k + 1) * chunk_size_heads if k < num_keys - 1 else len(all_heads)
+        start = k * oversample_heads
+        end = min((k + 1) * oversample_heads, len(all_heads))
         head_partitions.append(all_heads[start:end])
 
-    # Shuffle and partition MLP column slots
+    # Shuffle and partition MLP column slots (same oversampling logic).
     all_cols = [(l, c) for l in range(num_layers) for c in range(mlp_dim)]
     random.shuffle(all_cols)
 
-    chunk_size_cols = len(all_cols) // num_keys
+    if random_cross_layer_pairing:
+        oversample_cols = min(4 * swaps_per_key_mlp, len(all_cols) // num_keys)
+    else:
+        oversample_cols = len(all_cols) // num_keys
     col_partitions = []
     for k in range(num_keys):
-        start = k * chunk_size_cols
-        end = (k + 1) * chunk_size_cols if k < num_keys - 1 else len(all_cols)
+        start = k * oversample_cols
+        end = min((k + 1) * oversample_cols, len(all_cols))
         col_partitions.append(all_cols[start:end])
 
     # Choose MLP swap strategy based on mode
