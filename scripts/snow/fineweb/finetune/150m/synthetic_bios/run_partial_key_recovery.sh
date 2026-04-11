@@ -38,6 +38,7 @@ PARTIAL_KEY_PCTS=${PARTIAL_KEY_PCTS:-"0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1 2 3 
 NUM_RUNS=${NUM_RUNS:-100}
 SEED=${SEED:-42}
 DEVICE=${DEVICE:-auto}
+NGPUS=${NGPUS:-8}
 
 OUTPUT_DIR=${OUTPUT_DIR:-/work/scratch/checkpoints/fineweb/evals/partial_key_recovery_150m_synbios_key${KEY_SIZE}pct_kl${KL_TAG}_${EVAL_SPLIT}}
 
@@ -57,6 +58,7 @@ echo "  Partial key pcts:  ${PARTIAL_KEY_PCTS}"
 echo "  Runs per pct:      ${NUM_RUNS}"
 echo "  Seed:              ${SEED}"
 echo "  Device:            ${DEVICE}"
+echo "  GPUs (torchrun):   ${NGPUS}"
 echo "  Output dir:        ${OUTPUT_DIR}"
 echo "=========================================================="
 
@@ -86,7 +88,7 @@ if [ -n "$MAX_BIOS" ]; then
     EXTRA_ARGS+=(--max_bios "$MAX_BIOS")
 fi
 
-PYTHONPATH=./src:. python3 scripts/eval/partial_key_recovery_memorization.py \
+PYTHONPATH=./src:. torchrun --standalone --nproc_per_node="$NGPUS" scripts/eval/partial_key_recovery_memorization.py \
     --checkpoint "$CHECKPOINT" \
     --bio_metadata "$BIO_METADATA" \
     --key_path "$KEY_PATH" \

@@ -15,7 +15,6 @@ import json
 import os
 import random
 import statistics
-from collections import defaultdict
 from collections import OrderedDict
 from pathlib import Path
 
@@ -23,6 +22,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
+import torch.distributed as dist
+from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from tiered.model import GPTNeoForCausalLMTiered
@@ -73,7 +74,6 @@ def parse_args():
     p.add_argument("--num_runs", type=int, default=100,
                    help="Number of random subsets per percentage")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--log_every_runs", type=int, default=5)
     p.add_argument("--device", type=str, default="auto",
                    choices=["auto", "cuda", "cpu"])
     return p.parse_args()
@@ -87,6 +87,36 @@ def _resolve_device(device_arg: str) -> torch.device:
             raise RuntimeError("--device=cuda requested but CUDA is not available")
         return torch.device("cuda")
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _setup_distributed(
+    device_arg: str,
+) -> tuple[torch.device, int, int, bool, int]:
+    """Return (device, rank, world_size, is_distributed, local_rank)."""
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    if local_rank == -1:
+        return _resolve_device(device_arg), 0, 1, False, -1
+
+    if device_arg == "cpu" or not torch.cuda.is_available():
+        backend = "gloo"
+        device = torch.device("cpu")
+    else:
+        if device_arg == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("--device=cuda requested but CUDA is not available")
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+        backend = "nccl"
+
+    dist.init_process_group(backend=backend)
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    return device, rank, world_size, True, local_rank
+
+
+def _cleanup_distributed(is_distributed: bool) -> None:
+    if is_distributed and dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 def select_bios(metadata, eval_split, target_attr=None):
@@ -182,7 +212,7 @@ def _bio_value_span(tokenizer, bio):
     return tok_indices[0], tok_indices[-1] + 1
 
 
-def _prepare_bios_and_tokens(args):
+def _prepare_bios_and_tokens(args, verbose: bool = True):
     with open(args.bio_metadata, "r") as f:
         metadata = json.load(f)
 
@@ -195,7 +225,8 @@ def _prepare_bios_and_tokens(args):
     tokenizer = AutoTokenizer.from_pretrained("gpt2", use_fast=True)
     tokenizer.pad_token = tokenizer.eos_token
 
-    print("Computing spans and cached prefix/target tokens once...")
+    if verbose:
+        print("Computing spans and cached prefix/target tokens once...")
     items = []
     for bio in bios:
         span = _bio_value_span(tokenizer, bio)
@@ -221,7 +252,8 @@ def _prepare_bios_and_tokens(args):
         })
 
     valid = len(items)
-    print(f"Selected bios: {len(bios)} | valid value spans: {valid}")
+    if verbose:
+        print(f"Selected bios: {len(bios)} | valid value spans: {valid}")
     if valid <= 0:
         raise ValueError("All bios had unresolved value spans.")
 
@@ -361,68 +393,83 @@ def _plot_mean_std(
 
 def main():
     args = parse_args()
-    os.makedirs(args.output_dir, exist_ok=True)
+    device, rank, world_size, is_distributed, _local_rank = _setup_distributed(args.device)
+    is_main = rank == 0
+    if is_main:
+        os.makedirs(args.output_dir, exist_ok=True)
+    if is_distributed:
+        dist.barrier()
 
-    device = _resolve_device(args.device)
     metric_keys = _metric_keys()
 
     pcts = [float(x) for x in args.partial_key_pcts]
     if any(p <= 0.0 or p > 100.0 for p in pcts):
         raise ValueError("--partial_key_pcts must be in (0, 100].")
 
-    print("Loading full key...")
+    if is_main:
+        print("Loading full key...")
     full_key = load_key(args.key_path)
     key_entries = _flatten_key_entries(full_key)
     total_swaps = len(key_entries)
     if total_swaps == 0:
         raise ValueError("Loaded key has no swaps.")
-    print(f"Total key swaps: {total_swaps}")
+    if is_main:
+        print(f"Total key swaps: {total_swaps}")
 
     keep_counts = [_keep_count(total_swaps, p) for p in pcts]
 
-    tokenizer, items, max_gen_len = _prepare_bios_and_tokens(args)
+    tokenizer, items, max_gen_len = _prepare_bios_and_tokens(args, verbose=is_main)
 
-    print(f"Loading model from {args.checkpoint}")
+    if is_main:
+        print(f"Loading model from {args.checkpoint}")
     model = GPTNeoForCausalLMTiered.from_pretrained(args.checkpoint)
     model.to(device)
     model.eval()
 
-    print("\nEvaluating baselines...")
-    c1 = _evaluate_cached_greedy(
-        model=model,
-        items=items,
-        max_gen_len=max_gen_len,
-        pad_token_id=tokenizer.pad_token_id,
-        device=device,
-        batch_size=args.batch_size,
-    )
-    apply_permutation(model, full_key)
-    c2_full = _evaluate_cached_greedy(
-        model=model,
-        items=items,
-        max_gen_len=max_gen_len,
-        pad_token_id=tokenizer.pad_token_id,
-        device=device,
-        batch_size=args.batch_size,
-    )
-    unapply_permutation(model, full_key)
+    if is_main:
+        print("\nEvaluating baselines...")
+        c1 = _evaluate_cached_greedy(
+            model=model,
+            items=items,
+            max_gen_len=max_gen_len,
+            pad_token_id=tokenizer.pad_token_id,
+            device=device,
+            batch_size=args.batch_size,
+        )
+        apply_permutation(model, full_key)
+        c2_full = _evaluate_cached_greedy(
+            model=model,
+            items=items,
+            max_gen_len=max_gen_len,
+            pad_token_id=tokenizer.pad_token_id,
+            device=device,
+            batch_size=args.batch_size,
+        )
+        unapply_permutation(model, full_key)
 
-    print("  C1:", {k: round(c1.get(k, 0.0), 4) for k in metric_keys})
-    print("  Full C2:", {k: round(c2_full.get(k, 0.0), 4) for k in metric_keys})
+        print("  C1:", {k: round(c1.get(k, 0.0), 4) for k in metric_keys})
+        print("  Full C2:", {k: round(c2_full.get(k, 0.0), 4) for k in metric_keys})
+        print(
+            f"\nRunning partial-key sweep: {len(pcts)} percentages x {args.num_runs} runs "
+            f"across {world_size} rank(s)"
+        )
+    else:
+        c1 = None
+        c2_full = None
 
-    print(f"\nRunning partial-key sweep: {len(pcts)} percentages x {args.num_runs} runs")
+    local_run_indices = list(range(rank, args.num_runs, world_size))
     run_rows = []
-    per_pct_metrics: OrderedDict[float, dict[str, list[float]]] = OrderedDict()
-    for pct in pcts:
-        per_pct_metrics[pct] = {mk: [] for mk in metric_keys}
-
-    for run_idx in range(args.num_runs):
+    run_iter = tqdm(
+        local_run_indices,
+        total=len(local_run_indices),
+        desc=f"Rank {rank} runs",
+        position=rank if is_distributed else 0,
+        leave=True,
+    )
+    for run_idx in run_iter:
         rng = random.Random(args.seed + run_idx)
         order = list(range(total_swaps))
         rng.shuffle(order)
-
-        if (run_idx + 1) % max(1, args.log_every_runs) == 0 or run_idx == 0:
-            print(f"  Run {run_idx + 1}/{args.num_runs}")
 
         for pct, keep_n in zip(pcts, keep_counts):
             keep_indices = set(order[:keep_n])
@@ -449,8 +496,30 @@ def main():
             for mk in metric_keys:
                 val = float(agg.get(mk, 0.0))
                 row[mk] = val
-                per_pct_metrics[pct][mk].append(val)
             run_rows.append(row)
+
+    if is_distributed:
+        all_rows = [None for _ in range(world_size)]
+        dist.all_gather_object(all_rows, run_rows)
+        if is_main:
+            gathered_rows = []
+            for rows in all_rows:
+                gathered_rows.extend(rows)
+            run_rows = gathered_rows
+        else:
+            run_rows = None
+
+    if not is_main:
+        _cleanup_distributed(is_distributed)
+        return
+
+    run_rows.sort(key=lambda r: (r["run"], r["pct"]))
+    per_pct_metrics: OrderedDict[float, dict[str, list[float]]] = OrderedDict()
+    for pct in pcts:
+        per_pct_metrics[pct] = {mk: [] for mk in metric_keys}
+    for row in run_rows:
+        for mk in metric_keys:
+            per_pct_metrics[row["pct"]][mk].append(float(row[mk]))
 
     summaries = []
     for pct, keep_n in zip(pcts, keep_counts):
@@ -526,6 +595,7 @@ def main():
     print(f"Summary CSV:   {summary_csv}")
     print(f"Summary JSON:  {summary_json}")
     print(f"Plot PNG:      {plot_png}")
+    _cleanup_distributed(is_distributed)
 
 
 if __name__ == "__main__":
