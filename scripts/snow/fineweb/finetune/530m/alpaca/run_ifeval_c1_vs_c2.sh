@@ -48,7 +48,8 @@ if [ ! -d "$IFEVAL_DIR" ]; then
     cp -r /tmp/google-research/instruction_following_eval "$IFEVAL_DIR"
     rm -rf /tmp/google-research
 fi
-uv pip install -q langdetect immutabledict
+uv pip install -q langdetect immutabledict nltk
+python3 -c "import nltk; nltk.download('punkt_tab', quiet=True)"
 
 mkdir -p "$OUTPUT_DIR"
 
