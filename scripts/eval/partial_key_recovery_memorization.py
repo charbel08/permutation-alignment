@@ -257,15 +257,13 @@ def _prepare_bios_and_tokens(args, verbose: bool = True):
     if valid <= 0:
         raise ValueError("All bios had unresolved value spans.")
 
-    max_gen_len = max(i["target_ids"].shape[0] for i in items)
-    return tokenizer, items, max_gen_len
+    return tokenizer, items
 
 
 @torch.no_grad()
 def _evaluate_cached_greedy(
     model,
     items: list[dict],
-    max_gen_len: int,
     pad_token_id: int,
     device: torch.device,
     batch_size: int,
@@ -282,6 +280,7 @@ def _evaluate_cached_greedy(
     for start in range(0, len(items), batch_size):
         batch = items[start:start + batch_size]
         bs = len(batch)
+        batch_max_gen_len = max(item["target_ids"].shape[0] for item in batch)
 
         prefixes = [item["prefix_ids"] for item in batch]
         max_prefix_len = max(p.shape[0] for p in prefixes)
@@ -299,7 +298,7 @@ def _evaluate_cached_greedy(
         attn_mask = attn_mask.to(device)
         position_ids = position_ids.to(device)
 
-        for _ in range(max_gen_len):
+        for _ in range(batch_max_gen_len):
             logits = model(
                 input_ids,
                 attention_mask=attn_mask,
@@ -418,7 +417,7 @@ def main():
 
     keep_counts = [_keep_count(total_swaps, p) for p in pcts]
 
-    tokenizer, items, max_gen_len = _prepare_bios_and_tokens(args, verbose=is_main)
+    tokenizer, items = _prepare_bios_and_tokens(args, verbose=is_main)
 
     if is_main:
         print(f"Loading model from {args.checkpoint}")
@@ -431,7 +430,6 @@ def main():
         c1 = _evaluate_cached_greedy(
             model=model,
             items=items,
-            max_gen_len=max_gen_len,
             pad_token_id=tokenizer.pad_token_id,
             device=device,
             batch_size=args.batch_size,
@@ -440,7 +438,6 @@ def main():
         c2_full = _evaluate_cached_greedy(
             model=model,
             items=items,
-            max_gen_len=max_gen_len,
             pad_token_id=tokenizer.pad_token_id,
             device=device,
             batch_size=args.batch_size,
@@ -459,11 +456,13 @@ def main():
 
     local_run_indices = list(range(rank, args.num_runs, world_size))
     run_rows = []
+    outer_position = (2 * rank) if is_distributed else 0
+    inner_position = outer_position + 1
     run_iter = tqdm(
         local_run_indices,
         total=len(local_run_indices),
         desc=f"Rank {rank} runs",
-        position=rank if is_distributed else 0,
+        position=outer_position,
         leave=True,
     )
     for run_idx in run_iter:
@@ -471,7 +470,14 @@ def main():
         order = list(range(total_swaps))
         rng.shuffle(order)
 
-        for pct, keep_n in zip(pcts, keep_counts):
+        pct_iter = tqdm(
+            list(zip(pcts, keep_counts)),
+            total=len(pcts),
+            desc=f"Rank {rank} run {run_idx + 1}/{args.num_runs}",
+            position=inner_position,
+            leave=False,
+        )
+        for pct, keep_n in pct_iter:
             keep_indices = set(order[:keep_n])
             partial_key = _build_partial_key_from_keep(key_entries, keep_indices)
 
@@ -479,7 +485,6 @@ def main():
             agg = _evaluate_cached_greedy(
                 model=model,
                 items=items,
-                max_gen_len=max_gen_len,
                 pad_token_id=tokenizer.pad_token_id,
                 device=device,
                 batch_size=args.batch_size,
@@ -497,6 +502,7 @@ def main():
                 val = float(agg.get(mk, 0.0))
                 row[mk] = val
             run_rows.append(row)
+        pct_iter.close()
 
     if is_distributed:
         all_rows = [None for _ in range(world_size)]
