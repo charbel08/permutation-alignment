@@ -12,9 +12,12 @@ Designed to run with `torchrun` for multi-GPU generation.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import torch
@@ -187,6 +190,18 @@ def gather_records(local_records: list[dict], is_distributed: bool, world_size: 
     return merged
 
 
+def build_alpaca_eval_command() -> list[str]:
+    cli = shutil.which("alpaca_eval")
+    if cli is not None:
+        return [cli]
+    if importlib.util.find_spec("alpaca_eval") is not None:
+        return [sys.executable, "-m", "alpaca_eval.main"]
+    raise FileNotFoundError(
+        "Could not find `alpaca_eval` executable or Python module `alpaca_eval`. "
+        "Install it in this environment (e.g. `pip install alpaca-eval`)."
+    )
+
+
 def load_alpacaeval_examples(args):
     """Load AlpacaEval prompts with compatibility fallback for datasets>=3."""
     if args.dataset_json_path:
@@ -312,8 +327,9 @@ def main():
         if not args.annotators_config:
             raise ValueError("--annotators_config is required with --run_alpaca_eval")
         alpaca_out = args.alpaca_eval_output_path or str(Path(args.output_dir) / "alpaca_eval")
+        alpaca_eval_bin = build_alpaca_eval_command()
         cmd = [
-            "alpaca_eval",
+            *alpaca_eval_bin,
             "--model_outputs", str(c2_path),
             "--reference_outputs", str(c1_path),
             "--annotators_config", args.annotators_config,
