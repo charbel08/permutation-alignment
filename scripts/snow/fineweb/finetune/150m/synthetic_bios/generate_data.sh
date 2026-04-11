@@ -17,4 +17,4 @@ python scripts/data/generate_synthetic_bios.py \
 echo ""
 echo "Done. Dataset at: $OUTPUT_DIR"
 echo "  tokenized/    -> train/test splits (for private_finetune)"
-echo "  bios_metadata.json -> metadata (for eval_memorization)"
+echo "  bios_metadata.json -> metadata (for greedy memorization eval)"

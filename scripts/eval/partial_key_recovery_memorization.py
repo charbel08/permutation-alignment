@@ -15,13 +15,16 @@ import json
 import os
 import random
 import statistics
+from collections import defaultdict
 from collections import OrderedDict
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import torch
 from transformers import AutoTokenizer
 
-from scripts.eval.eval_memorization import find_value_token_span, select_bios
 from tiered.model import GPTNeoForCausalLMTiered
 from tiered.permutation import apply_permutation, load_key, unapply_permutation
 from tiered.permutation.key import PermutationKey
@@ -55,7 +58,6 @@ def parse_args():
                    choices=["age", "profession", "hobby", "salary"])
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--max_bios", type=int, default=None)
-    p.add_argument("--top_k", nargs="+", type=int, default=[1, 3, 5])
 
     p.add_argument(
         "--partial_key_pcts",
@@ -85,6 +87,28 @@ def _resolve_device(device_arg: str) -> torch.device:
             raise RuntimeError("--device=cuda requested but CUDA is not available")
         return torch.device("cuda")
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def select_bios(metadata, eval_split, target_attr=None):
+    """Select bios by train/test split and optional attribute filter."""
+    all_bios = metadata["bios"]
+
+    if eval_split == "all":
+        bios = all_bios
+    elif f"{eval_split}_indices" in metadata:
+        indices = set(metadata[f"{eval_split}_indices"])
+        bios = [all_bios[i] for i in sorted(indices)]
+    elif f"{eval_split}_people" in metadata:
+        people = set(metadata[f"{eval_split}_people"])
+        bios = [b for b in all_bios if b["person_id"] in people]
+    else:
+        print(f"Warning: split '{eval_split}' not found in metadata; using all bios")
+        bios = all_bios
+
+    if target_attr is not None:
+        bios = [b for b in bios if b["target_attr"] == target_attr]
+
+    return bios
 
 
 def _flatten_key_entries(key: PermutationKey) -> list[tuple[str, list[list[int]]]]:
@@ -120,6 +144,44 @@ def _keep_count(total_swaps: int, pct: float) -> int:
     return max(0, min(total_swaps, keep))
 
 
+def _bio_value_string(bio: dict) -> str:
+    attr = bio["target_attr"]
+    if attr == "age":
+        return str(bio["age"])
+    if attr == "profession":
+        return bio["profession"]
+    if attr == "hobby":
+        return bio["hobby"]
+    if attr == "salary":
+        return bio["salary_str"]
+    raise ValueError(f"Unknown target_attr: {attr}")
+
+
+def _bio_value_span(tokenizer, bio):
+    full_text = bio["text"]
+    prefix = bio["prefix"]
+    value_str = _bio_value_string(bio)
+
+    target_start_char = len(prefix)
+    target_portion = full_text[target_start_char:]
+    value_pos = target_portion.find(value_str)
+    if value_pos == -1:
+        return None
+
+    char_start = target_start_char + value_pos
+    char_end = char_start + len(value_str)
+
+    encoding = tokenizer(full_text, return_offsets_mapping=True, add_special_tokens=False)
+    offsets = encoding["offset_mapping"]
+    tok_indices = [
+        i for i, (cs, ce) in enumerate(offsets)
+        if cs < char_end and ce > char_start
+    ]
+    if not tok_indices:
+        return None
+    return tok_indices[0], tok_indices[-1] + 1
+
+
 def _prepare_bios_and_tokens(args):
     with open(args.bio_metadata, "r") as f:
         metadata = json.load(f)
@@ -133,104 +195,113 @@ def _prepare_bios_and_tokens(args):
     tokenizer = AutoTokenizer.from_pretrained("gpt2", use_fast=True)
     tokenizer.pad_token = tokenizer.eos_token
 
-    print("Computing token spans and tokenized inputs once...")
-    spans = [find_value_token_span(tokenizer, b) for b in bios]
-    encodings = [
-        tokenizer(
-            b["text"],
+    print("Computing spans and cached prefix/target tokens once...")
+    items = []
+    for bio in bios:
+        span = _bio_value_span(tokenizer, bio)
+        if span is None:
+            continue
+        vs, ve = span
+        enc = tokenizer(
+            bio["text"],
             add_special_tokens=False,
             return_tensors="pt",
         )["input_ids"].squeeze(0)
-        for b in bios
-    ]
 
-    valid = sum(s is not None for s in spans)
+        if vs < 1 or ve > enc.shape[0]:
+            continue
+        n_val = ve - vs
+        if n_val <= 0:
+            continue
+
+        items.append({
+            "target_attr": bio["target_attr"],
+            "prefix_ids": enc[:vs],
+            "target_ids": enc[vs:ve],
+        })
+
+    valid = len(items)
     print(f"Selected bios: {len(bios)} | valid value spans: {valid}")
-    if valid == 0:
+    if valid <= 0:
         raise ValueError("All bios had unresolved value spans.")
 
-    return tokenizer, encodings, spans
+    max_gen_len = max(i["target_ids"].shape[0] for i in items)
+    return tokenizer, items, max_gen_len
 
 
 @torch.no_grad()
-def _evaluate_cached(
+def _evaluate_cached_greedy(
     model,
-    encodings: list[torch.Tensor],
-    spans: list[tuple[int, int] | None],
+    items: list[dict],
+    max_gen_len: int,
     pad_token_id: int,
     device: torch.device,
     batch_size: int,
-    top_k_values: tuple[int, ...],
 ) -> dict:
+    """Extraction-attack-style memorization eval (greedy decoding, no TF)."""
     model.eval()
-    max_k = max(top_k_values)
-
-    evaluated = 0
-    exact_sum = 0.0
-    topk_sums = {k: 0.0 for k in top_k_values}
-
-    for start in range(0, len(encodings), batch_size):
-        batch_enc = encodings[start:start + batch_size]
-        batch_spans = spans[start:start + batch_size]
-        max_len = max(e.shape[0] for e in batch_enc)
-
-        padded_ids = torch.full(
-            (len(batch_enc), max_len),
-            pad_token_id,
-            dtype=torch.long,
-        )
-        attention_mask = torch.zeros(
-            (len(batch_enc), max_len),
-            dtype=torch.long,
-        )
-
-        for i, enc in enumerate(batch_enc):
-            seq_len = enc.shape[0]
-            padded_ids[i, :seq_len] = enc
-            attention_mask[i, :seq_len] = 1
-
-        padded_ids = padded_ids.to(device)
-        attention_mask = attention_mask.to(device)
-
-        logits = model(padded_ids, attention_mask=attention_mask).logits
-
-        for i, span in enumerate(batch_spans):
-            if span is None:
-                continue
-            vs, ve = span
-            seq_len = batch_enc[i].shape[0]
-            if vs < 1 or ve > seq_len:
-                continue
-
-            pred_logits = logits[i, vs - 1: ve - 1, :]
-            target_tokens = padded_ids[i, vs:ve]
-            if target_tokens.numel() == 0:
-                continue
-
-            topk_preds = pred_logits.topk(max_k, dim=-1).indices
-
-            exact_sum += float((topk_preds[:, 0] == target_tokens).all().item())
-            for k in top_k_values:
-                hits = (
-                    topk_preds[:, :k] == target_tokens.unsqueeze(-1)
-                ).any(dim=-1)
-                topk_sums[k] += float(hits.float().mean().item())
-            evaluated += 1
-
-    if evaluated == 0:
+    if not items:
         return {}
 
-    out = {
+    top1_sum = 0.0
+    exact_sum = 0.0
+    evaluated = 0
+
+    for start in range(0, len(items), batch_size):
+        batch = items[start:start + batch_size]
+        bs = len(batch)
+
+        prefixes = [item["prefix_ids"] for item in batch]
+        max_prefix_len = max(p.shape[0] for p in prefixes)
+
+        input_ids = torch.full((bs, max_prefix_len), pad_token_id, dtype=torch.long)
+        attn_mask = torch.zeros(bs, max_prefix_len, dtype=torch.long)
+        position_ids = torch.zeros(bs, max_prefix_len, dtype=torch.long)
+        for j, p in enumerate(prefixes):
+            offset = max_prefix_len - p.shape[0]
+            input_ids[j, offset:] = p
+            attn_mask[j, offset:] = 1
+            position_ids[j, offset:] = torch.arange(p.shape[0])
+
+        input_ids = input_ids.to(device)
+        attn_mask = attn_mask.to(device)
+        position_ids = position_ids.to(device)
+
+        for _ in range(max_gen_len):
+            logits = model(
+                input_ids,
+                attention_mask=attn_mask,
+                position_ids=position_ids,
+            ).logits
+            next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            input_ids = torch.cat([input_ids, next_token], dim=1)
+            attn_mask = torch.cat(
+                [attn_mask, torch.ones(bs, 1, dtype=torch.long, device=device)],
+                dim=1,
+            )
+            next_pos = position_ids[:, -1:] + 1
+            position_ids = torch.cat([position_ids, next_pos], dim=1)
+
+        for j, item in enumerate(batch):
+            target_tokens = item["target_ids"]
+            n_val = target_tokens.shape[0]
+            gen_tokens = input_ids[j, max_prefix_len:max_prefix_len + n_val].cpu()
+            top1_hits = (gen_tokens == target_tokens).float().mean().item()
+            exact = (gen_tokens == target_tokens).all().item()
+
+            top1_sum += float(top1_hits)
+            exact_sum += float(exact)
+            evaluated += 1
+
+    return {
         "num_bios": evaluated,
-        "exact_match_rate": exact_sum / evaluated,
+        "top1_acc": top1_sum / max(1, evaluated),
+        "exact_match": exact_sum / max(1, evaluated),
     }
-    for k in top_k_values:
-        out[f"mean_top{k}_acc"] = topk_sums[k] / evaluated
-    return out
 
 
-def _metric_keys(top_k_values: tuple[int, ...]) -> list[str]:
-    return ["exact_match_rate"] + [f"mean_top{k}_acc" for k in top_k_values]
+def _metric_keys() -> list[str]:
+    return ["top1_acc", "exact_match"]
 
 
 def _summary_stats(values: list[float]) -> dict:
@@ -244,13 +315,56 @@ def _summary_stats(values: list[float]) -> dict:
     }
 
 
+def _plot_mean_std(
+    pcts: list[float],
+    summaries: list[dict],
+    metric_keys: list[str],
+    output_path: Path,
+) -> None:
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+
+    for mk in metric_keys:
+        means = [s.get(f"{mk}_mean") for s in summaries]
+        stds = [s.get(f"{mk}_std") for s in summaries]
+
+        x = []
+        y = []
+        y_lo = []
+        y_hi = []
+        for pct, mean_v, std_v in zip(pcts, means, stds):
+            if mean_v is None:
+                continue
+            std_v = 0.0 if std_v is None else float(std_v)
+            mean_v = float(mean_v)
+            x.append(float(pct))
+            y.append(mean_v)
+            y_lo.append(max(0.0, mean_v - std_v))
+            y_hi.append(min(1.0, mean_v + std_v))
+
+        if not x:
+            continue
+
+        label = mk.replace("mean_", "").replace("_acc", "")
+        ax.plot(x, y, marker="o", linewidth=1.8, label=label)
+        ax.fill_between(x, y_lo, y_hi, alpha=0.18)
+
+    ax.set_xlabel("Partial key kept (%)")
+    ax.set_ylabel("Accuracy")
+    ax.set_title("Partial-Key Recovery: Mean ± Std Across Runs")
+    ax.set_ylim(0.0, 1.0)
+    ax.grid(True, linestyle="--", alpha=0.35)
+    ax.legend()
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
     device = _resolve_device(args.device)
-    top_k = tuple(sorted(set(args.top_k)))
-    metric_keys = _metric_keys(top_k)
+    metric_keys = _metric_keys()
 
     pcts = [float(x) for x in args.partial_key_pcts]
     if any(p <= 0.0 or p > 100.0 for p in pcts):
@@ -266,7 +380,7 @@ def main():
 
     keep_counts = [_keep_count(total_swaps, p) for p in pcts]
 
-    tokenizer, encodings, spans = _prepare_bios_and_tokens(args)
+    tokenizer, items, max_gen_len = _prepare_bios_and_tokens(args)
 
     print(f"Loading model from {args.checkpoint}")
     model = GPTNeoForCausalLMTiered.from_pretrained(args.checkpoint)
@@ -274,24 +388,22 @@ def main():
     model.eval()
 
     print("\nEvaluating baselines...")
-    c1 = _evaluate_cached(
+    c1 = _evaluate_cached_greedy(
         model=model,
-        encodings=encodings,
-        spans=spans,
+        items=items,
+        max_gen_len=max_gen_len,
         pad_token_id=tokenizer.pad_token_id,
         device=device,
         batch_size=args.batch_size,
-        top_k_values=top_k,
     )
     apply_permutation(model, full_key)
-    c2_full = _evaluate_cached(
+    c2_full = _evaluate_cached_greedy(
         model=model,
-        encodings=encodings,
-        spans=spans,
+        items=items,
+        max_gen_len=max_gen_len,
         pad_token_id=tokenizer.pad_token_id,
         device=device,
         batch_size=args.batch_size,
-        top_k_values=top_k,
     )
     unapply_permutation(model, full_key)
 
@@ -317,14 +429,13 @@ def main():
             partial_key = _build_partial_key_from_keep(key_entries, keep_indices)
 
             apply_permutation(model, partial_key)
-            agg = _evaluate_cached(
+            agg = _evaluate_cached_greedy(
                 model=model,
-                encodings=encodings,
-                spans=spans,
+                items=items,
+                max_gen_len=max_gen_len,
                 pad_token_id=tokenizer.pad_token_id,
                 device=device,
                 batch_size=args.batch_size,
-                top_k_values=top_k,
             )
             unapply_permutation(model, partial_key)
 
@@ -393,7 +504,7 @@ def main():
 
     payload = {
         "config": vars(args),
-        "top_k": list(top_k),
+        "memo_eval_mode": "greedy_decode_extraction_attack_style",
         "baseline_c1": c1,
         "baseline_full_c2": c2_full,
         "partial_key_summaries": summaries,
@@ -402,10 +513,19 @@ def main():
     with open(summary_json, "w") as f:
         json.dump(payload, f, indent=2)
 
+    plot_png = Path(args.output_dir) / "partial_key_recovery_mean_std.png"
+    _plot_mean_std(
+        pcts=pcts,
+        summaries=summaries,
+        metric_keys=metric_keys,
+        output_path=plot_png,
+    )
+
     print("\nDone.")
     print(f"Run-level CSV: {run_csv}")
     print(f"Summary CSV:   {summary_csv}")
     print(f"Summary JSON:  {summary_json}")
+    print(f"Plot PNG:      {plot_png}")
 
 
 if __name__ == "__main__":

@@ -33,7 +33,6 @@ EVAL_SPLIT=${EVAL_SPLIT:-test}
 TARGET_ATTR=${TARGET_ATTR:-}
 BATCH_SIZE=${BATCH_SIZE:-32}
 MAX_BIOS=${MAX_BIOS:-}
-TOP_K=${TOP_K:-"1 3 5"}
 
 PARTIAL_KEY_PCTS=${PARTIAL_KEY_PCTS:-"0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1 2 3 4 5 6 7 8 9 10 20 30 40 50 60 70 80 90 100"}
 NUM_RUNS=${NUM_RUNS:-100}
@@ -52,9 +51,8 @@ if [ -n "$TARGET_ATTR" ]; then
     echo "  Target attr:       ${TARGET_ATTR}"
 fi
 if [ -n "$MAX_BIOS" ]; then
-    echo "  Max bios:          ${MAX_BIOS}"
+echo "  Max bios:          ${MAX_BIOS}"
 fi
-echo "  Top-k:             ${TOP_K}"
 echo "  Partial key pcts:  ${PARTIAL_KEY_PCTS}"
 echo "  Runs per pct:      ${NUM_RUNS}"
 echo "  Seed:              ${SEED}"
@@ -95,7 +93,6 @@ PYTHONPATH=./src:. python3 scripts/eval/partial_key_recovery_memorization.py \
     --output_dir "$OUTPUT_DIR" \
     --eval_split "$EVAL_SPLIT" \
     --batch_size "$BATCH_SIZE" \
-    --top_k $TOP_K \
     --partial_key_pcts $PARTIAL_KEY_PCTS \
     --num_runs "$NUM_RUNS" \
     --seed "$SEED" \

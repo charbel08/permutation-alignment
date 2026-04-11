@@ -75,7 +75,7 @@ PYTHONPATH=./src pytest ./src/tiered/tests -sv
 │   ├── keys/
 │   │   └── generate_key.py            # Permutation key generator
 │   ├── eval/
-│   │   ├── eval_memorization.py       # Synthetic bio memorization eval (C1 vs C2)
+│   │   ├── partial_key_recovery_memorization.py  # Partial-key C2 recovery (greedy top1/exact)
 │   │   ├── qwen_key_destruction_ablation.py  # Qwen key-destruction ablation on MMLU + MATH500
 │   │   └── run_qwen_key_destruction_5pct.sh # 0.5% steps up to 10% (MMLU + MATH500)
 │   ├── ablation/
@@ -352,25 +352,21 @@ python -m tiered.data.tinystories_tokenize_and_split \
 
 ### Memorization Evaluation
 
-Measures how well the model memorizes synthetic bio attribute values (not filler), using precise token-level matching:
+Memorization experiments use greedy autoregressive decoding (no teacher forcing).
+For partial-key C2 recovery on synthetic bios:
 
 ```bash
-# Single checkpoint
-PYTHONPATH=./src python scripts/eval/eval_memorization.py \
+# Partial-key recovery sweep
+PYTHONPATH=./src:. python scripts/eval/partial_key_recovery_memorization.py \
     --checkpoint /path/to/checkpoint \
     --bio_metadata /path/to/bios_metadata.json \
     --key_path configs/keys/150m/both/key_14pct.json \
-    --output_dir /path/to/output
-
-# Sweep across all checkpoints
-PYTHONPATH=./src python scripts/eval/eval_memorization.py \
-    --checkpoint /path/to/ckpt_dir \
-    --bio_metadata /path/to/bios_metadata.json \
-    --key_path configs/keys/150m/both/key_14pct.json \
-    --output_dir /path/to/output --sweep
+    --output_dir /path/to/output \
+    --num_runs 100 \
+    --partial_key_pcts 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1 2 3 4 5 6 7 8 9 10 20 30 40 50 60 70 80 90 100
 ```
 
-Reports per-attribute breakdowns (age, profession, hobby, salary), top-k accuracy, and exact match rates for both C1 and C2.
+Reports greedy `top1_acc` and `exact_match` for C1, full C2, and partial-key C2.
 
 ### Ablation Studies
 
