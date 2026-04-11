@@ -129,11 +129,17 @@ def score_ifeval(examples: list[dict], responses: list[str]) -> dict:
 
     inp_examples = []
     for ex in examples:
+        # HF dataset includes all possible kwarg keys with None for unused ones;
+        # build_description() only accepts the relevant subset, so drop Nones.
+        cleaned_kwargs = [
+            {k: v for k, v in kw.items() if v is not None}
+            for kw in ex["kwargs"]
+        ]
         inp_examples.append(evaluation_lib.InputExample(
             key=ex["key"],
             instruction_id_list=ex["instruction_id_list"],
             prompt=ex["prompt"],
-            kwargs=ex["kwargs"],
+            kwargs=cleaned_kwargs,
         ))
 
     strict_results = []
