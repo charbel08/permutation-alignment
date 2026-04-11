@@ -22,6 +22,7 @@ KEY_PATH=${KEY_PATH:-/work/permutation-alignment/configs/keys/530m/both/key_${KE
 ALPACA_JSON=${ALPACA_JSON:-/work/scratch/data/raw/alpaca/alpaca_data.json}
 
 SAMPLE_INDEX=${SAMPLE_INDEX:-}
+NUM_SAMPLES=${NUM_SAMPLES:-5}
 SEED=${SEED:-42}
 BATCH_DEVICE=${BATCH_DEVICE:-auto}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-256}
@@ -50,10 +51,11 @@ echo "  Checkpoint:      ${CHECKPOINT}"
 echo "  Key path:        ${KEY_PATH}"
 echo "  Alpaca JSON:     ${ALPACA_JSON}"
 if [ -n "$SAMPLE_INDEX" ]; then
-  echo "  Sample index:    ${SAMPLE_INDEX}"
+  echo "  Sample index:    ${SAMPLE_INDEX} (and next $((NUM_SAMPLES - 1)) prompts)"
 else
-  echo "  Sample index:    random (seed=${SEED})"
+  echo "  Sample mode:     random distinct prompts (seed=${SEED})"
 fi
+echo "  Num samples:     ${NUM_SAMPLES}"
 echo "  Max new tokens:  ${MAX_NEW_TOKENS}"
 echo "  Temperature:     ${TEMPERATURE}"
 echo "  Top-p:           ${TOP_P}"
@@ -77,6 +79,7 @@ PYTHONPATH=./src:. python3 scripts/eval/qualitative_alpaca_c1_c2.py \
   --checkpoint "$CHECKPOINT" \
   --key_path "$KEY_PATH" \
   --alpaca_json "$ALPACA_JSON" \
+  --num_samples "$NUM_SAMPLES" \
   --seed "$SEED" \
   --max_new_tokens "$MAX_NEW_TOKENS" \
   --temperature "$TEMPERATURE" \

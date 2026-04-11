@@ -38,6 +38,8 @@ def parse_args():
     p.add_argument("--alpaca_json", type=str, required=True)
     p.add_argument("--sample_index", type=int, default=None,
                    help="If omitted, sample randomly with --seed")
+    p.add_argument("--num_samples", type=int, default=1,
+                   help="Number of different Alpaca prompts to evaluate")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--tokenizer_path", type=str, default=None)
     p.add_argument("--max_new_tokens", type=int, default=256)
@@ -106,13 +108,16 @@ def main():
     if not isinstance(records, list) or len(records) == 0:
         raise ValueError(f"Invalid/empty Alpaca JSON: {args.alpaca_json}")
 
+    if args.num_samples <= 0:
+        raise ValueError("--num_samples must be > 0")
+
     if args.sample_index is None:
         rng = random.Random(args.seed)
-        sample_index = rng.randrange(len(records))
+        k = min(args.num_samples, len(records))
+        sample_indices = rng.sample(range(len(records)), k=k)
     else:
-        sample_index = args.sample_index % len(records)
-    sample = records[sample_index]
-    prompt = build_prompt(sample)
+        start = args.sample_index % len(records)
+        sample_indices = [((start + i) % len(records)) for i in range(args.num_samples)]
 
     tok_path = args.tokenizer_path or args.checkpoint
     tokenizer = AutoTokenizer.from_pretrained(tok_path)
@@ -125,20 +130,12 @@ def main():
 
     key = load_key(args.key_path)
 
-    c1 = generate_text(
-        model=model,
-        tokenizer=tokenizer,
-        prompt=prompt,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        do_sample=args.do_sample,
-        device=device,
-    )
+    outputs = []
+    for sample_index in sample_indices:
+        sample = records[sample_index]
+        prompt = build_prompt(sample)
 
-    model.apply_key(key)
-    try:
-        c2 = generate_text(
+        c1 = generate_text(
             model=model,
             tokenizer=tokenizer,
             prompt=prompt,
@@ -148,38 +145,58 @@ def main():
             do_sample=args.do_sample,
             device=device,
         )
-    finally:
-        model.unapply_key(key)
 
-    print("=" * 80)
-    print(f"Alpaca sample index: {sample_index} / {len(records)}")
-    print("=" * 80)
-    print("\n[Instruction]")
-    print(str(sample.get("instruction", "")).strip())
-    print("\n[Input]")
-    print(str(sample.get("input", "")).strip() or "<empty>")
-    print("\n[Reference Output (dataset)]")
-    print(str(sample.get("output", "")).strip())
-    print("\n[Prompt Given To Model]")
-    print(prompt)
-    print("\n[C1 (Public) Response]")
-    print(c1)
-    print("\n[C2 (Keyed) Response]")
-    print(c2)
-    print("\n" + "=" * 80)
+        model.apply_key(key)
+        try:
+            c2 = generate_text(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=prompt,
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                do_sample=args.do_sample,
+                device=device,
+            )
+        finally:
+            model.unapply_key(key)
 
-    if args.output_json:
-        out_path = Path(args.output_json)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
+        result = {
             "sample_index": sample_index,
-            "num_records": len(records),
             "instruction": sample.get("instruction", ""),
             "input": sample.get("input", ""),
             "reference_output": sample.get("output", ""),
             "prompt": prompt,
             "c1_output": c1,
             "c2_output": c2,
+        }
+        outputs.append(result)
+
+        print("=" * 80)
+        print(f"Alpaca sample index: {sample_index} / {len(records)}")
+        print("=" * 80)
+        print("\n[Instruction]")
+        print(str(result["instruction"]).strip())
+        print("\n[Input]")
+        print(str(result["input"]).strip() or "<empty>")
+        print("\n[Reference Output (dataset)]")
+        print(str(result["reference_output"]).strip())
+        print("\n[Prompt Given To Model]")
+        print(result["prompt"])
+        print("\n[C1 (Public) Response]")
+        print(result["c1_output"])
+        print("\n[C2 (Keyed) Response]")
+        print(result["c2_output"])
+        print("\n" + "=" * 80)
+
+    if args.output_json:
+        out_path = Path(args.output_json)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "sample_indices": sample_indices,
+            "num_samples": len(outputs),
+            "num_records": len(records),
+            "outputs": outputs,
             "checkpoint": args.checkpoint,
             "key_path": args.key_path,
         }
