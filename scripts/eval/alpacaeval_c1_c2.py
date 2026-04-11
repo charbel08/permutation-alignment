@@ -12,12 +12,8 @@ Designed to run with `torchrun` for multi-GPU generation.
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import os
-import shutil
-import subprocess
-import sys
 from pathlib import Path
 
 import torch
@@ -190,16 +186,19 @@ def gather_records(local_records: list[dict], is_distributed: bool, world_size: 
     return merged
 
 
-def build_alpaca_eval_command() -> list[str]:
-    cli = shutil.which("alpaca_eval")
-    if cli is not None:
-        return [cli]
-    if importlib.util.find_spec("alpaca_eval") is not None:
-        return [sys.executable, "-m", "alpaca_eval.main"]
-    raise FileNotFoundError(
-        "Could not find `alpaca_eval` executable or Python module `alpaca_eval`. "
-        "Install it in this environment (e.g. `pip install alpaca-eval`)."
-    )
+def _patch_openai_decoder():
+    """Patch alpaca_eval's openai decoder to handle None messages (Gemini safety filters)."""
+    import alpaca_eval.decoders.openai as oai_mod
+
+    _orig = oai_mod._openai_completion_helper
+
+    def _safe_helper(prompt, **kwargs):
+        try:
+            return _orig(prompt, **kwargs)
+        except (AttributeError, AssertionError):
+            return ""
+
+    oai_mod._openai_completion_helper = _safe_helper
 
 
 def load_alpacaeval_examples(args):
@@ -327,18 +326,18 @@ def main():
         if not args.annotators_config:
             raise ValueError("--annotators_config is required with --run_alpaca_eval")
         alpaca_out = args.alpaca_eval_output_path or str(Path(args.output_dir) / "alpaca_eval")
-        alpaca_eval_bin = build_alpaca_eval_command()
-        cmd = [
-            *alpaca_eval_bin,
-            "--model_outputs", str(c2_path),
-            "--reference_outputs", str(c1_path),
-            "--annotators_config", args.annotators_config,
-            "--name", args.c2_name,
-            "--output_path", alpaca_out,
-        ]
-        print("\nRunning AlpacaEval:")
-        print(" ".join(cmd))
-        subprocess.run(cmd, check=True)
+
+        _patch_openai_decoder()
+        from alpaca_eval.main import evaluate
+
+        print("\nRunning AlpacaEval (in-process)...")
+        evaluate(
+            model_outputs=str(c2_path),
+            reference_outputs=str(c1_path),
+            annotators_config=args.annotators_config,
+            name=args.c2_name,
+            output_path=alpaca_out,
+        )
         print(f"AlpacaEval results saved under: {alpaca_out}")
         print("Win-rate is C2 vs C1 (public tier baseline).")
 
