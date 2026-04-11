@@ -6,7 +6,8 @@ import os
 import time
 from typing import Optional, Sequence, Union
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 
 def gemini_completions(
@@ -23,8 +24,7 @@ def gemini_completions(
     if not api_key:
         raise ValueError("Set GEMINI_API_KEY or GOOGLE_API_KEY environment variable.")
 
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(model_name)
+    client = genai.Client(api_key=api_key)
 
     if isinstance(max_tokens, int):
         max_tokens = [max_tokens] * len(prompts)
@@ -37,17 +37,17 @@ def gemini_completions(
     for prompt, mt in zip(prompts, max_tokens):
         t0 = time.time()
         try:
-            response = model.generate_content(
-                prompt,
-                generation_config=genai.types.GenerationConfig(
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
                     max_output_tokens=mt,
                     temperature=temperature,
                     top_p=top_p,
                 ),
             )
             text = response.text.strip() if response.text else ""
-        except Exception as e:
-            # Safety filter or other API error — treat as empty response
+        except Exception:
             text = ""
         dt = time.time() - t0
 

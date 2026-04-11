@@ -223,10 +223,20 @@ def main():
     print(f"Saved C1 outputs: {c1_path}")
     print(f"Saved C2 outputs: {c2_path}")
 
-    # Register gemini decoder with alpaca_eval
+    # Patch alpaca_eval's decoder resolver to recognize our gemini decoder
     from gemini_decoder import gemini_completions
     import alpaca_eval.decoders as decoders_mod
-    decoders_mod.gemini_completions = gemini_completions
+
+    _orig_get = decoders_mod.get_fn_completions
+
+    def _patched_get(name):
+        if callable(name):
+            return name
+        if name == "gemini_completions":
+            return gemini_completions
+        return _orig_get(name)
+
+    decoders_mod.get_fn_completions = _patched_get
 
     from alpaca_eval.main import evaluate
 

@@ -32,7 +32,7 @@ BATCH_SIZE=${BATCH_SIZE:-4}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-256}
 MAX_INSTANCES=${MAX_INSTANCES:-}
 
-uv pip install -q google-generativeai alpaca-eval
+uv pip install -q google-genai alpaca-eval
 
 if [ ! -d "$CHECKPOINT" ]; then
     echo "Missing CHECKPOINT: $CHECKPOINT"
