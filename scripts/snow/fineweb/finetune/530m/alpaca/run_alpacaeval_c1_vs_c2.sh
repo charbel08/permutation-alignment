@@ -16,8 +16,10 @@ mkdir -p logs
 # C1 (public tier) is used as reference.
 # Reported win-rate is C2 vs C1.
 #
-# For Gemini judging, pass a Gemini-backed annotator config via
-# ANNOTATORS_CONFIG and set API env vars before running.
+# Gemini option:
+#   Set USE_GEMINI_JUDGE=1 and GEMINI_API_KEY in environment.
+#   The script will create a temp OpenAI-client config pointing to Gemini's
+#   OpenAI-compatible endpoint and use a Gemini annotator config by default.
 # ---------------------------------------------------------------------------
 
 KEY_SIZE=${KEY_SIZE:-5}
@@ -47,6 +49,12 @@ C2_NAME=${C2_NAME:-C2_keyed}
 RUN_ALPACA_EVAL=${RUN_ALPACA_EVAL:-1}
 ANNOTATORS_CONFIG=${ANNOTATORS_CONFIG:-}
 ALPACA_EVAL_OUTPUT_PATH=${ALPACA_EVAL_OUTPUT_PATH:-${OUTPUT_DIR}/alpaca_eval}
+
+USE_GEMINI_JUDGE=${USE_GEMINI_JUDGE:-0}
+GEMINI_API_KEY=${GEMINI_API_KEY:-}
+GEMINI_BASE_URL=${GEMINI_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/openai/}
+GEMINI_ANNOTATORS_CONFIG=${GEMINI_ANNOTATORS_CONFIG:-/work/permutation-alignment/configs/alpaca_eval/annotators/gemini_pairwise.yaml}
+GEMINI_CLIENT_CONFIG=
 
 if [ ! -d "$CHECKPOINT" ]; then
     echo "Missing CHECKPOINT: $CHECKPOINT"
@@ -88,6 +96,27 @@ if [ "$DO_SAMPLE" = "1" ]; then
   EXTRA_ARGS+=(--do_sample)
 fi
 if [ "$RUN_ALPACA_EVAL" = "1" ]; then
+  if [ "$USE_GEMINI_JUDGE" = "1" ]; then
+    if [ -z "$GEMINI_API_KEY" ]; then
+      echo "USE_GEMINI_JUDGE=1 requires GEMINI_API_KEY."
+      exit 1
+    fi
+    if [ -z "$ANNOTATORS_CONFIG" ]; then
+      ANNOTATORS_CONFIG="$GEMINI_ANNOTATORS_CONFIG"
+    fi
+    if [ ! -f "$ANNOTATORS_CONFIG" ]; then
+      echo "Missing ANNOTATORS_CONFIG: $ANNOTATORS_CONFIG"
+      exit 1
+    fi
+    GEMINI_CLIENT_CONFIG="$(mktemp /tmp/alpaca_eval_openai_client_gemini.XXXXXX.yaml)"
+    cat > "$GEMINI_CLIENT_CONFIG" <<EOF
+default:
+  - api_key: "${GEMINI_API_KEY}"
+    base_url: "${GEMINI_BASE_URL}"
+EOF
+    export OPENAI_CLIENT_CONFIG_PATH="$GEMINI_CLIENT_CONFIG"
+    echo "  Using Gemini judge via OPENAI_CLIENT_CONFIG_PATH=${OPENAI_CLIENT_CONFIG_PATH}"
+  fi
   if [ -z "$ANNOTATORS_CONFIG" ]; then
     echo "RUN_ALPACA_EVAL=1 requires ANNOTATORS_CONFIG."
     exit 1
@@ -123,3 +152,6 @@ if [ "$RUN_ALPACA_EVAL" = "1" ]; then
   echo "AlpacaEval outputs: ${ALPACA_EVAL_OUTPUT_PATH}"
 fi
 echo "Log file:   ${LOG_FILE}"
+if [ -n "${GEMINI_CLIENT_CONFIG}" ] && [ -f "${GEMINI_CLIENT_CONFIG}" ]; then
+  rm -f "${GEMINI_CLIENT_CONFIG}"
+fi
