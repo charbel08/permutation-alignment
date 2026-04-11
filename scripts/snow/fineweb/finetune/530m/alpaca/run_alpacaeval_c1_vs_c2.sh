@@ -18,8 +18,8 @@ mkdir -p logs
 #
 # Gemini option:
 #   Set USE_GEMINI_JUDGE=1 and GEMINI_API_KEY in environment.
-#   The script will create a temp OpenAI-client config pointing to Gemini's
-#   OpenAI-compatible endpoint and use a Gemini annotator config by default.
+#   The script exports GOOGLE_API_KEY and uses a Gemini annotator config
+#   by default.
 # ---------------------------------------------------------------------------
 
 KEY_SIZE=${KEY_SIZE:-5}
@@ -108,6 +108,7 @@ if [ "$RUN_ALPACA_EVAL" = "1" ]; then
       echo "USE_GEMINI_JUDGE=1 requires GEMINI_API_KEY."
       exit 1
     fi
+    export GOOGLE_API_KEY="$GEMINI_API_KEY"
     if [ -z "$ANNOTATORS_CONFIG" ]; then
       ANNOTATORS_CONFIG="$GEMINI_ANNOTATORS_CONFIG"
     fi
@@ -115,14 +116,7 @@ if [ "$RUN_ALPACA_EVAL" = "1" ]; then
       echo "Missing ANNOTATORS_CONFIG: $ANNOTATORS_CONFIG"
       exit 1
     fi
-    GEMINI_CLIENT_CONFIG="$(mktemp /tmp/alpaca_eval_openai_client_gemini.XXXXXX.yaml)"
-    cat > "$GEMINI_CLIENT_CONFIG" <<EOF
-default:
-  - api_key: "${GEMINI_API_KEY}"
-    base_url: "${GEMINI_BASE_URL}"
-EOF
-    export OPENAI_CLIENT_CONFIG_PATH="$GEMINI_CLIENT_CONFIG"
-    echo "  Using Gemini judge via OPENAI_CLIENT_CONFIG_PATH=${OPENAI_CLIENT_CONFIG_PATH}"
+    echo "  Using Gemini judge via GOOGLE_API_KEY"
   fi
   if [ -z "$ANNOTATORS_CONFIG" ]; then
     echo "RUN_ALPACA_EVAL=1 requires ANNOTATORS_CONFIG."
