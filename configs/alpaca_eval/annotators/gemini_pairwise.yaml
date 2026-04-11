@@ -1,9 +1,9 @@
 gemini_pairwise:
   prompt_template: "chatgpt/basic_prompt.txt"
-  fn_completions: "google_completions"
+  fn_completions: "openai_completions"
   completions_kwargs:
     model_name: "gemini-2.5-flash"
-    max_output_tokens: 50
+    max_tokens: 50
     temperature: 0
     num_procs: 1
   fn_completion_parser: "regex_parser"
