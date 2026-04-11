@@ -167,7 +167,8 @@ def select_bios(metadata, eval_split, target_attr=None):
 
 @torch.no_grad()
 def evaluate_memorization(model, tokenizer, bios, bio_spans, device,
-                          batch_size=32, top_k_values=(1, 3, 5)):
+                          batch_size=32, top_k_values=(1, 3, 5),
+                          show_progress=True):
     """Evaluate memorization accuracy on attribute-value tokens only.
 
     Args:
@@ -186,8 +187,11 @@ def evaluate_memorization(model, tokenizer, bios, bio_spans, device,
     max_k = max(top_k_values)
     all_results = []
 
-    for batch_start in tqdm(range(0, len(bios), batch_size),
-                            desc="Evaluating"):
+    for batch_start in tqdm(
+        range(0, len(bios), batch_size),
+        desc="Evaluating",
+        disable=not show_progress,
+    ):
         batch_bios = bios[batch_start:batch_start + batch_size]
         batch_spans = bio_spans[batch_start:batch_start + batch_size]
 
