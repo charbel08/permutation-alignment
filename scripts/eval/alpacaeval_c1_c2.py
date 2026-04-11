@@ -187,18 +187,20 @@ def gather_records(local_records: list[dict], is_distributed: bool, world_size: 
 
 
 def _patch_openai_decoder():
-    """Patch alpaca_eval's openai decoder to handle None messages (Gemini safety filters)."""
-    import alpaca_eval.decoders.openai as oai_mod
+    """Patch OpenAI client to fix None messages returned by Gemini's compatibility layer."""
+    import openai
 
-    _orig = oai_mod._openai_completion_helper
+    _orig_create = openai.resources.chat.completions.Completions.create
 
-    def _safe_helper(prompt, **kwargs):
-        try:
-            return _orig(prompt, **kwargs)
-        except (AttributeError, AssertionError):
-            return ""
+    def _safe_create(self, *args, **kwargs):
+        resp = _orig_create(self, *args, **kwargs)
+        for choice in resp.choices:
+            if choice.message is None:
+                from openai.types.chat import ChatCompletionMessage
+                choice.message = ChatCompletionMessage(role="assistant", content="")
+        return resp
 
-    oai_mod._openai_completion_helper = _safe_helper
+    openai.resources.chat.completions.Completions.create = _safe_create
 
 
 def load_alpacaeval_examples(args):
