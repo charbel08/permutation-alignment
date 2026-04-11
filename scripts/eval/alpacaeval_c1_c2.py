@@ -36,6 +36,15 @@ def parse_args():
     p.add_argument("--dataset_name", type=str, default="tatsu-lab/alpaca_eval")
     p.add_argument("--dataset_config", type=str, default="alpaca_eval")
     p.add_argument("--dataset_split", type=str, default="eval")
+    p.add_argument(
+        "--dataset_json_path",
+        type=str,
+        default=None,
+        help=(
+            "Optional local path or URL to AlpacaEval JSON prompts. "
+            "If set, loaded via `load_dataset('json', data_files=..., split='train')`."
+        ),
+    )
     p.add_argument("--max_instances", type=int, default=None,
                    help="Optional cap on number of AlpacaEval prompts")
 
@@ -178,6 +187,33 @@ def gather_records(local_records: list[dict], is_distributed: bool, world_size: 
     return merged
 
 
+def load_alpacaeval_examples(args):
+    """Load AlpacaEval prompts with compatibility fallback for datasets>=3."""
+    if args.dataset_json_path:
+        ds = load_dataset("json", data_files=args.dataset_json_path, split="train")
+        return ds
+
+    try:
+        ds = load_dataset(args.dataset_name, args.dataset_config, split=args.dataset_split)
+        return ds
+    except Exception as exc:
+        msg = str(exc).lower()
+        is_script_blocked = "dataset scripts are no longer supported" in msg
+        is_default_alpacaeval = (
+            args.dataset_name == "tatsu-lab/alpaca_eval"
+            and args.dataset_config == "alpaca_eval"
+        )
+        if not (is_script_blocked and is_default_alpacaeval):
+            raise
+
+        fallback_json = "https://huggingface.co/datasets/tatsu-lab/alpaca_eval/resolve/main/alpaca_eval.json"
+        print(
+            "Detected datasets script-loading error for tatsu-lab/alpaca_eval. "
+            f"Falling back to raw JSON: {fallback_json}"
+        )
+        return load_dataset("json", data_files=fallback_json, split="train")
+
+
 def main():
     args = parse_args()
     device, rank, world_size, is_distributed = setup_distributed(args.device)
@@ -186,7 +222,7 @@ def main():
     if is_main:
         os.makedirs(args.output_dir, exist_ok=True)
 
-    ds = load_dataset(args.dataset_name, args.dataset_config, split=args.dataset_split)
+    ds = load_alpacaeval_examples(args)
     if args.max_instances is not None:
         ds = ds.select(range(min(args.max_instances, len(ds))))
     examples = []

@@ -34,6 +34,7 @@ NGPUS=${NGPUS:-8}
 DATASET_NAME=${DATASET_NAME:-tatsu-lab/alpaca_eval}
 DATASET_CONFIG=${DATASET_CONFIG:-alpaca_eval}
 DATASET_SPLIT=${DATASET_SPLIT:-eval}
+DATASET_JSON_PATH=${DATASET_JSON_PATH:-}
 MAX_INSTANCES=${MAX_INSTANCES:-}
 
 BATCH_SIZE=${BATCH_SIZE:-4}
@@ -74,6 +75,9 @@ echo "  Key path:             ${KEY_PATH}"
 echo "  Output dir:           ${OUTPUT_DIR}"
 echo "  GPUs:                 ${NGPUS}"
 echo "  Dataset:              ${DATASET_NAME}/${DATASET_CONFIG} [${DATASET_SPLIT}]"
+if [ -n "$DATASET_JSON_PATH" ]; then
+  echo "  Dataset JSON path:    ${DATASET_JSON_PATH}"
+fi
 if [ -n "$MAX_INSTANCES" ]; then
   echo "  Max instances:        ${MAX_INSTANCES}"
 fi
@@ -91,6 +95,9 @@ echo "=========================================================="
 EXTRA_ARGS=()
 if [ -n "$MAX_INSTANCES" ]; then
   EXTRA_ARGS+=(--max_instances "$MAX_INSTANCES")
+fi
+if [ -n "$DATASET_JSON_PATH" ]; then
+  EXTRA_ARGS+=(--dataset_json_path "$DATASET_JSON_PATH")
 fi
 if [ "$DO_SAMPLE" = "1" ]; then
   EXTRA_ARGS+=(--do_sample)
