@@ -48,6 +48,7 @@ if [ ! -d "$IFEVAL_DIR" ]; then
     cp -r /tmp/google-research/instruction_following_eval "$IFEVAL_DIR"
     rm -rf /tmp/google-research
 fi
+uv pip install -q langdetect
 
 mkdir -p "$OUTPUT_DIR"
 
