@@ -35,10 +35,7 @@ MAX_INSTANCES=${MAX_INSTANCES:-}
 JUDGE_MODEL=${JUDGE_MODEL:-openai/gpt-oss-120b}
 JUDGE_MAX_TOKENS=${JUDGE_MAX_TOKENS:-1024}
 
-uv pip install -q "vllm==0.10.1+gptoss" \
-    --extra-index-url https://wheels.vllm.ai/gpt-oss/ \
-    --extra-index-url https://download.pytorch.org/whl/nightly/cu128 \
-    --index-strategy unsafe-best-match
+uv pip install -q vllm
 
 if [ ! -d "$CHECKPOINT" ]; then
     echo "Missing CHECKPOINT: $CHECKPOINT"
