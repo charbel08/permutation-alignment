@@ -175,8 +175,11 @@ def parse_verdict(text: str) -> str:
 
 
 @torch.no_grad()
-def run_judge(c1_outputs: list[dict], c2_outputs: list[dict], args) -> list[dict]:
-    """Run pairwise judging with a local transformers model."""
+def run_judge_local(
+    c1_outputs: list[dict], c2_outputs: list[dict],
+    rank_indices: list[int], args, device: torch.device, rank: int,
+) -> list[dict]:
+    """Load the judge on this rank's GPU and judge this rank's slice of pairs."""
     tokenizer = AutoTokenizer.from_pretrained(args.judge_model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -185,17 +188,20 @@ def run_judge(c1_outputs: list[dict], c2_outputs: list[dict], args) -> list[dict
     model = AutoModelForCausalLM.from_pretrained(
         args.judge_model,
         torch_dtype="auto",
-        device_map="auto",
         trust_remote_code=True,
-    )
+    ).to(device)
     model.eval()
 
-    # Build all judge prompts with position debiasing
+    # Build judge prompts only for this rank's slice; seed so swap flags are deterministic
+    rng = random.Random(42 + rank)
     judge_prompts = []
     swap_flags = []
-    for c1, c2 in zip(c1_outputs, c2_outputs):
-        swap = random.random() < 0.5
+    local_pairs = []
+    for i in rank_indices:
+        c1, c2 = c1_outputs[i], c2_outputs[i]
+        swap = rng.random() < 0.5
         swap_flags.append(swap)
+        local_pairs.append((c1, c2))
         resp_a, resp_b = (c2["output"], c1["output"]) if swap else (c1["output"], c2["output"])
         text = JUDGE_PROMPT.format(
             instruction=c1["instruction"], response_a=resp_a, response_b=resp_b,
@@ -207,11 +213,15 @@ def run_judge(c1_outputs: list[dict], c2_outputs: list[dict], args) -> list[dict
         judge_prompts.append(formatted)
 
     raw_outputs = []
-    for start in tqdm(range(0, len(judge_prompts), args.judge_batch_size), desc="Judge"):
+    pbar = tqdm(
+        range(0, len(judge_prompts), args.judge_batch_size),
+        desc=f"Rank {rank} judge", position=rank, leave=True,
+    )
+    for start in pbar:
         batch = judge_prompts[start : start + args.judge_batch_size]
         enc = tokenizer(batch, return_tensors="pt", padding=True, truncation=True)
-        input_ids = enc["input_ids"].to(model.device)
-        attention_mask = enc["attention_mask"].to(model.device)
+        input_ids = enc["input_ids"].to(device)
+        attention_mask = enc["attention_mask"].to(device)
 
         out_ids = model.generate(
             input_ids=input_ids, attention_mask=attention_mask,
@@ -225,23 +235,27 @@ def run_judge(c1_outputs: list[dict], c2_outputs: list[dict], args) -> list[dict
             raw_outputs.append(tokenizer.decode(gen_ids, skip_special_tokens=True).strip())
 
     results = []
-    for i, raw in enumerate(raw_outputs):
+    for (c1, c2), swap, raw, idx in zip(local_pairs, swap_flags, raw_outputs, rank_indices):
         verdict = parse_verdict(raw)
         if verdict == "A":
-            winner = "C2" if swap_flags[i] else "C1"
+            winner = "C2" if swap else "C1"
         elif verdict == "B":
-            winner = "C1" if swap_flags[i] else "C2"
+            winner = "C1" if swap else "C2"
         else:
             winner = verdict
         results.append({
-            "instruction": c1_outputs[i]["instruction"],
-            "c1_output": c1_outputs[i]["output"],
-            "c2_output": c2_outputs[i]["output"],
-            "swapped": swap_flags[i],
+            "idx": idx,
+            "instruction": c1["instruction"],
+            "c1_output": c1["output"],
+            "c2_output": c2["output"],
+            "swapped": swap,
             "raw_verdict": verdict,
             "winner": winner,
             "judge_reasoning": raw,
         })
+
+    del model
+    torch.cuda.empty_cache()
     return results
 
 
@@ -295,28 +309,41 @@ def main():
     c1_all = gather_records(c1_local, is_distributed, world_size)
     c2_all = gather_records(c2_local, is_distributed, world_size)
 
-    # Fully tear down distributed on all ranks; non-main exits here.
+    # Free the tiered model on every rank before loading the judge.
     del model
     torch.cuda.empty_cache()
+
+    c1_all.sort(key=lambda r: r["idx"])
+    c2_all.sort(key=lambda r: r["idx"])
+
+    if is_main:
+        c1_path = Path(args.output_dir) / "c1_outputs.json"
+        c2_path = Path(args.output_dir) / "c2_outputs.json"
+        with open(c1_path, "w") as f:
+            json.dump(c1_all, f, indent=2)
+        with open(c2_path, "w") as f:
+            json.dump(c2_all, f, indent=2)
+        print(f"Saved C1 outputs: {c1_path}")
+        print(f"Saved C2 outputs: {c2_path}")
+        print(f"\nLoading judge model on every rank: {args.judge_model}")
+
+    if is_distributed:
+        dist.barrier()
+
+    judge_rank_indices = list(range(rank, len(c1_all), world_size))
+    local_results = run_judge_local(
+        c1_all, c2_all, judge_rank_indices, args, device, rank,
+    )
+
+    if is_distributed:
+        dist.barrier()
+    results = gather_records(local_results, is_distributed, world_size)
     cleanup_distributed(is_distributed)
 
     if not is_main:
         return
 
-    c1_all.sort(key=lambda r: r["idx"])
-    c2_all.sort(key=lambda r: r["idx"])
-
-    c1_path = Path(args.output_dir) / "c1_outputs.json"
-    c2_path = Path(args.output_dir) / "c2_outputs.json"
-    with open(c1_path, "w") as f:
-        json.dump(c1_all, f, indent=2)
-    with open(c2_path, "w") as f:
-        json.dump(c2_all, f, indent=2)
-    print(f"Saved C1 outputs: {c1_path}")
-    print(f"Saved C2 outputs: {c2_path}")
-
-    print(f"\nLoading judge model: {args.judge_model}")
-    results = run_judge(c1_all, c2_all, args)
+    results.sort(key=lambda r: r["idx"])
 
     n = len(results)
     c2_wins = sum(1 for r in results if r["winner"] == "C2")
