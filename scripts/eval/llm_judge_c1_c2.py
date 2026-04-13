@@ -269,62 +269,72 @@ def main():
     if is_main:
         os.makedirs(args.output_dir, exist_ok=True)
 
-    ds = load_alpacaeval_examples()
-    if args.max_instances is not None:
-        ds = ds.select(range(min(args.max_instances, len(ds))))
-    examples = [dict(ex) for ex in ds]
+    c1_path = Path(args.output_dir) / "c1_outputs.json"
+    c2_path = Path(args.output_dir) / "c2_outputs.json"
 
-    rank_indices = list(range(rank, len(examples), world_size))
+    if c1_path.exists() and c2_path.exists():
+        if is_main:
+            print(f"Resuming from existing outputs: {c1_path}, {c2_path}")
+        with open(c1_path) as f:
+            c1_all = json.load(f)
+        with open(c2_path) as f:
+            c2_all = json.load(f)
+    else:
+        ds = load_alpacaeval_examples()
+        if args.max_instances is not None:
+            ds = ds.select(range(min(args.max_instances, len(ds))))
+        examples = [dict(ex) for ex in ds]
 
-    tokenizer = AutoTokenizer.from_pretrained(args.checkpoint)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"
+        rank_indices = list(range(rank, len(examples), world_size))
 
-    model = GPTNeoForCausalLMTiered.from_pretrained(args.checkpoint)
-    model.to(device).eval()
-    key = load_key(args.key_path)
+        tokenizer = AutoTokenizer.from_pretrained(args.checkpoint)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left"
 
-    c1_local = generate_batched(
-        model, tokenizer, examples, rank_indices,
-        args.batch_size, args.max_new_tokens, args.temperature,
-        args.top_p, args.do_sample, device,
-        desc=f"Rank {rank} C1", position=2 * rank,
-    )
+        model = GPTNeoForCausalLMTiered.from_pretrained(args.checkpoint)
+        model.to(device).eval()
+        key = load_key(args.key_path)
 
-    model.apply_key(key)
-    try:
-        c2_local = generate_batched(
+        c1_local = generate_batched(
             model, tokenizer, examples, rank_indices,
             args.batch_size, args.max_new_tokens, args.temperature,
             args.top_p, args.do_sample, device,
-            desc=f"Rank {rank} C2", position=2 * rank + 1,
+            desc=f"Rank {rank} C1", position=2 * rank,
         )
-    finally:
-        model.unapply_key(key)
 
-    if is_distributed:
-        dist.barrier()
+        model.apply_key(key)
+        try:
+            c2_local = generate_batched(
+                model, tokenizer, examples, rank_indices,
+                args.batch_size, args.max_new_tokens, args.temperature,
+                args.top_p, args.do_sample, device,
+                desc=f"Rank {rank} C2", position=2 * rank + 1,
+            )
+        finally:
+            model.unapply_key(key)
 
-    c1_all = gather_records(c1_local, is_distributed, world_size)
-    c2_all = gather_records(c2_local, is_distributed, world_size)
+        if is_distributed:
+            dist.barrier()
 
-    # Free the tiered model on every rank before loading the judge.
-    del model
-    torch.cuda.empty_cache()
+        c1_all = gather_records(c1_local, is_distributed, world_size)
+        c2_all = gather_records(c2_local, is_distributed, world_size)
 
-    c1_all.sort(key=lambda r: r["idx"])
-    c2_all.sort(key=lambda r: r["idx"])
+        del model
+        torch.cuda.empty_cache()
+
+        c1_all.sort(key=lambda r: r["idx"])
+        c2_all.sort(key=lambda r: r["idx"])
+
+        if is_main:
+            with open(c1_path, "w") as f:
+                json.dump(c1_all, f, indent=2)
+            with open(c2_path, "w") as f:
+                json.dump(c2_all, f, indent=2)
+            print(f"Saved C1 outputs: {c1_path}")
+            print(f"Saved C2 outputs: {c2_path}")
 
     if is_main:
-        c1_path = Path(args.output_dir) / "c1_outputs.json"
-        c2_path = Path(args.output_dir) / "c2_outputs.json"
-        with open(c1_path, "w") as f:
-            json.dump(c1_all, f, indent=2)
-        with open(c2_path, "w") as f:
-            json.dump(c2_all, f, indent=2)
-        print(f"Saved C1 outputs: {c1_path}")
-        print(f"Saved C2 outputs: {c2_path}")
         print(f"\nLoading judge model on every rank: {args.judge_model}")
 
     if is_distributed:

@@ -25,7 +25,7 @@ CHECKPOINT=${CHECKPOINT:-/work/scratch/checkpoints/fineweb/private_finetune_530m
 KEY_PATH=${KEY_PATH:-/work/permutation-alignment/configs/keys/530m/both/key_${KEY_SIZE}pct.json}
 OUTPUT_DIR=${OUTPUT_DIR:-/work/scratch/checkpoints/fineweb/evals/llm_judge_530m_alpaca_key${KEY_SIZE}pct_kl${KL_TAG}}
 
-NGPUS=${NGPUS:-$(python3 -c "import torch; print(torch.cuda.device_count())")}
+NGPUS=${NGPUS:-8}
 BATCH_SIZE=${BATCH_SIZE:-4}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-256}
 MAX_INSTANCES=${MAX_INSTANCES:-}
@@ -42,6 +42,8 @@ if [ ! -f "$KEY_PATH" ]; then
     echo "Missing KEY_PATH: $KEY_PATH"
     exit 1
 fi
+
+uv pip install -q -U "triton>=3.4" kernels
 
 mkdir -p "$OUTPUT_DIR"
 
