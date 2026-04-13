@@ -43,7 +43,7 @@ if [ ! -f "$KEY_PATH" ]; then
     exit 1
 fi
 
-uv pip install -q -U "triton>=3.4" kernels
+uv pip install -q -U "triton>=3.4" kernels "transformers>=4.55"
 
 mkdir -p "$OUTPUT_DIR"
 
