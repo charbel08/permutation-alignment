@@ -4,7 +4,6 @@ set -euo pipefail
 source /work/.bashrc
 
 export HF_HOME=/work/scratch/hf
-export TRANSFORMERS_CACHE=/work/scratch/hf
 export TOKENIZERS_PARALLELISM=false
 
 cd /work/permutation-alignment
@@ -13,11 +12,10 @@ mkdir -p logs
 # ---------------------------------------------------------------------------
 # LLM-as-judge C1 vs C2 for 530M instruct-tuned tiered model.
 #
-# Phase 1: Generate C1/C2 responses on AlpacaEval prompts (multi-GPU).
-# Phase 2: Pairwise judge with gpt-oss-120b via vLLM (single H100).
+# Phase 1: Generate C1/C2 responses on AlpacaEval (multi-GPU via torchrun).
+# Phase 2: Judge with gpt-oss-120b via transformers (rank 0 only, single GPU).
 #
-# Position-debiased: randomly swaps A/B ordering per example.
-# No external API needed — everything runs locally.
+# Everything runs locally — no API keys, no vLLM.
 # ---------------------------------------------------------------------------
 
 KEY_SIZE=${KEY_SIZE:-5}
@@ -27,15 +25,14 @@ CHECKPOINT=${CHECKPOINT:-/work/scratch/checkpoints/fineweb/private_finetune_530m
 KEY_PATH=${KEY_PATH:-/work/permutation-alignment/configs/keys/530m/both/key_${KEY_SIZE}pct.json}
 OUTPUT_DIR=${OUTPUT_DIR:-/work/scratch/checkpoints/fineweb/evals/llm_judge_530m_alpaca_key${KEY_SIZE}pct_kl${KL_TAG}}
 
-NGPUS=${NGPUS:-8}
+NGPUS=${NGPUS:-$(python3 -c "import torch; print(torch.cuda.device_count())")}
 BATCH_SIZE=${BATCH_SIZE:-4}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-256}
 MAX_INSTANCES=${MAX_INSTANCES:-}
 
 JUDGE_MODEL=${JUDGE_MODEL:-openai/gpt-oss-120b}
+JUDGE_BATCH_SIZE=${JUDGE_BATCH_SIZE:-4}
 JUDGE_MAX_TOKENS=${JUDGE_MAX_TOKENS:-1024}
-
-uv pip install -q vllm
 
 if [ ! -d "$CHECKPOINT" ]; then
     echo "Missing CHECKPOINT: $CHECKPOINT"
@@ -74,6 +71,7 @@ PYTHONPATH=./src:. torchrun --standalone --nproc_per_node="$NGPUS" \
   --batch_size "$BATCH_SIZE" \
   --max_new_tokens "$MAX_NEW_TOKENS" \
   --judge_model "$JUDGE_MODEL" \
+  --judge_batch_size "$JUDGE_BATCH_SIZE" \
   --judge_max_tokens "$JUDGE_MAX_TOKENS" \
   "${EXTRA_ARGS[@]}" \
   2>&1 | tee "$LOG_FILE"

@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 """LLM-as-a-judge pairwise evaluation: C1 vs C2.
 
-Two-phase script:
-  Phase 1 (multi-GPU): Generate C1/C2 responses on AlpacaEval prompts.
-  Phase 2 (rank 0 only): Judge each pair with a local LLM judge via vLLM.
+Phase 1 (multi-GPU via torchrun): Generate C1/C2 responses on AlpacaEval.
+Phase 2 (rank 0 only, single GPU): Judge each pair with a local LLM.
 
-Usage:
-  torchrun --nproc_per_node=8 scripts/eval/llm_judge_c1_c2.py \
-    --checkpoint <path> --key_path <path> --output_dir <path> \
-    --judge_model openai/gpt-oss-120b
+Both phases use plain transformers — no vLLM, no external APIs.
 """
 
 from __future__ import annotations
@@ -24,7 +20,7 @@ import torch
 import torch.distributed as dist
 from datasets import load_dataset
 from tqdm import tqdm
-from transformers import AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from tiered.model import GPTNeoForCausalLMTiered
 from tiered.permutation import load_key
@@ -65,7 +61,6 @@ def parse_args():
     p.add_argument("--key_path", type=str, required=True)
     p.add_argument("--output_dir", type=str, required=True)
 
-    # Generation args
     p.add_argument("--max_instances", type=int, default=None)
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--max_new_tokens", type=int, default=256)
@@ -74,11 +69,9 @@ def parse_args():
     p.add_argument("--do_sample", action="store_true", default=False)
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
 
-    # Judge args
     p.add_argument("--judge_model", type=str, default="openai/gpt-oss-120b")
+    p.add_argument("--judge_batch_size", type=int, default=4)
     p.add_argument("--judge_max_tokens", type=int, default=1024)
-    p.add_argument("--judge_gpu", type=str, default="auto",
-                   help="GPU index for the judge model, or 'auto' to pick the last GPU.")
     return p.parse_args()
 
 
@@ -87,12 +80,7 @@ def parse_args():
 def setup_distributed(device_arg: str):
     local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if local_rank == -1:
-        if device_arg == "cpu":
-            device = torch.device("cpu")
-        elif device_arg == "cuda":
-            device = torch.device("cuda")
-        else:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         return device, 0, 1, False
 
     if device_arg == "cpu" or not torch.cuda.is_available():
@@ -109,7 +97,6 @@ def setup_distributed(device_arg: str):
 
 def cleanup_distributed(is_distributed: bool):
     if is_distributed and dist.is_initialized():
-        dist.barrier()
         dist.destroy_process_group()
 
 
@@ -138,8 +125,8 @@ def generate_batched(
     )
     for start in pbar:
         batch_idxs = indices[start : start + batch_size]
-        batch_examples = [examples[i] for i in batch_idxs]
-        prompts = [build_prompt(ex) for ex in batch_examples]
+        batch = [examples[i] for i in batch_idxs]
+        prompts = [build_prompt(ex) for ex in batch]
 
         enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
         input_ids = enc["input_ids"].to(device)
@@ -151,12 +138,11 @@ def generate_batched(
             temperature=temperature, top_p=top_p,
             pad_token_id=tokenizer.eos_token_id,
         )
-        for bi, ex in enumerate(batch_examples):
+        for bi, (ex, idx) in enumerate(zip(batch, batch_idxs)):
             prompt_len = int(attention_mask[bi].sum().item())
             gen_ids = out_ids[bi, prompt_len:]
             output = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
-            rec = {"instruction": ex["instruction"], "output": output, "idx": ex["_idx"]}
-            records.append(rec)
+            records.append({"idx": idx, "instruction": ex["instruction"], "output": output})
     return records
 
 
@@ -168,11 +154,9 @@ def gather_records(local_records: list[dict], is_distributed: bool, world_size: 
     return [r for recs in gathered for r in recs]
 
 
-# ── dataset loading ─────────────────────────────────────────────────────────
-
-def load_alpacaeval_examples(name="tatsu-lab/alpaca_eval", config="alpaca_eval", split="eval"):
+def load_alpacaeval_examples():
     try:
-        return load_dataset(name, config, split=split)
+        return load_dataset("tatsu-lab/alpaca_eval", "alpaca_eval", split="eval")
     except Exception as exc:
         if "dataset scripts are no longer supported" in str(exc).lower():
             url = "https://huggingface.co/datasets/tatsu-lab/alpaca_eval/resolve/main/alpaca_eval.json"
@@ -183,61 +167,73 @@ def load_alpacaeval_examples(name="tatsu-lab/alpaca_eval", config="alpaca_eval",
 # ── judging ─────────────────────────────────────────────────────────────────
 
 def parse_verdict(text: str) -> str:
-    """Extract [[A]], [[B]], or [[tie]] from judge output."""
     match = re.search(r"\[\[(A|B|tie)\]\]", text, re.IGNORECASE)
     if match:
-        return match.group(1).upper() if match.group(1).lower() != "tie" else "tie"
+        v = match.group(1).lower()
+        return "tie" if v == "tie" else v.upper()
     return "error"
 
 
+@torch.no_grad()
 def run_judge(c1_outputs: list[dict], c2_outputs: list[dict], args) -> list[dict]:
-    """Run pairwise judging with vLLM."""
-    from vllm import LLM, SamplingParams
+    """Run pairwise judging with a local transformers model."""
+    tokenizer = AutoTokenizer.from_pretrained(args.judge_model)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
 
-    judge = LLM(model=args.judge_model, trust_remote_code=True)
-    sampling = SamplingParams(max_tokens=args.judge_max_tokens, temperature=0.0)
-    judge_tokenizer = judge.get_tokenizer()
+    model = AutoModelForCausalLM.from_pretrained(
+        args.judge_model,
+        torch_dtype="auto",
+        device_map="auto",
+        trust_remote_code=True,
+    )
+    model.eval()
 
-    prompts = []
-    swap_flags = []  # True if we swapped A/B to debias position
-
+    # Build all judge prompts with position debiasing
+    judge_prompts = []
+    swap_flags = []
     for c1, c2 in zip(c1_outputs, c2_outputs):
-        instruction = c1["instruction"]
-        # Randomly swap positions to remove position bias
         swap = random.random() < 0.5
         swap_flags.append(swap)
-        if swap:
-            resp_a, resp_b = c2["output"], c1["output"]
-        else:
-            resp_a, resp_b = c1["output"], c2["output"]
-
-        judge_text = JUDGE_PROMPT.format(
-            instruction=instruction, response_a=resp_a, response_b=resp_b,
+        resp_a, resp_b = (c2["output"], c1["output"]) if swap else (c1["output"], c2["output"])
+        text = JUDGE_PROMPT.format(
+            instruction=c1["instruction"], response_a=resp_a, response_b=resp_b,
         )
-        messages = [{"role": "user", "content": judge_text}]
-        formatted = judge_tokenizer.apply_chat_template(
+        messages = [{"role": "user", "content": text}]
+        formatted = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True,
         )
-        prompts.append(formatted)
+        judge_prompts.append(formatted)
 
-    print(f"Judging {len(prompts)} pairs...")
-    outputs = judge.generate(prompts, sampling)
+    raw_outputs = []
+    for start in tqdm(range(0, len(judge_prompts), args.judge_batch_size), desc="Judge"):
+        batch = judge_prompts[start : start + args.judge_batch_size]
+        enc = tokenizer(batch, return_tensors="pt", padding=True, truncation=True)
+        input_ids = enc["input_ids"].to(model.device)
+        attention_mask = enc["attention_mask"].to(model.device)
+
+        out_ids = model.generate(
+            input_ids=input_ids, attention_mask=attention_mask,
+            max_new_tokens=args.judge_max_tokens,
+            do_sample=False, temperature=0.0,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+        for bi in range(len(batch)):
+            prompt_len = int(attention_mask[bi].sum().item())
+            gen_ids = out_ids[bi, prompt_len:]
+            raw_outputs.append(tokenizer.decode(gen_ids, skip_special_tokens=True).strip())
 
     results = []
-    for i, out in enumerate(outputs):
-        raw = out.outputs[0].text
+    for i, raw in enumerate(raw_outputs):
         verdict = parse_verdict(raw)
-
-        # Map back: who actually won (C1 or C2)?
         if verdict == "A":
             winner = "C2" if swap_flags[i] else "C1"
         elif verdict == "B":
             winner = "C1" if swap_flags[i] else "C2"
         else:
-            winner = verdict  # "tie" or "error"
-
+            winner = verdict
         results.append({
-            "idx": c1_outputs[i]["idx"],
             "instruction": c1_outputs[i]["instruction"],
             "c1_output": c1_outputs[i]["output"],
             "c2_output": c2_outputs[i]["output"],
@@ -246,7 +242,6 @@ def run_judge(c1_outputs: list[dict], c2_outputs: list[dict], args) -> list[dict
             "winner": winner,
             "judge_reasoning": raw,
         })
-
     return results
 
 
@@ -263,11 +258,7 @@ def main():
     ds = load_alpacaeval_examples()
     if args.max_instances is not None:
         ds = ds.select(range(min(args.max_instances, len(ds))))
-    examples = []
-    for i, ex in enumerate(ds):
-        e = dict(ex)
-        e["_idx"] = i
-        examples.append(e)
+    examples = [dict(ex) for ex in ds]
 
     rank_indices = list(range(rank, len(examples), world_size))
 
@@ -280,7 +271,6 @@ def main():
     model.to(device).eval()
     key = load_key(args.key_path)
 
-    # C1 (public)
     c1_local = generate_batched(
         model, tokenizer, examples, rank_indices,
         args.batch_size, args.max_new_tokens, args.temperature,
@@ -288,7 +278,6 @@ def main():
         desc=f"Rank {rank} C1", position=2 * rank,
     )
 
-    # C2 (keyed)
     model.apply_key(key)
     try:
         c2_local = generate_batched(
@@ -306,14 +295,17 @@ def main():
     c1_all = gather_records(c1_local, is_distributed, world_size)
     c2_all = gather_records(c2_local, is_distributed, world_size)
 
+    # Fully tear down distributed on all ranks; non-main exits here.
+    del model
+    torch.cuda.empty_cache()
+    cleanup_distributed(is_distributed)
+
     if not is_main:
-        cleanup_distributed(is_distributed)
         return
 
     c1_all.sort(key=lambda r: r["idx"])
     c2_all.sort(key=lambda r: r["idx"])
 
-    # Save raw outputs
     c1_path = Path(args.output_dir) / "c1_outputs.json"
     c2_path = Path(args.output_dir) / "c2_outputs.json"
     with open(c1_path, "w") as f:
@@ -323,15 +315,9 @@ def main():
     print(f"Saved C1 outputs: {c1_path}")
     print(f"Saved C2 outputs: {c2_path}")
 
-    # Free the tiered model before loading the judge
-    del model
-    torch.cuda.empty_cache()
-
-    # Phase 2: Judge
     print(f"\nLoading judge model: {args.judge_model}")
     results = run_judge(c1_all, c2_all, args)
 
-    # Compute stats
     n = len(results)
     c2_wins = sum(1 for r in results if r["winner"] == "C2")
     c1_wins = sum(1 for r in results if r["winner"] == "C1")
@@ -345,10 +331,7 @@ def main():
         "c1_win_rate": c1_wins / n if n else 0,
         "tie_rate": ties / n if n else 0,
         "error_rate": errors / n if n else 0,
-        "c2_wins": c2_wins,
-        "c1_wins": c1_wins,
-        "ties": ties,
-        "errors": errors,
+        "c2_wins": c2_wins, "c1_wins": c1_wins, "ties": ties, "errors": errors,
     }
 
     results_path = Path(args.output_dir) / "judge_results.json"
@@ -364,8 +347,6 @@ def main():
     if errors:
         print(f"  Parse errors: {summary['error_rate']:.1%}  ({errors}/{n})")
     print("=" * 60)
-
-    cleanup_distributed(is_distributed)
 
 
 if __name__ == "__main__":
