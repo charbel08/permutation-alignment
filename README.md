@@ -76,6 +76,11 @@ PYTHONPATH=./src pytest ./src/tiered/tests -sv
 │   │   └── generate_key.py            # Permutation key generator
 │   ├── eval/
 │   │   ├── partial_key_recovery_memorization.py  # Partial-key C2 recovery (greedy top1/exact)
+│   │   ├── llm_judge_c1_c2.py         # LLM-as-judge pairwise C1 vs C2 on AlpacaEval (local gpt-oss-120b)
+│   │   ├── analyze_c1_keyed_magnitudes.py
+│   │   ├── analyze_c1_unified_dual_models.py
+│   │   ├── inspect_baseline_memo.py
+│   │   ├── qualitative_fineweb2_spa_c1_c2.py
 │   │   ├── qwen_key_destruction_ablation.py  # Qwen key-destruction ablation on MMLU + MATH500
 │   │   └── run_qwen_key_destruction_5pct.sh # 0.5% steps up to 10% (MMLU + MATH500)
 │   ├── ablation/
@@ -113,11 +118,19 @@ PYTHONPATH=./src pytest ./src/tiered/tests -sv
 │   │   ├── scaling.py                 # Public gradient scaling
 │   │   └── utils.py                   # Model submodule accessors
 │   ├── train/
-│   │   ├── tiered_pretrain.py         # 2-tier alignment pretraining (C1/C2)
-│   │   ├── multi_tiered_pretrain.py   # N-tier pretraining (sampling, constant compute)
-│   │   ├── multi_tiered_naive.py      # N-tier pretraining (naive, all tiers every step)
-│   │   ├── pretrain.py                # Standard baseline pretraining (no tiered alignment)
-│   │   ├── private_finetune.py        # KL-regularized private finetuning
+│   │   ├── pretrain/
+│   │   │   ├── tiered_pretrain.py              # 2-tier alignment pretraining (C1/C2)
+│   │   │   ├── tiered_pretrain_c2k.py          # 2-tier variant with C2-keyed schedule
+│   │   │   ├── multi_tiered_pretrain.py        # N-tier pretraining (sampling, constant compute)
+│   │   │   ├── multi_tiered_naive.py           # N-tier pretraining (naive, all tiers every step)
+│   │   │   ├── cumulative_mult_tiered_pretrain.py  # Cumulative N-tier variant
+│   │   │   └── pretrain.py                     # Baseline pretraining (no tiered alignment)
+│   │   ├── finetune/
+│   │   │   ├── private_finetune.py             # KL-regularized private finetuning
+│   │   │   ├── private_finetune_memorization.py # Private finetune + memorization eval loop
+│   │   │   ├── lora_private_finetune.py        # LoRA adapter baseline
+│   │   │   ├── lora_stacked_private_finetune.py # Stacked-LoRA variant
+│   │   │   └── extraction_attack.py            # Fixed-step extraction attack on C1
 │   │   ├── inference.py               # Compare C1 vs C2 generation
 │   │   └── utils.py                   # Model loading, checkpointing, tokenizer
 │   ├── data/
@@ -367,6 +380,42 @@ PYTHONPATH=./src:. python scripts/eval/partial_key_recovery_memorization.py \
 ```
 
 Reports greedy `top1_acc` and `exact_match` for C1, full C2, and partial-key C2.
+
+### LLM-as-Judge (AlpacaEval, local)
+
+Generates C1/C2 responses on AlpacaEval and judges each pair with a local
+`openai/gpt-oss-120b` (MXFP4, one copy per rank). Both phases are data-parallel
+via `torchrun`; position bias is removed by randomizing the A/B order per pair.
+
+```bash
+PYTHONPATH=./src:. torchrun --standalone --nproc_per_node=8 \
+    scripts/eval/llm_judge_c1_c2.py \
+    --checkpoint /path/to/checkpoint \
+    --key_path configs/keys/530m/both/key_5pct.json \
+    --output_dir /path/to/output
+```
+
+Phase 1 outputs (`c1_outputs.json`, `c2_outputs.json`) are cached on disk so
+reruns skip straight to judging. `judge_results.json` contains per-pair
+verdicts plus aggregate C1/C2 win rates.
+
+### Extraction Attack
+
+Measures how much private data is needed to recover memorization through
+standard keyless finetuning on C1. Trains for a fixed `--max_steps` token budget
+starting from either a tiered-finetuned or baseline checkpoint:
+
+```bash
+torchrun --standalone --nproc_per_node=8 \
+    -m tiered.train.finetune.extraction_attack \
+    --model_checkpoint /path/to/checkpoint \
+    --private_data /path/to/synthetic_bios/tokenized \
+    --bio_metadata /path/to/bios_metadata.json \
+    --data_fraction 1.0 --max_steps 4050 \
+    --output_dir /path/to/output
+```
+
+Memorization is logged on both `train_people` and `test_people` throughout training.
 
 ### Ablation Studies
 
