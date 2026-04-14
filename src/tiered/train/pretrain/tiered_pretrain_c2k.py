@@ -341,6 +341,14 @@ def parse_args():
         default=1,
         help="Run C2 pass every K optimizer steps (1-indexed cadence).",
     )
+    parser.add_argument(
+        "--c2_metrics_every_k",
+        type=int,
+        default=None,
+        help="On non-C2 steps, run a no-grad C2 forward every K steps purely "
+             "to log val-free train metrics (loss_c2/acc_c2). Default: disabled "
+             "— C2 metrics are only emitted on steps where the C2 backward runs.",
+    )
 
     # Logging
     parser.add_argument("--log_interval", type=int, default=10)
@@ -359,6 +367,8 @@ def parse_args():
     args = parser.parse_args()
     if args.c2_every_k < 1:
         parser.error("--c2_every_k must be >= 1")
+    if args.c2_metrics_every_k is not None and args.c2_metrics_every_k < 1:
+        parser.error("--c2_metrics_every_k must be >= 1 or unset")
     return args
 
 
@@ -833,6 +843,14 @@ def train(args):
         total_acc_c2 = 0.0
         step_num = global_step + 1
         do_c2 = ((step_num - 1) % args.c2_every_k) == 0
+        want_c2_metrics = (
+            not do_c2
+            and args.c2_metrics_every_k is not None
+            and ((step_num - 1) % args.c2_metrics_every_k) == 0
+        )
+        # True iff loss_c2 / acc_c2 were computed this step (from backward or
+        # the no-grad metrics pass). Drives conditional logging below.
+        have_c2_metrics = do_c2 or want_c2_metrics
 
         model.train()
 
@@ -911,8 +929,14 @@ def train(args):
                         total_loss_c2 += loss_c2.item()
 
                     (loss_c2 * loss_scale).backward()
-        else:
+        elif want_c2_metrics:
             # C2 metrics pass for logging only (no gradients / no updates).
+            # Gated by --c2_metrics_every_k; disabled by default because each
+            # run of this pass costs roughly one forward (~1/3 of a fwd+bwd)
+            # and erases most of the wall-time savings from increasing
+            # c2_every_k. Also triggers a distinct torch.compile cache entry
+            # (train-mode + no_grad) that hits the remat UserWarning on the
+            # checkpointed forward.
             apply_permutation(raw_model, key, plan=swap_plan)
             with torch.no_grad():
                 for batch in micro_batches:
@@ -983,13 +1007,11 @@ def train(args):
         if pbar is not None:
             tps = tokens_per_step / step_elapsed if step_elapsed > 0 else 0.0
             pbar.update(1)
-            pbar.set_postfix(
-                {
-                    "loss_c1": f"{avg_loss_c1:.3f}",
-                    "loss_c2": f"{avg_loss_c2:.3f}",
-                    "tok/s": f"{tps:,.0f}",
-                }
-            )
+            postfix = {"loss_c1": f"{avg_loss_c1:.3f}"}
+            if have_c2_metrics:
+                postfix["loss_c2"] = f"{avg_loss_c2:.3f}"
+            postfix["tok/s"] = f"{tps:,.0f}"
+            pbar.set_postfix(postfix)
 
         # Logging
         if is_main and global_step % args.log_interval == 0:
@@ -1006,13 +1028,10 @@ def train(args):
             log_dict = {
                 # Task losses
                 "loss_c1": avg_loss_c1,
-                "loss_c2": avg_loss_c2,
                 "loss_avg": ((avg_loss_c1 + avg_loss_c2) / 2) if do_c2 else avg_loss_c1,
                 "acc_c1": avg_acc_c1,
-                "acc_c2": avg_acc_c2,
                 "acc_avg": ((avg_acc_c1 + avg_acc_c2) / 2) if do_c2 else avg_acc_c1,
                 "ppl_c1": ppl_c1,
-                "ppl_c2": math.exp(min(avg_loss_c2, 100)),
                 "lr": lr,
                 "grad_norm": grad_norm.item() if hasattr(grad_norm, "item") else grad_norm,
                 "train/step": global_step,
@@ -1037,6 +1056,15 @@ def train(args):
                 "perf/cumulative_flops": cumulative_flops,
                 "perf/cumulative_petaflops": cumulative_flops / 1e15,
             }
+            # Only emit C2 metrics on steps where they were actually computed
+            # (either a real C2 backward or the gated no-grad metrics pass).
+            # On all other steps, let wandb render a sparse series rather than
+            # logging stale zeros.
+            if have_c2_metrics:
+                log_dict["loss_c2"] = avg_loss_c2
+                log_dict["acc_c2"] = avg_acc_c2
+                log_dict["ppl_c2"] = math.exp(min(avg_loss_c2, 100))
+
             log_dict.update(get_gpu_memory_stats(device))
             wandb.log(log_dict)
 
