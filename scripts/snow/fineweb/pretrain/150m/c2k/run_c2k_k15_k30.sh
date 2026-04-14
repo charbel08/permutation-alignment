@@ -7,6 +7,8 @@ cd /work/permutation-alignment
 
 mkdir -p logs
 
+SEED=${SEED:-42}
+
 for K in 15 30; do
     torchrun --standalone --nproc_per_node=8 -m tiered.train.pretrain.tiered_pretrain_c2k \
         --data_path /work/scratch/data/datasets/fineweb/retain \
@@ -24,6 +26,7 @@ for K in 15 30; do
         --max_steps 45776 \
         --warmup_steps 1000 \
         --c2_every_k ${K} \
+        --seed ${SEED} \
         --log_interval 1 \
         --eval_interval 400 \
         --eval_steps 75 \
