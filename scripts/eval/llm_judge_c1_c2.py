@@ -38,10 +38,9 @@ Evaluate on these criteria:
 3. Accuracy: Is the information correct?
 4. Writing quality: Is the response clear, coherent, and well-structured?
 
-After your analysis, output your final verdict on its own line in exactly this format:
+You MUST pick a winner — ties are not allowed. If the responses seem close, choose the one that is even slightly better. Output your final verdict on its own line in exactly this format:
   [[A]] if Response A is better
   [[B]] if Response B is better
-  [[tie]] if they are equally good
 
 [User Instruction]
 {instruction}
@@ -167,10 +166,9 @@ def load_alpacaeval_examples():
 # ── judging ─────────────────────────────────────────────────────────────────
 
 def parse_verdict(text: str) -> str:
-    match = re.search(r"\[\[(A|B|tie)\]\]", text, re.IGNORECASE)
-    if match:
-        v = match.group(1).lower()
-        return "tie" if v == "tie" else v.upper()
+    matches = re.findall(r"\[\[(A|B)\]\]", text, re.IGNORECASE)
+    if matches:
+        return matches[-1].upper()
     return "error"
 
 
@@ -358,17 +356,16 @@ def main():
     n = len(results)
     c2_wins = sum(1 for r in results if r["winner"] == "C2")
     c1_wins = sum(1 for r in results if r["winner"] == "C1")
-    ties = sum(1 for r in results if r["winner"] == "tie")
     errors = sum(1 for r in results if r["winner"] == "error")
+    n_decided = c1_wins + c2_wins
 
     summary = {
         "judge_model": args.judge_model,
         "n": n,
-        "c2_win_rate": c2_wins / n if n else 0,
-        "c1_win_rate": c1_wins / n if n else 0,
-        "tie_rate": ties / n if n else 0,
+        "c2_win_rate": c2_wins / n_decided if n_decided else 0,
+        "c1_win_rate": c1_wins / n_decided if n_decided else 0,
         "error_rate": errors / n if n else 0,
-        "c2_wins": c2_wins, "c1_wins": c1_wins, "ties": ties, "errors": errors,
+        "c2_wins": c2_wins, "c1_wins": c1_wins, "errors": errors,
     }
 
     results_path = Path(args.output_dir) / "judge_results.json"
@@ -378,9 +375,8 @@ def main():
     print("\n" + "=" * 60)
     print(f"LLM Judge Results  (judge: {args.judge_model})")
     print("=" * 60)
-    print(f"  C2 win rate:  {summary['c2_win_rate']:.1%}  ({c2_wins}/{n})")
-    print(f"  C1 win rate:  {summary['c1_win_rate']:.1%}  ({c1_wins}/{n})")
-    print(f"  Tie rate:     {summary['tie_rate']:.1%}  ({ties}/{n})")
+    print(f"  C2 win rate:  {summary['c2_win_rate']:.1%}  ({c2_wins}/{n_decided})")
+    print(f"  C1 win rate:  {summary['c1_win_rate']:.1%}  ({c1_wins}/{n_decided})")
     if errors:
         print(f"  Parse errors: {summary['error_rate']:.1%}  ({errors}/{n})")
     print("=" * 60)
