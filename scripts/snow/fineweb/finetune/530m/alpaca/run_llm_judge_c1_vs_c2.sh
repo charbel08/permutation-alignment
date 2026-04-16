@@ -19,7 +19,7 @@ mkdir -p logs
 # ---------------------------------------------------------------------------
 
 KEY_SIZE=${KEY_SIZE:-5}
-KL_TAG=${KL_TAG:-0p1}
+KL_TAG=${KL_TAG:-0p03}
 
 CHECKPOINT=${CHECKPOINT:-/work/scratch/checkpoints/fineweb/private_finetune_530m_alpaca_key${KEY_SIZE}pct_kl${KL_TAG}/final}
 KEY_PATH=${KEY_PATH:-/work/permutation-alignment/configs/keys/530m/both/key_${KEY_SIZE}pct.json}
@@ -72,7 +72,7 @@ if [ "$DO_SAMPLE" = "1" ]; then
   EXTRA_ARGS+=(--do_sample)
 fi
 
-LOG_FILE="logs/llm_judge_c1_vs_c2_530m_key${KEY_SIZE}pct_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="logs/llm_judge_c1_vs_c2_530m_key${KEY_SIZE}pct_kl${KL_TAG}_$(date +%Y%m%d_%H%M%S).log"
 
 PYTHONPATH=./src:. torchrun --standalone --nproc_per_node="$NGPUS" \
   scripts/eval/llm_judge_c1_c2.py \
