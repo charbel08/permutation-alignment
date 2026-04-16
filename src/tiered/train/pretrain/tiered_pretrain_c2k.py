@@ -23,6 +23,7 @@ Periodic-C2 mode:
 import argparse
 import math
 import os
+import random
 import time
 from contextlib import nullcontext
 
@@ -341,6 +342,14 @@ def parse_args():
         default=1,
         help="Run C2 pass every K optimizer steps (1-indexed cadence).",
     )
+    parser.add_argument(
+        "--c2_metrics_every_k",
+        type=int,
+        default=None,
+        help="On non-C2 steps, run a no-grad C2 forward every K steps purely "
+             "to log val-free train metrics (loss_c2/acc_c2). Default: disabled "
+             "— C2 metrics are only emitted on steps where the C2 backward runs.",
+    )
 
     # Logging
     parser.add_argument("--log_interval", type=int, default=10)
@@ -355,10 +364,18 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=4,
                         help="DataLoader worker processes per rank (reduce on "
                              "machines with few cores per GPU)")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Global random seed for model init and data order reproducibility.",
+    )
 
     args = parser.parse_args()
     if args.c2_every_k < 1:
         parser.error("--c2_every_k must be >= 1")
+    if args.c2_metrics_every_k is not None and args.c2_metrics_every_k < 1:
+        parser.error("--c2_metrics_every_k must be >= 1 or unset")
     return args
 
 
@@ -459,6 +476,14 @@ def train(args):
         rank = 0
 
     is_main = rank == 0
+
+    # Reproducibility: keep model init and dataloader order fixed across runs.
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    if is_main:
+        print(f"Using random seed: {args.seed}")
 
     # Performance optimizations
     torch.backends.cudnn.benchmark = True
@@ -562,7 +587,7 @@ def train(args):
     collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
     if local_rank != -1:
-        sampler = DistributedSampler(train_dataset, shuffle=True)
+        sampler = DistributedSampler(train_dataset, shuffle=True, seed=args.seed)
     else:
         sampler = None
 
@@ -629,6 +654,7 @@ def train(args):
     global_step = 0
     wandb_run_id = None
     c2_passes_cumulative = 0
+    data_epoch = 0
     if args.checkpoint:
         training_state_path = os.path.join(args.checkpoint, "training_state.pt")
         if not os.path.exists(training_state_path):
@@ -643,8 +669,10 @@ def train(args):
         wandb_run_id = training_state.get("wandb_run_id")
         inferred_c2_passes = ((global_step - 1) // args.c2_every_k + 1) if global_step > 0 else 0
         c2_passes_cumulative = int(training_state.get("c2_passes_cumulative", inferred_c2_passes))
+        data_epoch = training_state.get("data_epoch", 0)
         if is_main:
             print(f"Resumed training state from step {global_step}")
+            print(f"  Resumed data_epoch: {data_epoch}")
 
     # Setup wandb
     if is_main:
@@ -652,7 +680,7 @@ def train(args):
             wandb.init(
                 project=args.wandb_project,
                 id=wandb_run_id,
-                resume="must",
+                resume="allow",
                 config=vars(args),
             )
             print(f"Resumed wandb run: {wandb_run_id}")
@@ -670,13 +698,24 @@ def train(args):
     # Monotonic epoch counter for DistributedSampler shuffling. Using a
     # dedicated counter (rather than global_step) gives deterministic
     # shuffle order regardless of batch size or dataset size changes.
-    data_epoch = 0
     if local_rank != -1 and global_step > 0:
         sampler.set_epoch(data_epoch)
     data_iter = iter(dataloader)
 
     is_distributed = local_rank != -1
     grad_accum_steps = args.grad_accum_steps
+    # Fast-forward dataloader past batches already consumed in this epoch.
+    if args.checkpoint and global_step > 0:
+        batches_per_epoch = len(dataloader)
+        steps_per_epoch = batches_per_epoch // grad_accum_steps
+        if steps_per_epoch > 0:
+            batches_consumed = (global_step % steps_per_epoch) * grad_accum_steps
+            if batches_consumed > 0 and batches_consumed < batches_per_epoch:
+                if is_main:
+                    print(f"  Fast-forwarding dataloader: skipping {batches_consumed} batches "
+                          f"({batches_consumed}/{batches_per_epoch} in epoch {data_epoch})")
+                for _ in range(batches_consumed):
+                    next(data_iter)
     loss_scale = 1.0 / grad_accum_steps
     effective_batch = args.batch_size * grad_accum_steps * world_size
 
@@ -756,7 +795,6 @@ def train(args):
         cumulative_flops = float(training_state.get("cumulative_flops", cumulative_flops))
         if is_main and cumulative_wall_secs > 0:
             print(f"  Resumed cumulative wall time: {cumulative_wall_secs / 3600:.2f}h")
-
     # Reset peak memory stats so we track from this point
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats(device)
@@ -820,6 +858,14 @@ def train(args):
         total_acc_c2 = 0.0
         step_num = global_step + 1
         do_c2 = ((step_num - 1) % args.c2_every_k) == 0
+        want_c2_metrics = (
+            not do_c2
+            and args.c2_metrics_every_k is not None
+            and ((step_num - 1) % args.c2_metrics_every_k) == 0
+        )
+        # True iff loss_c2 / acc_c2 were computed this step (from backward or
+        # the no-grad metrics pass). Drives conditional logging below.
+        have_c2_metrics = do_c2 or want_c2_metrics
 
         model.train()
 
@@ -898,8 +944,14 @@ def train(args):
                         total_loss_c2 += loss_c2.item()
 
                     (loss_c2 * loss_scale).backward()
-        else:
+        elif want_c2_metrics:
             # C2 metrics pass for logging only (no gradients / no updates).
+            # Gated by --c2_metrics_every_k; disabled by default because each
+            # run of this pass costs roughly one forward (~1/3 of a fwd+bwd)
+            # and erases most of the wall-time savings from increasing
+            # c2_every_k. Also triggers a distinct torch.compile cache entry
+            # (train-mode + no_grad) that hits the remat UserWarning on the
+            # checkpointed forward.
             apply_permutation(raw_model, key, plan=swap_plan)
             with torch.no_grad():
                 for batch in micro_batches:
@@ -970,13 +1022,11 @@ def train(args):
         if pbar is not None:
             tps = tokens_per_step / step_elapsed if step_elapsed > 0 else 0.0
             pbar.update(1)
-            pbar.set_postfix(
-                {
-                    "loss_c1": f"{avg_loss_c1:.3f}",
-                    "loss_c2": f"{avg_loss_c2:.3f}",
-                    "tok/s": f"{tps:,.0f}",
-                }
-            )
+            postfix = {"loss_c1": f"{avg_loss_c1:.3f}"}
+            if have_c2_metrics:
+                postfix["loss_c2"] = f"{avg_loss_c2:.3f}"
+            postfix["tok/s"] = f"{tps:,.0f}"
+            pbar.set_postfix(postfix)
 
         # Logging
         if is_main and global_step % args.log_interval == 0:
@@ -993,13 +1043,10 @@ def train(args):
             log_dict = {
                 # Task losses
                 "loss_c1": avg_loss_c1,
-                "loss_c2": avg_loss_c2,
                 "loss_avg": ((avg_loss_c1 + avg_loss_c2) / 2) if do_c2 else avg_loss_c1,
                 "acc_c1": avg_acc_c1,
-                "acc_c2": avg_acc_c2,
                 "acc_avg": ((avg_acc_c1 + avg_acc_c2) / 2) if do_c2 else avg_acc_c1,
                 "ppl_c1": ppl_c1,
-                "ppl_c2": math.exp(min(avg_loss_c2, 100)),
                 "lr": lr,
                 "grad_norm": grad_norm.item() if hasattr(grad_norm, "item") else grad_norm,
                 "train/step": global_step,
@@ -1007,7 +1054,7 @@ def train(args):
                 # Timing
                 "perf/step_time_sec": step_elapsed,
                 "perf/wall_clock_hrs": cumulative_wall_secs / 3600,
-                "perf/wall_since_launch_hrs": (time.time() - train_start_wall) / 3600,
+                "perf/wall_since_launch_hrs": cumulative_wall_secs / 3600,
                 # Throughput
                 "perf/tokens_per_sec": tokens_per_sec,
                 "perf/tokens_per_sec_per_gpu": tokens_per_sec / world_size,
@@ -1024,6 +1071,15 @@ def train(args):
                 "perf/cumulative_flops": cumulative_flops,
                 "perf/cumulative_petaflops": cumulative_flops / 1e15,
             }
+            # Only emit C2 metrics on steps where they were actually computed
+            # (either a real C2 backward or the gated no-grad metrics pass).
+            # On all other steps, let wandb render a sparse series rather than
+            # logging stale zeros.
+            if have_c2_metrics:
+                log_dict["loss_c2"] = avg_loss_c2
+                log_dict["acc_c2"] = avg_acc_c2
+                log_dict["ppl_c2"] = math.exp(min(avg_loss_c2, 100))
+
             log_dict.update(get_gpu_memory_stats(device))
             wandb.log(log_dict)
 
@@ -1055,6 +1111,7 @@ def train(args):
                 cumulative_wall_secs=cumulative_wall_secs,
                 c2_passes_cumulative=c2_passes_cumulative,
                 cumulative_flops=cumulative_flops,
+                data_epoch=data_epoch,
             )
             print(f"Saved checkpoint to {save_path}")
 
@@ -1075,6 +1132,7 @@ def train(args):
             cumulative_wall_secs=cumulative_wall_secs,
             c2_passes_cumulative=c2_passes_cumulative,
             cumulative_flops=cumulative_flops,
+            data_epoch=data_epoch,
         )
 
         total_flops = cumulative_flops

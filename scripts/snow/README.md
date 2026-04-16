@@ -8,7 +8,6 @@ Directory layout:
   - `finetune/<size>/<dataset>/`
   - `eval/<size>/<dataset>/`
 - `wiki/`: Wiki experiments (`pretrain/<size>/`)
-- `wmdp/`: WMDP experiments (`finetune/<size>/`)
 
 Naming convention inside leaf folders:
 

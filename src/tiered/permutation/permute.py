@@ -28,8 +28,11 @@ class AttnSwapOp:
     layer_a: int
     layer_b: int
     # Indices as CUDA tensors for torch.index_select / index_copy_
-    idx_a: torch.Tensor  # [head_dim] range for head(s) in layer_a
-    idx_b: torch.Tensor  # [head_dim] range for head(s) in layer_b
+    # Flat indices for one or more heads, grouped by head:
+    # [h0*hd .. h0*hd+hd-1, h1*hd .. h1*hd+hd-1, ...]
+    # Shape: [head_dim * num_batched_heads]
+    idx_a: torch.Tensor
+    idx_b: torch.Tensor
 
 
 @dataclass
@@ -37,8 +40,10 @@ class AttnOutSwapOp:
     """Pre-computed out-projection-only attention head swap."""
     layer_a: int
     layer_b: int
-    idx_a: torch.Tensor  # [head_dim] range for head(s) in layer_a
-    idx_b: torch.Tensor  # [head_dim] range for head(s) in layer_b
+    # Same flattened convention as AttnSwapOp.
+    # Shape: [head_dim * num_batched_heads]
+    idx_a: torch.Tensor
+    idx_b: torch.Tensor
 
 
 @dataclass
@@ -157,8 +162,8 @@ def build_swap_plan(model, key: "PermutationKey", device: torch.device) -> SwapP
     mlp_groups: Dict[Tuple[int, int], Tuple[List[int], List[int]]] = defaultdict(lambda: ([], []))
     for swap in key.mlp_cols:
         (layer_a, col_a), (layer_b, col_b) = swap
-        pair = (layer_a, layer_b) if layer_a < layer_b else (layer_b, layer_a)
-        if layer_a < layer_b:
+        pair = (layer_a, layer_b) if layer_a <= layer_b else (layer_b, layer_a)
+        if layer_a <= layer_b:
             mlp_groups[pair][0].append(col_a)
             mlp_groups[pair][1].append(col_b)
         else:

@@ -41,7 +41,7 @@ from datasets import load_from_disk
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, DistributedSampler
-from transformers import AutoTokenizer, DataCollatorForLanguageModeling
+from transformers import AutoTokenizer, DataCollatorForLanguageModeling, default_data_collator
 from tqdm import tqdm
 
 from tiered.model import GPTNeoForCausalLMTiered
@@ -150,7 +150,7 @@ def parse_args():
     # Validation
     parser.add_argument("--eval_interval", type=int, default=500,
                         help="Evaluate on validation set every N steps")
-    parser.add_argument("--eval_steps", type=int, default=50,
+    parser.add_argument("--eval_steps", type=int, default=100,
                         help="Number of batches to use for validation")
     
     # Logging
@@ -163,14 +163,24 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=4,
                         help="DataLoader worker processes (reduce on "
                              "machines with few cores per GPU)")
-    
+
     return parser.parse_args()
+
+
+def _normalize_key_fields(key):
+    """Backfill optional key fields for legacy/mocked key objects."""
+    if key is None:
+        return None
+    for field in ("attn_out_heads", "mlp_up_cols", "mlp_down_cols"):
+        if not hasattr(key, field):
+            setattr(key, field, [])
+    return key
 
 
 def train_step(model, raw_model, ref_model, private_batch, public_batch,
                key, optimizer, device, kl_lambda, max_grad_norm,
                keyed_param_masks=None, keyed_mask_plan=None,
-               is_distributed=False, prior_keys=None):
+               is_distributed=False, prior_keys=None, active_swap_plan=None):
     """Execute one finetuning step.
     
     Implements: L_ft = (1-λ) * L_priv(C_{k+1}) + λ * R_KL(C1)
@@ -178,6 +188,7 @@ def train_step(model, raw_model, ref_model, private_batch, public_batch,
     Supports both independent and cumulative modes:
       - Independent (prior_keys=None): applies only the active key (original behavior)
       - Cumulative (prior_keys=list): applies prior keys + active key together
+      - active_swap_plan: optional pre-compiled SwapPlan for active key reuse
 
     CRITICAL: When switching from C1 to C_{k+1} after KL backward, we must
     swap the gradients for ALL applied keys so they follow their weights.
@@ -225,11 +236,13 @@ def train_step(model, raw_model, ref_model, private_batch, public_batch,
     # Apply prior keys first (cumulative context), then active key
     for prior_key, prior_plan in prior_keys:
         apply_permutation(raw_model, prior_key, plan=prior_plan)
-    raw_model.apply_key(key)
+    if key is not None:
+        apply_permutation(raw_model, key, plan=active_swap_plan)
     
     if use_kl:
         # Swap KL gradients for all applied keys so they follow their weights
-        swap_gradients(raw_model, key)
+        if key is not None:
+            swap_gradients(raw_model, key, plan=active_swap_plan)
         for prior_key, prior_plan in reversed(prior_keys):
             swap_gradients(raw_model, prior_key, plan=prior_plan)
     
@@ -244,7 +257,11 @@ def train_step(model, raw_model, ref_model, private_batch, public_batch,
     with torch.no_grad():
         preds = outputs_c2.logits[:, :-1, :].argmax(dim=-1)
         targets = labels[:, 1:]
-        acc = (preds == targets).float().mean().item()
+        valid = targets != -100
+        if valid.any():
+            acc = (preds[valid] == targets[valid]).float().mean().item()
+        else:
+            acc = 0.0
     
     scaled_priv.backward()
     
@@ -279,7 +296,8 @@ def train_step(model, raw_model, ref_model, private_batch, public_batch,
         optimizer.step()
     
     # === Step 7: Back to C1 ===
-    raw_model.unapply_key(key)
+    if key is not None:
+        unapply_permutation(raw_model, key, plan=active_swap_plan)
     for prior_key, prior_plan in reversed(prior_keys):
         unapply_permutation(raw_model, prior_key, plan=prior_plan)
     
@@ -288,7 +306,7 @@ def train_step(model, raw_model, ref_model, private_batch, public_batch,
 
 @torch.no_grad()
 def evaluate_on_dataset(model, dataloader, key, device, num_steps=50, eval_c2=False,
-                        prior_keys=None):
+                        prior_keys=None, active_swap_plan=None):
     """Evaluate model on a dataset.
     
     Args:
@@ -300,6 +318,7 @@ def evaluate_on_dataset(model, dataloader, key, device, num_steps=50, eval_c2=Fa
         eval_c2: Whether to also evaluate C2 architecture
         prior_keys: List of (key, swap_plan) pairs to apply before the eval key
                     for cumulative mode. None or [] for independent mode.
+        active_swap_plan: Optional pre-compiled SwapPlan for eval key.
         
     Returns:
         Dict with loss, ppl, acc for C1 (and C2 if eval_c2=True)
@@ -308,7 +327,7 @@ def evaluate_on_dataset(model, dataloader, key, device, num_steps=50, eval_c2=Fa
         prior_keys = []
     
     model.eval()
-    
+
     total_loss_c1 = 0.0
     total_acc_c1 = 0.0
     total_top3_c1 = 0.0
@@ -316,74 +335,109 @@ def evaluate_on_dataset(model, dataloader, key, device, num_steps=50, eval_c2=Fa
     total_acc_c2 = 0.0
     total_top3_c2 = 0.0
     num_batches = 0
-    
+
     data_iter = iter(dataloader)
-    
-    for _ in range(num_steps):
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            data_iter = iter(dataloader)
-            batch = next(data_iter)
-        
-        input_ids = batch["input_ids"].to(device)
-        labels = batch["labels"].to(device)
-        
-        # Evaluate C1 (public architecture)
-        outputs_c1 = model(input_ids, labels=labels)
-        loss_c1 = outputs_c1.loss.item()
-        logits_c1 = outputs_c1.logits[:, :-1, :]
-        targets = labels[:, 1:]
-        preds_c1 = logits_c1.argmax(dim=-1)
-        acc_c1 = (preds_c1 == targets).float().mean().item()
-        top3_c1 = logits_c1.topk(3, dim=-1).indices
-        top3_acc_c1 = (top3_c1 == targets.unsqueeze(-1)).any(dim=-1).float().mean().item()
-        
-        total_loss_c1 += loss_c1
-        total_acc_c1 += acc_c1
-        total_top3_c1 += top3_acc_c1
-        
-        # Evaluate C2 (or cumulative C_{k+1}) if requested
-        if eval_c2:
-            # Apply prior keys (cumulative context), then eval key
-            for prior_key, prior_plan in prior_keys:
-                apply_permutation(model, prior_key, plan=prior_plan)
-            model.apply_key(key)
-            
-            outputs_c2 = model(input_ids, labels=labels)
-            loss_c2 = outputs_c2.loss.item()
-            logits_c2 = outputs_c2.logits[:, :-1, :]
-            preds_c2 = logits_c2.argmax(dim=-1)
-            acc_c2 = (preds_c2 == targets).float().mean().item()
-            top3_c2 = logits_c2.topk(3, dim=-1).indices
-            top3_acc_c2 = (top3_c2 == targets.unsqueeze(-1)).any(dim=-1).float().mean().item()
-            
-            # Unapply in reverse
-            model.unapply_key(key)
-            for prior_key, prior_plan in reversed(prior_keys):
-                unapply_permutation(model, prior_key, plan=prior_plan)
-            
-            total_loss_c2 += loss_c2
-            total_acc_c2 += acc_c2
-            total_top3_c2 += top3_acc_c2
-        
-        num_batches += 1
+
+    with torch.no_grad():
+        for _ in range(num_steps):
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                data_iter = iter(dataloader)
+                batch = next(data_iter)
+
+            input_ids = batch["input_ids"].to(device)
+            labels = batch["labels"].to(device)
+
+            # Evaluate C1 (public architecture)
+            outputs_c1 = model(input_ids, labels=labels)
+            loss_c1 = outputs_c1.loss.item()
+            logits_c1 = outputs_c1.logits[:, :-1, :]
+            targets = labels[:, 1:]
+            preds_c1 = logits_c1.argmax(dim=-1)
+            valid = targets != -100
+            if valid.any():
+                acc_c1 = (preds_c1[valid] == targets[valid]).float().mean().item()
+            else:
+                acc_c1 = 0.0
+            top3_c1 = logits_c1.topk(3, dim=-1).indices
+            if valid.any():
+                top3_acc_c1 = (
+                    (top3_c1[valid] == targets[valid].unsqueeze(-1)).any(dim=-1).float().mean().item()
+                )
+            else:
+                top3_acc_c1 = 0.0
+
+            total_loss_c1 += loss_c1
+            total_acc_c1 += acc_c1
+            total_top3_c1 += top3_acc_c1
+
+            # Evaluate C2 (or cumulative C_{k+1}) if requested
+            if eval_c2:
+                # Apply prior keys (cumulative context), then eval key
+                for prior_key, prior_plan in prior_keys:
+                    apply_permutation(model, prior_key, plan=prior_plan)
+                if key is not None:
+                    apply_permutation(model, key, plan=active_swap_plan)
+
+                outputs_c2 = model(input_ids, labels=labels)
+                loss_c2 = outputs_c2.loss.item()
+                logits_c2 = outputs_c2.logits[:, :-1, :]
+                preds_c2 = logits_c2.argmax(dim=-1)
+                if valid.any():
+                    acc_c2 = (preds_c2[valid] == targets[valid]).float().mean().item()
+                else:
+                    acc_c2 = 0.0
+                top3_c2 = logits_c2.topk(3, dim=-1).indices
+                if valid.any():
+                    top3_acc_c2 = (
+                        (top3_c2[valid] == targets[valid].unsqueeze(-1)).any(dim=-1).float().mean().item()
+                    )
+                else:
+                    top3_acc_c2 = 0.0
+
+                # Unapply in reverse
+                if key is not None:
+                    unapply_permutation(model, key, plan=active_swap_plan)
+                for prior_key, prior_plan in reversed(prior_keys):
+                    unapply_permutation(model, prior_key, plan=prior_plan)
+
+                total_loss_c2 += loss_c2
+                total_acc_c2 += acc_c2
+                total_top3_c2 += top3_acc_c2
+
+            num_batches += 1
     
     model.train()
-    
+
+    # Average across ranks when running distributed
+    if dist.is_initialized():
+        vals = [total_loss_c1, total_acc_c1, total_top3_c1, float(num_batches)]
+        if eval_c2:
+            vals.extend([total_loss_c2, total_acc_c2, total_top3_c2])
+        t = torch.tensor(vals, device=device, dtype=torch.float64)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        total_loss_c1, total_acc_c1, total_top3_c1, num_batches = (
+            t[0].item(), t[1].item(), t[2].item(), t[3].item(),
+        )
+        if eval_c2:
+            total_loss_c2, total_acc_c2, total_top3_c2 = (
+                t[4].item(), t[5].item(), t[6].item(),
+            )
+
     result = {
         "loss_c1": total_loss_c1 / num_batches,
         "acc_c1": total_acc_c1 / num_batches,
         "top3_acc_c1": total_top3_c1 / num_batches,
         "ppl_c1": math.exp(min(total_loss_c1 / num_batches, 100)),
     }
-    
+
     if eval_c2:
         result["loss_c2"] = total_loss_c2 / num_batches
         result["acc_c2"] = total_acc_c2 / num_batches
         result["top3_acc_c2"] = total_top3_c2 / num_batches
         result["ppl_c2"] = math.exp(min(total_loss_c2 / num_batches, 100))
-    
+
     return result
 
 
@@ -414,7 +468,7 @@ def main():
     model = GPTNeoForCausalLMTiered.from_pretrained(args.checkpoint)
     model.to(device)
     
-    key = load_key(args.key_path)
+    key = _normalize_key_fields(load_key(args.key_path))
     if is_main:
         print(f"Loaded active key: {len(key.attn_heads)} attention swaps, {len(key.mlp_cols)} MLP swaps")
     
@@ -427,7 +481,7 @@ def main():
         if is_main:
             print(f"Cumulative mode: {len(args.cumulative_key_paths)} prior key(s)")
         for kp in args.cumulative_key_paths:
-            pk = load_key(kp)
+            pk = _normalize_key_fields(load_key(kp))
             sp = build_swap_plan(model, pk, device)
             prior_keys.append((pk, sp))
             if is_main:
@@ -437,6 +491,7 @@ def main():
     # (C1 = public/no key)
     # In cumulative mode, C_{k+1} applies keys 0..k, so eval must do the same.
     all_keys = {}  # {label: PermutationKey}
+    all_key_swap_plans = {}  # {label: SwapPlan}
     all_eval_prior_keys = {}  # {label: list of (key, plan) pairs to apply before eval key}
     active_tier_label = None
     if args.all_key_paths:
@@ -444,7 +499,7 @@ def main():
         all_loaded_keys = []
         all_swap_plans = []
         for kp in args.all_key_paths:
-            k = load_key(kp)
+            k = _normalize_key_fields(load_key(kp))
             sp = build_swap_plan(model, k, device)
             all_loaded_keys.append(k)
             all_swap_plans.append(sp)
@@ -452,6 +507,7 @@ def main():
         for i, kp in enumerate(args.all_key_paths):
             label = f"C{i + 2}"  # C2, C3, C4, ...
             all_keys[label] = all_loaded_keys[i]
+            all_key_swap_plans[label] = all_swap_plans[i]
 
             if cumulative_mode:
                 # C_{k+1} eval applies keys 0..k-1 as prior, then key k
@@ -473,11 +529,13 @@ def main():
         if active_tier_label is None:
             label = f"C{len(all_keys) + 2}"
             all_keys[label] = key
+            all_key_swap_plans[label] = build_swap_plan(model, key, device)
             all_eval_prior_keys[label] = list(prior_keys)
             active_tier_label = label
     else:
         active_tier_label = "C2"
         all_keys["C2"] = key
+        all_key_swap_plans["C2"] = build_swap_plan(model, key, device)
         all_eval_prior_keys["C2"] = list(prior_keys)
     
     # Create reference model for KL (frozen copy of pretrained C1)
@@ -501,6 +559,24 @@ def main():
     
     # Keep raw_model reference for weight manipulation (apply_key, swap_gradients, etc.)
     raw_model = model
+
+    # Pre-build/rebuild swap plans on the final raw model (matches pretraining behavior).
+    active_swap_plan = build_swap_plan(raw_model, key, device)
+    prior_keys = [
+        (prior_key, build_swap_plan(raw_model, prior_key, device))
+        for prior_key, _ in prior_keys
+    ]
+    all_key_swap_plans = {
+        label: build_swap_plan(raw_model, eval_key, device)
+        for label, eval_key in all_keys.items()
+    }
+    all_eval_prior_keys = {
+        label: [
+            (prior_key, build_swap_plan(raw_model, prior_key, device))
+            for prior_key, _ in prior_key_list
+        ]
+        for label, prior_key_list in all_eval_prior_keys.items()
+    }
     
     # Wrap in DDP
     if is_distributed:
@@ -511,52 +587,61 @@ def main():
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
-    collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
-    
-    # Load private/forget data (for L_priv and private validation)
+    lm_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+    # Load private/forget data (for L_priv training + optional validation)
     if is_main:
         print(f"Loading private/forget data from {args.private_data}")
     private_dataset = load_from_disk(args.private_data)
-    
-    # Split into train/val if not already split
+
+    private_val = None
     if "train" in private_dataset and "test" in private_dataset:
         private_train = private_dataset["train"]
         private_val = private_dataset["test"]
     elif "train" in private_dataset:
         private_train = private_dataset["train"]
-        private_val = private_dataset["train"].select(range(min(1000, len(private_dataset["train"]))))
     else:
-        n_val = max(100, len(private_dataset) // 10)
-        private_train = private_dataset.select(range(len(private_dataset) - n_val))
-        private_val = private_dataset.select(range(len(private_dataset) - n_val, len(private_dataset)))
-    
+        private_train = private_dataset
+
+    private_has_labels = "labels" in private_train.column_names
     cols_to_keep = ["input_ids", "attention_mask"]
+    if private_has_labels:
+        cols_to_keep.append("labels")
     cols_to_remove = [c for c in private_train.column_names if c not in cols_to_keep]
     if cols_to_remove:
         private_train = private_train.remove_columns(cols_to_remove)
-        private_val = private_val.remove_columns(cols_to_remove)
-    
+        if private_val is not None:
+            private_val = private_val.remove_columns(cols_to_remove)
+
+    private_collator = default_data_collator if private_has_labels else lm_collator
+    if is_main and private_has_labels:
+        print("Private dataset includes labels: using precomputed labels (e.g., response-only masking).")
+
     private_sampler = DistributedSampler(private_train, shuffle=True) if is_distributed else None
     private_loader = DataLoader(
         private_train,
         batch_size=args.batch_size,
         sampler=private_sampler,
         shuffle=(private_sampler is None),
-        collate_fn=collator,
+        collate_fn=private_collator,
         drop_last=True,
         num_workers=args.num_workers,
         pin_memory=True,
     )
-    
-    private_val_loader = DataLoader(
-        private_val,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=collator,
-        drop_last=True,
-        num_workers=args.num_workers,
-        pin_memory=True,
-    )
+
+    private_val_loader = None
+    if private_val is not None:
+        private_val_sampler = DistributedSampler(private_val, shuffle=False) if is_distributed else None
+        private_val_loader = DataLoader(
+            private_val,
+            batch_size=args.batch_size,
+            sampler=private_val_sampler,
+            shuffle=False,
+            collate_fn=private_collator,
+            drop_last=True,
+            num_workers=args.num_workers,
+            pin_memory=True,
+        )
     
     # Load public/retain data (for R_KL and retain validation)
     public_loader = None
@@ -590,17 +675,19 @@ def main():
                 batch_size=args.batch_size,
                 sampler=public_sampler,
                 shuffle=(public_sampler is None),
-                collate_fn=collator,
+                collate_fn=lm_collator,
                 drop_last=True,
                 num_workers=args.num_workers,
                 pin_memory=True,
             )
         
+        retain_val_sampler = DistributedSampler(retain_val, shuffle=False) if is_distributed else None
         retain_val_loader = DataLoader(
             retain_val,
             batch_size=args.batch_size,
+            sampler=retain_val_sampler,
             shuffle=False,
-            collate_fn=collator,
+            collate_fn=lm_collator,
             drop_last=True,
             num_workers=args.num_workers,
             pin_memory=True,
@@ -647,6 +734,7 @@ def main():
     global_step = 0
     wandb_run_id = None
     cumulative_wall_secs = 0.0
+    data_epoch = 0
     if args.resume_from:
         training_state_path = os.path.join(args.resume_from, "training_state.pt")
         if os.path.exists(training_state_path):
@@ -664,7 +752,11 @@ def main():
             global_step = training_state["global_step"]
             wandb_run_id = training_state.get("wandb_run_id")
             cumulative_wall_secs = training_state.get("cumulative_wall_secs", 0.0)
+            data_epoch = training_state.get("data_epoch", 0)
+            if global_step > 0 and data_epoch == 0 and len(private_loader) > 0:
+                data_epoch = global_step // len(private_loader)
             print(f"Resumed finetuning state from step {global_step}")
+            print(f"  Resumed data_epoch: {data_epoch}")
             if cumulative_wall_secs > 0:
                 print(f"  Resumed cumulative wall time: {cumulative_wall_secs / 3600:.2f}h")
 
@@ -674,7 +766,7 @@ def main():
             wandb.init(
                 project=args.wandb_project,
                 id=wandb_run_id,
-                resume="must",
+                resume="allow",
                 config=vars(args),
             )
             print(f"Resumed wandb run: {wandb_run_id}")
@@ -752,12 +844,115 @@ def main():
     # Cumulative trackers
     cumulative_tokens = global_step * (tokens_private_per_step + tokens_public_per_step)
     train_start_wall = time.time()
+
+    def run_validation(step_for_logging: int) -> float:
+        """Run full validation pass and return active-tier private loss.
+
+        All ranks participate in evaluation (each processes its own shard),
+        and evaluate_on_dataset all-reduces the results. Only rank 0 prints
+        and logs to wandb.
+        """
+        if is_main:
+            print(f"\n[Validation @ Step {step_for_logging}]")
+
+        val_log = {"train/step": step_for_logging}
+
+        # Evaluate C1 + all keyed tiers on private data (when val split exists)
+        if private_val_loader is not None:
+            c1_private = evaluate_on_dataset(
+                raw_model, private_val_loader, key, device,
+                num_steps=args.eval_steps, eval_c2=False
+            )
+            if is_main:
+                print(f"  Private data:")
+                print(f"    C1: loss={c1_private['loss_c1']:.4f}, ppl={c1_private['ppl_c1']:.2f}, acc={c1_private['acc_c1']:.4f}")
+            val_log["Val Private/C1 Loss"] = c1_private["loss_c1"]
+            val_log["Val Private/C1 Perplexity"] = c1_private["ppl_c1"]
+            val_log["Val Private/C1 Accuracy"] = c1_private["acc_c1"]
+
+            for tier_label, eval_key in all_keys.items():
+                tier_metrics = evaluate_on_dataset(
+                    raw_model, private_val_loader, eval_key, device,
+                    num_steps=args.eval_steps, eval_c2=True,
+                    prior_keys=all_eval_prior_keys.get(tier_label, []),
+                    active_swap_plan=all_key_swap_plans.get(tier_label),
+                )
+                if is_main:
+                    tag = "★" if tier_label == active_tier_label else " "
+                    print(f"  {tag} {tier_label}: loss={tier_metrics['loss_c2']:.4f}, ppl={tier_metrics['ppl_c2']:.2f}, acc={tier_metrics['acc_c2']:.4f}")
+                val_log[f"Val Private/{tier_label} Loss"] = tier_metrics["loss_c2"]
+                val_log[f"Val Private/{tier_label} Perplexity"] = tier_metrics["ppl_c2"]
+                val_log[f"Val Private/{tier_label} Accuracy"] = tier_metrics["acc_c2"]
+
+        # Evaluate C1 + all keyed tiers on retain data
+        if retain_val_loader is not None:
+            c1_retain = evaluate_on_dataset(
+                raw_model, retain_val_loader, key, device,
+                num_steps=args.eval_steps, eval_c2=False
+            )
+            if is_main:
+                print(f"  Retain data:")
+                print(f"    C1: loss={c1_retain['loss_c1']:.4f}, ppl={c1_retain['ppl_c1']:.2f}, acc={c1_retain['acc_c1']:.4f}")
+            val_log["Val Retain/C1 Loss"] = c1_retain["loss_c1"]
+            val_log["Val Retain/C1 Perplexity"] = c1_retain["ppl_c1"]
+            val_log["Val Retain/C1 Accuracy"] = c1_retain["acc_c1"]
+
+            for tier_label, eval_key in all_keys.items():
+                tier_metrics = evaluate_on_dataset(
+                    raw_model, retain_val_loader, eval_key, device,
+                    num_steps=args.eval_steps, eval_c2=True,
+                    prior_keys=all_eval_prior_keys.get(tier_label, []),
+                    active_swap_plan=all_key_swap_plans.get(tier_label),
+                )
+                if is_main:
+                    tag = "★" if tier_label == active_tier_label else " "
+                    print(f"  {tag} {tier_label}: loss={tier_metrics['loss_c2']:.4f}, ppl={tier_metrics['ppl_c2']:.2f}, acc={tier_metrics['acc_c2']:.4f}")
+                val_log[f"Val Retain/{tier_label} Loss"] = tier_metrics["loss_c2"]
+                val_log[f"Val Retain/{tier_label} Perplexity"] = tier_metrics["ppl_c2"]
+                val_log[f"Val Retain/{tier_label} Accuracy"] = tier_metrics["acc_c2"]
+
+        if is_main:
+            import sys
+            sys.stdout.flush()
+            wandb.log(val_log)
+            print(flush=True)
+        # Prefer private val loss for best-model tracking, fall back to retain
+        active_loss = val_log.get(f"Val Private/{active_tier_label} Loss",
+                                  val_log.get(f"Val Retain/{active_tier_label} Loss",
+                                              float("inf")))
+        return active_loss
     
     # Training loop
+    if private_sampler is not None and global_step > 0:
+        private_sampler.set_epoch(data_epoch)
     private_iter = iter(private_loader)
-    public_iter = iter(public_loader) if public_loader else None
+    if global_step > 0 and len(private_loader) > 0:
+        private_batches_consumed = global_step % len(private_loader)
+        if private_batches_consumed > 0:
+            if is_main:
+                print(
+                    f"  Fast-forwarding private dataloader: skipping {private_batches_consumed} "
+                    f"batches ({private_batches_consumed}/{len(private_loader)} in epoch {data_epoch})"
+                )
+            for _ in range(private_batches_consumed):
+                next(private_iter)
+
+    public_iter = None
+    if public_loader:
+        if public_sampler is not None and global_step > 0:
+            public_sampler.set_epoch(data_epoch)
+        public_iter = iter(public_loader)
+        if global_step > 0 and len(public_loader) > 0:
+            public_batches_consumed = global_step % len(public_loader)
+            if public_batches_consumed > 0:
+                if is_main:
+                    print(
+                        f"  Fast-forwarding public dataloader: skipping {public_batches_consumed} "
+                        f"batches ({public_batches_consumed}/{len(public_loader)} in epoch {data_epoch})"
+                    )
+                for _ in range(public_batches_consumed):
+                    next(public_iter)
     best_val_loss = float('inf')
-    data_epoch = 0
     
     if is_main:
         print(f"Starting finetuning for {args.max_steps} steps...")
@@ -769,9 +964,22 @@ def main():
                 f"{args.keyed_l2_lambda}"
             )
         print(f"Validation every {args.eval_interval} steps")
-        print(f"Tracking: C1 on retain, C1 on private, C2 on private")
+        print(f"Tracking: C1/C2 on private and retain validation splits")
     
     pbar = tqdm(total=args.max_steps, desc="Finetuning", initial=global_step) if is_main else None
+
+    # Initial baseline validation before any optimizer step/backprop in this run.
+    if global_step == 0:
+        initial_active_loss = run_validation(step_for_logging=0)
+        if is_main and initial_active_loss < best_val_loss:
+            best_val_loss = initial_active_loss
+            save_path = os.path.join(args.output_dir, "best")
+            save_checkpoint(raw_model, tokenizer, optimizer, save_path,
+                          scheduler=scheduler, global_step=global_step,
+                          wandb_run_id=wandb_run_id,
+                          cumulative_wall_secs=cumulative_wall_secs,
+                          data_epoch=data_epoch)
+            print(f"Initial best model saved to {save_path}")
     
     while global_step < args.max_steps:
         # ── Step timing ──
@@ -804,7 +1012,8 @@ def main():
             model, raw_model, ref_model, private_batch, public_batch, key, 
             optimizer, device, args.kl_lambda, args.max_grad_norm,
             keyed_param_masks=keyed_param_masks, keyed_mask_plan=keyed_mask_plan,
-            is_distributed=is_distributed, prior_keys=prior_keys
+            is_distributed=is_distributed, prior_keys=prior_keys,
+            active_swap_plan=active_swap_plan,
         )
         scheduler.step()
         global_step += 1
@@ -844,7 +1053,7 @@ def main():
                 # Timing
                 "perf/step_time_sec": step_elapsed,
                 "perf/wall_clock_hrs": cumulative_wall_secs / 3600,
-                "perf/wall_since_launch_hrs": (time.time() - train_start_wall) / 3600,
+                "perf/wall_since_launch_hrs": cumulative_wall_secs / 3600,
                 # Throughput
                 "perf/tokens_per_sec": tokens_per_sec,
                 # FLOPs
@@ -859,79 +1068,18 @@ def main():
             log_dict.update(get_gpu_memory_stats(device))
             wandb.log(log_dict)
         
-        # Validation (rank 0 only — eval on raw_model)
-        do_eval = (global_step == 1 or global_step % args.eval_interval == 0)
-        if is_main and do_eval:
-            print(f"\n[Validation @ Step {global_step}]")
-            
-            # Evaluate C1 + all keyed tiers on private/forget data
-            val_log = {"train/step": global_step}
-            
-            # C1 (public, no key) on private data
-            c1_private = evaluate_on_dataset(
-                raw_model, private_val_loader, key, device,
-                num_steps=args.eval_steps, eval_c2=False
-            )
-            print(f"  Private data:")
-            print(f"    C1: loss={c1_private['loss_c1']:.4f}, ppl={c1_private['ppl_c1']:.2f}, acc={c1_private['acc_c1']:.4f}")
-            val_log["Val Private/C1 Loss"] = c1_private["loss_c1"]
-            val_log["Val Private/C1 Perplexity"] = c1_private["ppl_c1"]
-            val_log["Val Private/C1 Accuracy"] = c1_private["acc_c1"]
-            
-            for tier_label, eval_key in all_keys.items():
-                tier_metrics = evaluate_on_dataset(
-                    raw_model, private_val_loader, eval_key, device, 
-                    num_steps=args.eval_steps, eval_c2=True,
-                    prior_keys=all_eval_prior_keys.get(tier_label, [])
-                )
-                tag = "★" if tier_label == active_tier_label else " "
-                print(f"  {tag} {tier_label}: loss={tier_metrics['loss_c2']:.4f}, ppl={tier_metrics['ppl_c2']:.2f}, acc={tier_metrics['acc_c2']:.4f}")
-                val_log[f"Val Private/{tier_label} Loss"] = tier_metrics["loss_c2"]
-                val_log[f"Val Private/{tier_label} Perplexity"] = tier_metrics["ppl_c2"]
-                val_log[f"Val Private/{tier_label} Accuracy"] = tier_metrics["acc_c2"]
-            
-            # Evaluate C1 + all keyed tiers on retain data
-            if retain_val_loader is not None:
-                c1_retain = evaluate_on_dataset(
-                    raw_model, retain_val_loader, key, device,
-                    num_steps=args.eval_steps, eval_c2=False
-                )
-                print(f"  Retain data:")
-                print(f"    C1: loss={c1_retain['loss_c1']:.4f}, ppl={c1_retain['ppl_c1']:.2f}, acc={c1_retain['acc_c1']:.4f}")
-                val_log["Val Retain/C1 Loss"] = c1_retain["loss_c1"]
-                val_log["Val Retain/C1 Perplexity"] = c1_retain["ppl_c1"]
-                val_log["Val Retain/C1 Accuracy"] = c1_retain["acc_c1"]
-                
-                for tier_label, eval_key in all_keys.items():
-                    tier_metrics = evaluate_on_dataset(
-                        raw_model, retain_val_loader, eval_key, device,
-                        num_steps=args.eval_steps, eval_c2=True,
-                        prior_keys=all_eval_prior_keys.get(tier_label, [])
-                    )
-                    tag = "★" if tier_label == active_tier_label else " "
-                    print(f"  {tag} {tier_label}: loss={tier_metrics['loss_c2']:.4f}, ppl={tier_metrics['ppl_c2']:.2f}, acc={tier_metrics['acc_c2']:.4f}")
-                    val_log[f"Val Retain/{tier_label} Loss"] = tier_metrics["loss_c2"]
-                    val_log[f"Val Retain/{tier_label} Perplexity"] = tier_metrics["ppl_c2"]
-                    val_log[f"Val Retain/{tier_label} Accuracy"] = tier_metrics["acc_c2"]
-            
-            wandb.log(val_log)
-            
-            print()
-            
-            # Save best model based on active tier's loss on private data
-            active_c2_loss = val_log.get(f"Val Private/{active_tier_label} Loss", float('inf'))
-            if active_c2_loss < best_val_loss:
+        # Validation (all ranks participate, rank 0 logs)
+        if global_step % args.eval_interval == 0:
+            active_c2_loss = run_validation(step_for_logging=global_step)
+            if is_main and active_c2_loss < best_val_loss:
                 best_val_loss = active_c2_loss
                 save_path = os.path.join(args.output_dir, "best")
                 save_checkpoint(raw_model, tokenizer, optimizer, save_path,
                               scheduler=scheduler, global_step=global_step,
                               wandb_run_id=wandb_run_id,
-                              cumulative_wall_secs=cumulative_wall_secs)
+                              cumulative_wall_secs=cumulative_wall_secs,
+                              data_epoch=data_epoch)
                 print(f"New best model saved to {save_path}")
-        
-        # In DDP, keep all ranks aligned around rank-0-only eval to avoid hangs.
-        if is_distributed and do_eval:
-            dist.barrier()
         
         # Save checkpoint (rank 0 only)
         if is_main and global_step % args.save_interval == 0:
@@ -939,7 +1087,8 @@ def main():
             save_checkpoint(raw_model, tokenizer, optimizer, save_path,
                           scheduler=scheduler, global_step=global_step,
                           wandb_run_id=wandb_run_id,
-                          cumulative_wall_secs=cumulative_wall_secs)
+                          cumulative_wall_secs=cumulative_wall_secs,
+                          data_epoch=data_epoch)
             print(f"Saved checkpoint to {save_path}")
     
     if pbar is not None:
@@ -951,7 +1100,8 @@ def main():
         save_checkpoint(raw_model, tokenizer, optimizer, save_path,
                        scheduler=scheduler, global_step=global_step,
                        wandb_run_id=wandb_run_id,
-                       cumulative_wall_secs=cumulative_wall_secs)
+                       cumulative_wall_secs=cumulative_wall_secs,
+                       data_epoch=data_epoch)
 
         total_flops = flops_per_step * global_step
         print(f"\n{'='*60}")

@@ -43,7 +43,6 @@ L_ft = (1 − λ) · L_priv(C2) + λ · R_KL(C1_current, C1_frozen)
 
 Only keyed weights are updated during finetuning. The KL term regularizes against C1 divergence from the pretrained baseline.
 
-**SuperGLUE finetuning** (`superglue_finetune.py`) demonstrates that C2 can learn NLU capabilities hidden behind the key, using answer-only label masking so only answer tokens contribute to the loss.
 
 ## Installation
 
@@ -64,8 +63,6 @@ PYTHONPATH=./src pytest ./src/tiered/tests -sv
 ```
 ├── configs/
 │   └── keys/                          # Pre-generated permutation keys
-│       ├── 64m/both/                  # 64M model, both-projection swaps
-│       │   └── key_20pct_mixed.json
 │       ├── 150m/both/
 │       │   ├── key_14pct.json
 │       │   └── key_7pct_{1,2,3}.json
@@ -78,7 +75,12 @@ PYTHONPATH=./src pytest ./src/tiered/tests -sv
 │   ├── keys/
 │   │   └── generate_key.py            # Permutation key generator
 │   ├── eval/
-│   │   ├── eval_memorization.py       # Synthetic bio memorization eval (C1 vs C2)
+│   │   ├── partial_key_recovery_memorization.py  # Partial-key C2 recovery (greedy top1/exact)
+│   │   ├── llm_judge_c1_c2.py         # LLM-as-judge pairwise C1 vs C2 on AlpacaEval (local gpt-oss-120b)
+│   │   ├── analyze_c1_keyed_magnitudes.py
+│   │   ├── analyze_c1_unified_dual_models.py
+│   │   ├── inspect_baseline_memo.py
+│   │   ├── qualitative_fineweb2_spa_c1_c2.py
 │   │   ├── qwen_key_destruction_ablation.py  # Qwen key-destruction ablation on MMLU + MATH500
 │   │   └── run_qwen_key_destruction_5pct.sh # 0.5% steps up to 10% (MMLU + MATH500)
 │   ├── ablation/
@@ -96,14 +98,11 @@ PYTHONPATH=./src pytest ./src/tiered/tests -sv
 │   ├── mila/                          # SLURM sbatch scripts (Mila cluster)
 │   │   ├── pretrain.sbatch
 │   │   ├── tiered_pretrain.sbatch
-│   │   ├── tiered_pretrain_batches.sbatch
-│   │   └── private_finetune_superglue.sbatch
+│   │   └── tiered_pretrain_batches.sbatch
 │   └── snow/                          # SLURM sbatch scripts (Snowflake cluster)
 │       ├── data/                      # dataset prep launchers
 │       ├── wiki/
-│       │   └── pretrain/64m/run.sh
-│       ├── wmdp/
-│       │   └── finetune/150m/run_multi.sh
+│       │   └── pretrain/<size>/run.sh
 │       └── fineweb/
 │           ├── pretrain/<size>/       # baseline + keyed pretraining launchers
 │           ├── finetune/<size>/<dataset>/  # fine-tuning launchers (incl. KL=0 variants)
@@ -119,18 +118,24 @@ PYTHONPATH=./src pytest ./src/tiered/tests -sv
 │   │   ├── scaling.py                 # Public gradient scaling
 │   │   └── utils.py                   # Model submodule accessors
 │   ├── train/
-│   │   ├── tiered_pretrain.py         # 2-tier alignment pretraining (C1/C2)
-│   │   ├── multi_tiered_pretrain.py   # N-tier pretraining (sampling, constant compute)
-│   │   ├── multi_tiered_naive.py      # N-tier pretraining (naive, all tiers every step)
-│   │   ├── pretrain.py                # Standard baseline pretraining (no tiered alignment)
-│   │   ├── private_finetune.py        # KL-regularized private finetuning
-│   │   ├── superglue_finetune.py      # SuperGLUE private finetuning (answer-only masking)
+│   │   ├── pretrain/
+│   │   │   ├── tiered_pretrain.py              # 2-tier alignment pretraining (C1/C2)
+│   │   │   ├── tiered_pretrain_c2k.py          # 2-tier variant with C2-keyed schedule
+│   │   │   ├── multi_tiered_pretrain.py        # N-tier pretraining (sampling, constant compute)
+│   │   │   ├── multi_tiered_naive.py           # N-tier pretraining (naive, all tiers every step)
+│   │   │   ├── cumulative_mult_tiered_pretrain.py  # Cumulative N-tier variant
+│   │   │   └── pretrain.py                     # Baseline pretraining (no tiered alignment)
+│   │   ├── finetune/
+│   │   │   ├── private_finetune.py             # KL-regularized private finetuning
+│   │   │   ├── private_finetune_memorization.py # Private finetune + memorization eval loop
+│   │   │   ├── lora_private_finetune.py        # LoRA adapter baseline
+│   │   │   ├── lora_stacked_private_finetune.py # Stacked-LoRA variant
+│   │   │   └── extraction_attack.py            # Fixed-step extraction attack on C1
 │   │   ├── inference.py               # Compare C1 vs C2 generation
 │   │   └── utils.py                   # Model loading, checkpointing, tokenizer
 │   ├── data/
 │   │   ├── prepare_wikipedia.py       # Wikipedia → forget/adjacent/retain splits
 │   │   ├── prepare_fineweb.py         # FineWeb → tokenized chunks for pretraining
-│   │   ├── prepare_superglue.py       # SuperGLUE → answer-only masked dataset
 │   │   ├── tinystories_tokenize_and_split.py
 │   │   └── explore.py                 # Dataset statistics
 │   └── tests/
@@ -172,7 +177,6 @@ This generates a key covering ~20% of model parameters, split 25% attention / 75
 
 | Key file | Model | Coverage |
 |----------|-------|----------|
-| `64m/key_20pct_mixed.json` | 64M | 20% |
 | `150m/key_14pct.json` | 150M | 14% |
 | `150m/key_7pct_{1,2,3}.json` | 150M | 7% each (for multi-tier) |
 | `530m/key_14pct.json` | 530M | 14% |
@@ -188,7 +192,7 @@ from tiered.model import GPTNeoForCausalLMTiered
 from tiered.permutation import load_key
 
 model = GPTNeoForCausalLMTiered.from_pretrained("path/to/checkpoint")
-key = load_key("configs/keys/64m/both/key_20pct_mixed.json")
+key = load_key("configs/keys/150m/both/key_14pct.json")
 
 # Public configuration (C1)
 outputs_c1 = model.generate(input_ids)
@@ -204,7 +208,7 @@ Or use the inference script directly:
 ```bash
 PYTHONPATH=./src python src/tiered/train/inference.py \
     --checkpoint /path/to/checkpoint \
-    --key_path configs/keys/64m/both/key_20pct_mixed.json \
+    --key_path configs/keys/150m/both/key_14pct.json \
     --prompt "Once upon a time"
 ```
 
@@ -215,7 +219,7 @@ Train a model with asymmetric gradient updates on C1 and C2:
 ```bash
 torchrun --standalone --nproc_per_node=3 -m tiered.train.pretrain.tiered_pretrain \
     --data_path /path/to/tokenized/data \
-    --key_path configs/keys/64m/both/key_20pct_mixed.json \
+    --key_path configs/keys/150m/both/key_14pct.json \
     --output_dir /path/to/output \
     --hidden_size 512 --num_heads 32 --num_layers 12 \
     --context_size 1024 --batch_size 16 \
@@ -272,7 +276,7 @@ Finetune the keyed tier on private data while preserving public behavior:
 ```bash
 PYTHONPATH=./src python src/tiered/train/finetune/private_finetune.py \
     --checkpoint /path/to/tiered/checkpoint \
-    --key_path configs/keys/64m/both/key_20pct_mixed.json \
+    --key_path configs/keys/150m/both/key_14pct.json \
     --private_data /path/to/forget/data \
     --public_data /path/to/retain/data \
     --output_dir /path/to/output \
@@ -305,22 +309,6 @@ Key outputs:
 - `output_dir/final/experiment_metadata.json`: rank/budget metadata
 - `output_dir/comparison_summary.json`: perf + FLOPs comparison summary
 
-### SuperGLUE Private Finetuning
-
-Finetune C2 on SuperGLUE NLU tasks with answer-only label masking:
-
-```bash
-PYTHONPATH=./src python src/tiered/train/finetune/superglue_finetune.py \
-    --checkpoint /path/to/pretrained \
-    --key_path configs/keys/64m/both/key_20pct_mixed.json \
-    --superglue_data /path/to/superglue \
-    --public_data /path/to/wiki_bio/retain \
-    --output_dir /path/to/output \
-    --kl_lambda 0.1 --max_steps 10000
-```
-
-Tracks three validation signals: C1 on retain (stability), C1 on SuperGLUE (no leakage), C2 on SuperGLUE (learning).
-
 ## Data Preparation
 
 ### FineWeb (Large-Scale Pretraining)
@@ -352,18 +340,6 @@ python -m tiered.data.prepare_wikipedia \
 
 This produces three HuggingFace `DatasetDict`s (forget, adjacent, retain), each with train/test splits, tokenized and chunked to fixed lengths.
 
-### SuperGLUE
-
-Prepares all 8 SuperGLUE tasks (BoolQ, CB, COPA, MultiRC, ReCoRD, RTE, WiC, WSC) with answer-only label masking:
-
-```bash
-PYTHONPATH=./src python src/tiered/data/prepare_superglue.py \
-    --output-dir /path/to/output/superglue \
-    --context-size 1024
-```
-
-Each example stores `input_ids`, `attention_mask`, and `labels` where `labels=-100` for prompt tokens (only answer tokens receive gradient).
-
 ### Synthetic Bios (Memorization Evaluation)
 
 Generates a controlled dataset of synthetic biographies for measuring memorization:
@@ -389,25 +365,57 @@ python -m tiered.data.tinystories_tokenize_and_split \
 
 ### Memorization Evaluation
 
-Measures how well the model memorizes synthetic bio attribute values (not filler), using precise token-level matching:
+Memorization experiments use greedy autoregressive decoding (no teacher forcing).
+For partial-key C2 recovery on synthetic bios:
 
 ```bash
-# Single checkpoint
-PYTHONPATH=./src python scripts/eval/eval_memorization.py \
+# Partial-key recovery sweep
+PYTHONPATH=./src:. python scripts/eval/partial_key_recovery_memorization.py \
     --checkpoint /path/to/checkpoint \
     --bio_metadata /path/to/bios_metadata.json \
-    --key_path configs/keys/64m/both/key_20pct_mixed.json \
-    --output_dir /path/to/output
-
-# Sweep across all checkpoints
-PYTHONPATH=./src python scripts/eval/eval_memorization.py \
-    --checkpoint /path/to/ckpt_dir \
-    --bio_metadata /path/to/bios_metadata.json \
-    --key_path configs/keys/64m/both/key_20pct_mixed.json \
-    --output_dir /path/to/output --sweep
+    --key_path configs/keys/150m/both/key_14pct.json \
+    --output_dir /path/to/output \
+    --num_runs 100 \
+    --partial_key_pcts 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1 2 3 4 5 6 7 8 9 10 20 30 40 50 60 70 80 90 100
 ```
 
-Reports per-attribute breakdowns (age, profession, hobby, salary), top-k accuracy, and exact match rates for both C1 and C2.
+Reports greedy `top1_acc` and `exact_match` for C1, full C2, and partial-key C2.
+
+### LLM-as-Judge (AlpacaEval, local)
+
+Generates C1/C2 responses on AlpacaEval and judges each pair with a local
+`openai/gpt-oss-120b` (MXFP4, one copy per rank). Both phases are data-parallel
+via `torchrun`; position bias is removed by randomizing the A/B order per pair.
+
+```bash
+PYTHONPATH=./src:. torchrun --standalone --nproc_per_node=8 \
+    scripts/eval/llm_judge_c1_c2.py \
+    --checkpoint /path/to/checkpoint \
+    --key_path configs/keys/530m/both/key_5pct.json \
+    --output_dir /path/to/output
+```
+
+Phase 1 outputs (`c1_outputs.json`, `c2_outputs.json`) are cached on disk so
+reruns skip straight to judging. `judge_results.json` contains per-pair
+verdicts plus aggregate C1/C2 win rates.
+
+### Extraction Attack
+
+Measures how much private data is needed to recover memorization through
+standard keyless finetuning on C1. Trains for a fixed `--max_steps` token budget
+starting from either a tiered-finetuned or baseline checkpoint:
+
+```bash
+torchrun --standalone --nproc_per_node=8 \
+    -m tiered.train.finetune.extraction_attack \
+    --model_checkpoint /path/to/checkpoint \
+    --private_data /path/to/synthetic_bios/tokenized \
+    --bio_metadata /path/to/bios_metadata.json \
+    --data_fraction 1.0 --max_steps 4050 \
+    --output_dir /path/to/output
+```
+
+Memorization is logged on both `train_people` and `test_people` throughout training.
 
 ### Ablation Studies
 

@@ -9,7 +9,8 @@ import torch
 from transformers.models.gpt_neo.modeling_gpt_neo import GPTNeoConfig, GPTNeoForCausalLM
 
 from tiered.permutation.key import PermutationKey, load_key, save_key, validate_key
-from tiered.permutation.permute import apply_permutation, unapply_permutation
+from tiered.permutation.permute import apply_permutation, unapply_permutation, swap_gradients
+from tiered.permutation.masking import build_mask_plan, mask_keyed_gradients, mask_public_gradients
 
 
 class MockGPTNeoConfig(GPTNeoConfig):

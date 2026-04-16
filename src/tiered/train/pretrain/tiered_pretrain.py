@@ -617,7 +617,7 @@ def train(args):
             wandb.init(
                 project=args.wandb_project,
                 id=wandb_run_id,
-                resume="must",
+                resume="allow",
                 config=vars(args),
             )
             print(f"Resumed wandb run: {wandb_run_id}")
@@ -636,12 +636,29 @@ def train(args):
     # dedicated counter (rather than global_step) gives deterministic
     # shuffle order regardless of batch size or dataset size changes.
     data_epoch = 0
+    if args.checkpoint:
+        data_epoch = training_state.get("data_epoch", 0)
+        if is_main:
+            print(f"  Resumed data_epoch: {data_epoch}")
     if local_rank != -1 and global_step > 0:
         sampler.set_epoch(data_epoch)
     data_iter = iter(dataloader)
 
     is_distributed = local_rank != -1
     grad_accum_steps = args.grad_accum_steps
+
+    # Fast-forward dataloader past batches already consumed in this epoch.
+    # Each optimizer step consumes grad_accum_steps micro-batches.
+    if args.checkpoint and global_step > 0:
+        batches_per_epoch = len(dataloader)
+        steps_per_epoch = batches_per_epoch // grad_accum_steps
+        batches_consumed = (global_step % steps_per_epoch) * grad_accum_steps
+        if batches_consumed > 0 and batches_consumed < batches_per_epoch:
+            if is_main:
+                print(f"  Fast-forwarding dataloader: skipping {batches_consumed} batches "
+                      f"({batches_consumed}/{batches_per_epoch} in epoch {data_epoch})")
+            for _ in range(batches_consumed):
+                next(data_iter)
     loss_scale = 1.0 / grad_accum_steps
     effective_batch = args.batch_size * grad_accum_steps * world_size
 
@@ -715,7 +732,6 @@ def train(args):
         cumulative_wall_secs = training_state.get("cumulative_wall_secs", 0.0)
         if is_main and cumulative_wall_secs > 0:
             print(f"  Resumed cumulative wall time: {cumulative_wall_secs / 3600:.2f}h")
-
     # Reset peak memory stats so we track from this point
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats(device)
@@ -931,7 +947,7 @@ def train(args):
                 # Timing
                 "perf/step_time_sec": step_elapsed,
                 "perf/wall_clock_hrs": cumulative_wall_secs / 3600,
-                "perf/wall_since_launch_hrs": (time.time() - train_start_wall) / 3600,
+                "perf/wall_since_launch_hrs": cumulative_wall_secs / 3600,
                 # Throughput
                 "perf/tokens_per_sec": tokens_per_sec,
                 "perf/tokens_per_sec_per_gpu": tokens_per_sec / world_size,
@@ -975,6 +991,7 @@ def train(args):
                 global_step=global_step,
                 wandb_run_id=wandb_run_id,
                 cumulative_wall_secs=cumulative_wall_secs,
+                data_epoch=data_epoch,
             )
             print(f"Saved checkpoint to {save_path}")
 
@@ -993,6 +1010,7 @@ def train(args):
             global_step=global_step,
             wandb_run_id=wandb_run_id,
             cumulative_wall_secs=cumulative_wall_secs,
+            data_epoch=data_epoch,
         )
 
         total_flops = 2 * flops_per_token * cumulative_tokens

@@ -267,6 +267,51 @@ def _make_random_swaps(pool: list[tuple[int, int]], max_swaps: int):
     return swaps
 
 
+def _make_random_cross_layer_swaps(pool: list[tuple[int, int]], max_swaps: int):
+    """Pair up items randomly while forbidding same-layer swaps.
+
+    Unlike _make_cross_layer_swaps, this preserves random layer pairing rather
+    than imposing a round-robin structure over sorted layers.
+
+    Expects a pool larger than 2*max_swaps so that the random cross-layer
+    constraint has room to breathe.  Stops as soon as max_swaps is reached;
+    unused slots are simply discarded.
+
+    Args:
+        pool: Shuffled list of (layer, index) tuples.
+        max_swaps: Maximum number of swaps to generate.
+
+    Returns:
+        List of [[layer_a, idx_a], [layer_b, idx_b]] swaps.
+    """
+    from collections import defaultdict
+
+    buckets = defaultdict(list)
+    for item in pool:
+        buckets[item[0]].append(item)
+
+    active_layers = [layer for layer, items in buckets.items() if items]
+    swaps = []
+
+    while len(active_layers) >= 2 and len(swaps) < max_swaps:
+        layer_a = random.choice(active_layers)
+        layer_b_choices = [layer for layer in active_layers if layer != layer_a]
+        if not layer_b_choices:
+            break
+        layer_b = random.choice(layer_b_choices)
+
+        item_a = buckets[layer_a].pop()
+        item_b = buckets[layer_b].pop()
+        swaps.append([list(item_a), list(item_b)])
+
+        if not buckets[layer_a]:
+            active_layers.remove(layer_a)
+        if layer_b in active_layers and not buckets[layer_b]:
+            active_layers.remove(layer_b)
+
+    return swaps
+
+
 def generate_keys(
     num_keys: int,
     num_layers: int,
@@ -280,6 +325,7 @@ def generate_keys(
     untie_weights: bool = False,
     context_size: int = 1024,
     seed: int = 42,
+    random_cross_layer_pairing: bool = False,
 ) -> list[dict]:
     """Generate N non-overlapping permutation keys.
 
@@ -338,6 +384,10 @@ def generate_keys(
     print(f"Model config: {num_layers} layers, {num_heads} heads, hidden={hidden_size}, mlp={mlp_dim}")
     print(f"Attention mode: {attn_mode}")
     print(f"MLP mode: {mlp_mode}")
+    if random_cross_layer_pairing:
+        print("Cross-layer pairing: random (same-layer swaps forbidden)")
+    else:
+        print("Cross-layer pairing: structured round-robin")
     print(f"Total model params:        {total_params:,} (untied={untie_weights})")
     print(f"Total swappable params:    {total_swappable:,}")
     print(f"  - attention swappable:   {total_swappable_attn:,}")
@@ -379,6 +429,8 @@ def generate_keys(
     # Choose attention swap strategy based on mode
     if attn_mode == "out":
         make_attn_swaps = _make_random_swaps
+    elif random_cross_layer_pairing:
+        make_attn_swaps = _make_random_cross_layer_swaps
     else:
         make_attn_swaps = _make_cross_layer_swaps
 
@@ -388,31 +440,42 @@ def generate_keys(
         "out": "attn_out_heads",
     }[attn_mode]
 
-    # Shuffle and partition attention head slots
+    # Shuffle and partition attention head slots.
+    # For random cross-layer pairing, over-allocate each partition (2x the
+    # needed swap slots) so the random algorithm has slack.  Unused slots
+    # are simply discarded after pairing.
     all_heads = [(l, h) for l in range(num_layers) for h in range(num_heads)]
     random.shuffle(all_heads)
 
-    chunk_size_heads = len(all_heads) // num_keys
+    if random_cross_layer_pairing:
+        oversample_heads = min(4 * swaps_per_key_attn, len(all_heads) // num_keys)
+    else:
+        oversample_heads = len(all_heads) // num_keys
     head_partitions = []
     for k in range(num_keys):
-        start = k * chunk_size_heads
-        end = (k + 1) * chunk_size_heads if k < num_keys - 1 else len(all_heads)
+        start = k * oversample_heads
+        end = min((k + 1) * oversample_heads, len(all_heads))
         head_partitions.append(all_heads[start:end])
 
-    # Shuffle and partition MLP column slots
+    # Shuffle and partition MLP column slots (same oversampling logic).
     all_cols = [(l, c) for l in range(num_layers) for c in range(mlp_dim)]
     random.shuffle(all_cols)
 
-    chunk_size_cols = len(all_cols) // num_keys
+    if random_cross_layer_pairing:
+        oversample_cols = min(4 * swaps_per_key_mlp, len(all_cols) // num_keys)
+    else:
+        oversample_cols = len(all_cols) // num_keys
     col_partitions = []
     for k in range(num_keys):
-        start = k * chunk_size_cols
-        end = (k + 1) * chunk_size_cols if k < num_keys - 1 else len(all_cols)
+        start = k * oversample_cols
+        end = min((k + 1) * oversample_cols, len(all_cols))
         col_partitions.append(all_cols[start:end])
 
     # Choose MLP swap strategy based on mode
     if mlp_mode in ("up", "down"):
         make_mlp_swaps = _make_random_swaps
+    elif random_cross_layer_pairing:
+        make_mlp_swaps = _make_random_cross_layer_swaps
     else:
         make_mlp_swaps = _make_cross_layer_swaps
 
@@ -601,6 +664,13 @@ def main():
         help="MLP swap mode: 'both' (up+down, cross-layer only), "
              "'up' (c_fc only, any layer), 'down' (c_proj only, any layer)",
     )
+    parser.add_argument(
+        "--random_cross_layer_pairing",
+        action="store_true",
+        help="For cross-layer modes only ('attn_mode=full' and/or 'mlp_mode=both'), "
+             "pair slots across random different layers instead of the default "
+             "structured round-robin pairing. Same-layer swaps remain forbidden.",
+    )
     parser.add_argument("--seed", type=int, default=42)
 
     args = parser.parse_args()
@@ -666,6 +736,7 @@ def main():
         untie_weights=args.untie_weights,
         context_size=args.context_size,
         seed=args.seed,
+        random_cross_layer_pairing=args.random_cross_layer_pairing,
     )
 
     output_path = Path(args.output)

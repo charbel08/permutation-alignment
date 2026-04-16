@@ -11,10 +11,9 @@ cd /work/permutation-alignment
 
 python -m tiered.data.prepare_fineweb2_multilingual \
     --output-dir /work/scratch/data/datasets/fineweb2_private \
-    --languages deu_Latn tur_Latn spa_Latn \
-    --chunk-size 1024 \
-    --max-tokens-per-language 500000000 \
+    --languages spa_Latn deu_Latn jpn_Jpan tur_Latn \
+    --chunk-size 2048 \
+    --max-tokens-per-language 5000000000 \
     --test-fraction 0.005 \
-    --shard-size-chunks 5000 \
-    --dataset-revision main \
+    --num-proc 32 \
     --seed 42
