@@ -29,6 +29,9 @@ NGPUS=${NGPUS:-8}
 BATCH_SIZE=${BATCH_SIZE:-4}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-256}
 MAX_INSTANCES=${MAX_INSTANCES:-}
+TEMPERATURE=${TEMPERATURE:-0.4}
+TOP_P=${TOP_P:-0.95}
+DO_SAMPLE=${DO_SAMPLE:-1}
 
 JUDGE_MODEL=${JUDGE_MODEL:-openai/gpt-oss-120b}
 JUDGE_BATCH_SIZE=${JUDGE_BATCH_SIZE:-4}
@@ -56,11 +59,17 @@ echo "  GPUs:         ${NGPUS}"
 echo "  Judge model:  ${JUDGE_MODEL}"
 echo "  Batch size:   ${BATCH_SIZE}"
 echo "  Max tokens:   ${MAX_NEW_TOKENS}"
+echo "  Temperature:  ${TEMPERATURE}"
+echo "  Top-p:        ${TOP_P}"
+echo "  Do sample:    ${DO_SAMPLE}"
 echo "=========================================================="
 
 EXTRA_ARGS=()
 if [ -n "$MAX_INSTANCES" ]; then
   EXTRA_ARGS+=(--max_instances "$MAX_INSTANCES")
+fi
+if [ "$DO_SAMPLE" = "1" ]; then
+  EXTRA_ARGS+=(--do_sample)
 fi
 
 LOG_FILE="logs/llm_judge_c1_vs_c2_530m_key${KEY_SIZE}pct_$(date +%Y%m%d_%H%M%S).log"
@@ -72,6 +81,8 @@ PYTHONPATH=./src:. torchrun --standalone --nproc_per_node="$NGPUS" \
   --output_dir "$OUTPUT_DIR" \
   --batch_size "$BATCH_SIZE" \
   --max_new_tokens "$MAX_NEW_TOKENS" \
+  --temperature "$TEMPERATURE" \
+  --top_p "$TOP_P" \
   --judge_model "$JUDGE_MODEL" \
   --judge_batch_size "$JUDGE_BATCH_SIZE" \
   --judge_max_tokens "$JUDGE_MAX_TOKENS" \

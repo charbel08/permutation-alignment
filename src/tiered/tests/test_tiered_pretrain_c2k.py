@@ -23,6 +23,9 @@ class _TinyTokenizer:
     eos_token = "<eos>"
     pad_token = "<eos>"
 
+    def save_pretrained(self, path):
+        return None
+
 
 class _TinyCollator:
     def __init__(self, tokenizer=None, mlm=False):
@@ -164,6 +167,7 @@ def _default_args(tmp_path: Path, *, max_steps=5, c2_every_k=2, checkpoint=None)
         weight_decay=0.0,
         max_grad_norm=1.0,
         c2_every_k=c2_every_k,
+        c2_metrics_every_k=None,
         log_interval=1,
         save_interval=10_000,
         eval_interval=10_000,
@@ -172,6 +176,7 @@ def _default_args(tmp_path: Path, *, max_steps=5, c2_every_k=2, checkpoint=None)
         run_name="test-run",
         local_rank=-1,
         num_workers=0,
+        seed=123,
     )
 
 
@@ -202,7 +207,13 @@ def _install_common_patches(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(c2k, "detect_gpu_peak_flops", lambda _d: (0.0, "cpu"))
     monkeypatch.setattr(c2k, "get_gpu_memory_stats", lambda _d: {})
 
-    key_obj = SimpleNamespace(attn_heads=[((0, 0), (0, 1))], mlp_cols=[((0, 0), (0, 1))])
+    key_obj = SimpleNamespace(
+        attn_heads=[((0, 0), (0, 1))],
+        attn_out_heads=[],
+        mlp_cols=[((0, 0), (0, 1))],
+        mlp_up_cols=[],
+        mlp_down_cols=[],
+    )
     monkeypatch.setattr(c2k, "load_key", lambda _p: key_obj)
     swap_plan = SimpleNamespace(attn_ops=[], attn_out_ops=[], mlp_ops=[], mlp_up_ops=[], mlp_down_ops=[])
     mask_plan = SimpleNamespace(
@@ -281,6 +292,25 @@ def test_parse_args_rejects_nonpositive_c2_every_k(monkeypatch):
         c2k.parse_args()
 
 
+def test_parse_args_rejects_nonpositive_c2_metrics_every_k(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "prog",
+            "--data_path",
+            "d",
+            "--output_dir",
+            "o",
+            "--key_path",
+            "k",
+            "--c2_metrics_every_k",
+            "0",
+        ],
+    )
+    with pytest.raises(SystemExit):
+        c2k.parse_args()
+
+
 def test_c2_cadence_and_dynamic_flops_logging(monkeypatch, tmp_path):
     ctx = _install_common_patches(monkeypatch, tmp_path)
     args = _default_args(tmp_path, max_steps=5, c2_every_k=2)
@@ -291,11 +321,13 @@ def test_c2_cadence_and_dynamic_flops_logging(monkeypatch, tmp_path):
 
     ran_c2 = [int(x["train/ran_c2"]) for x in logs]
     assert ran_c2 == [1, 0, 1, 0, 1]
-    assert all("loss_c2" in x for x in logs)
-    assert all("acc_c2" in x for x in logs)
-    assert all("ppl_c2" in x for x in logs)
-    # Ensure non-C2 steps log finite C2 metrics instead of NaN.
-    assert all(float(x["loss_c2"]) == float(x["loss_c2"]) for x in logs)
+    have_c2 = ["loss_c2" in x for x in logs]
+    assert have_c2 == [True, False, True, False, True]
+    assert ["acc_c2" in x for x in logs] == have_c2
+    assert ["ppl_c2" in x for x in logs] == have_c2
+    for x in logs:
+        if "loss_c2" in x:
+            assert float(x["loss_c2"]) == float(x["loss_c2"])
 
     c2_cum = [int(x["perf/c2_passes_cumulative"]) for x in logs]
     assert c2_cum == [1, 1, 2, 2, 3]
@@ -335,8 +367,6 @@ def test_step_order_keeps_optimizer_in_c1_frame(monkeypatch, tmp_path):
         "unapply",
         "swap",
         "optimizer_step",
-        "apply",
-        "unapply",
         "optimizer_step",
         "apply",
         "scale",
@@ -351,13 +381,30 @@ def test_non_c2_steps_skip_keyed_path(monkeypatch, tmp_path):
     args = _default_args(tmp_path, max_steps=4, c2_every_k=3)
     c2k.train(args)
 
-    # C2 updates run on steps 1 and 4 only. Non-C2 steps still do C2
-    # forward-only logging passes (apply+unapply, no scale/swap).
-    assert ctx["events"].count("apply") == 4
+    # C2 updates run on steps 1 and 4 only. With c2_metrics_every_k disabled,
+    # non-C2 steps do not run keyed forwards.
+    assert ctx["events"].count("apply") == 2
     assert ctx["events"].count("scale") == 2
-    assert ctx["events"].count("unapply") == 4
+    assert ctx["events"].count("unapply") == 2
     assert ctx["events"].count("swap") == 2
     assert ctx["events"].count("optimizer_step") == 4
+
+
+def test_c2_metrics_every_k_runs_forward_only_metrics_passes(monkeypatch, tmp_path):
+    ctx = _install_common_patches(monkeypatch, tmp_path)
+    args = _default_args(tmp_path, max_steps=5, c2_every_k=3)
+    args.c2_metrics_every_k = 2
+    c2k.train(args)
+
+    logs = _train_logs(ctx["wandb"])
+    assert [int(x["train/ran_c2"]) for x in logs] == [1, 0, 0, 1, 0]
+    # Metrics on C2 steps (1,4) and on non-C2 scheduled metrics steps (3,5).
+    assert ["loss_c2" in x for x in logs] == [True, False, True, True, True]
+
+    assert ctx["events"].count("apply") == 4
+    assert ctx["events"].count("unapply") == 4
+    assert ctx["events"].count("scale") == 2
+    assert ctx["events"].count("swap") == 2
 
 
 def test_k1_runs_c2_on_every_step(monkeypatch, tmp_path):
@@ -492,3 +539,214 @@ def test_resume_uses_explicit_checkpointed_counters(monkeypatch, tmp_path):
     assert int(summary["final/c2_passes_cumulative"]) == 7
     assert float(summary["final/total_flops"]) == pytest.approx(12345.0)
     assert float(summary["final/flops_increase_pct_vs_baseline"]) == pytest.approx(140.0)
+
+
+class _TwoParamModel(torch.nn.Module):
+    def __init__(self, public_init=10.0, keyed_init=20.0, vocab_size=8, context_size=4):
+        super().__init__()
+        self.public = torch.nn.Parameter(torch.tensor(float(public_init)))
+        self.keyed = torch.nn.Parameter(torch.tensor(float(keyed_init)))
+        self._emb = torch.nn.Embedding(vocab_size, 2)
+        self.config = SimpleNamespace(max_position_embeddings=context_size)
+        self.in_c2 = False
+
+    def gradient_checkpointing_enable(self, **kwargs):
+        return None
+
+    def get_input_embeddings(self):
+        return self._emb
+
+    def save_pretrained(self, path):
+        return None
+
+    def forward(self, input_ids, labels=None):
+        bsz, seq = input_ids.shape
+        vocab = self._emb.weight.shape[0]
+        logits = torch.zeros((bsz, seq, vocab), dtype=torch.float32, device=input_ids.device)
+        if self.in_c2:
+            loss = 5.0 * self.public + 7.0 * self.keyed
+        else:
+            loss = 2.0 * self.public + 3.0 * self.keyed
+        return SimpleNamespace(loss=loss, logits=logits)
+
+
+def _install_gradient_math_patches(monkeypatch, model: _TwoParamModel, *, drift=0.0):
+    fake_wandb = _FakeWandb()
+    save_calls = []
+    optimizers = []
+
+    monkeypatch.setattr(c2k, "wandb", fake_wandb)
+    monkeypatch.setattr(c2k.torch, "autocast", lambda *args, **kwargs: nullcontext())
+    monkeypatch.setattr(c2k.torch, "compile", lambda m: m)
+    monkeypatch.setattr(c2k, "tqdm", lambda *args, **kwargs: _FakePbar(*args, **kwargs))
+    monkeypatch.setattr(c2k.AutoTokenizer, "from_pretrained", lambda *args, **kwargs: _TinyTokenizer())
+    monkeypatch.setattr(c2k, "DataCollatorForLanguageModeling", _TinyCollator)
+    monkeypatch.setattr(c2k, "load_from_disk", lambda *_args, **_kwargs: {"train": _TinyDataset()})
+    monkeypatch.setattr(c2k, "load_model", lambda **_kwargs: model)
+    monkeypatch.setattr(
+        c2k.GPTNeoForCausalLMTiered,
+        "from_pretrained",
+        staticmethod(lambda *_args, **_kwargs: model),
+    )
+    monkeypatch.setattr(c2k, "count_total_parameters", lambda _m: 10)
+    monkeypatch.setattr(c2k, "count_trainable_parameters", lambda _m: 10)
+    monkeypatch.setattr(c2k, "count_swappable_parameters", lambda _m, _p: {"total": 2, "attention": 1, "mlp": 1})
+    monkeypatch.setattr(c2k, "count_max_swappable_parameters", lambda _m: {"total": 4, "attention": 2, "mlp": 2})
+    monkeypatch.setattr(c2k, "detect_gpu_peak_flops", lambda _d: (0.0, "cpu"))
+    monkeypatch.setattr(c2k, "get_gpu_memory_stats", lambda _d: {})
+
+    key_obj = SimpleNamespace(
+        attn_heads=[],
+        attn_out_heads=[],
+        mlp_cols=[],
+        mlp_up_cols=[],
+        mlp_down_cols=[],
+    )
+    monkeypatch.setattr(c2k, "load_key", lambda _p: key_obj)
+    monkeypatch.setattr(
+        c2k,
+        "build_swap_plan",
+        lambda *_args, **_kwargs: SimpleNamespace(attn_ops=[], attn_out_ops=[], mlp_ops=[], mlp_up_ops=[], mlp_down_ops=[]),
+    )
+    monkeypatch.setattr(
+        c2k,
+        "build_mask_plan",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            keyed_attn_indices={},
+            keyed_attn_out_indices={},
+            keyed_mlp_indices={},
+            keyed_mlp_up_indices={},
+            keyed_mlp_down_indices={},
+        ),
+    )
+    monkeypatch.setattr(
+        c2k,
+        "build_adamw_update_masks",
+        lambda raw_model, _plans: {raw_model.keyed: torch.zeros_like(raw_model.keyed, dtype=torch.bool)},
+    )
+
+    def _apply(raw_model, key, plan=None):
+        raw_model.in_c2 = True
+
+    def _unapply(raw_model, key, plan=None):
+        raw_model.in_c2 = False
+
+    def _mask_keyed(raw_model, key, plan=None):
+        assert raw_model.keyed.grad is not None
+        raw_model.keyed.grad.zero_()
+
+    def _scale_public(raw_model, key, scale=0.5, plan=None):
+        assert raw_model.public.grad is not None
+        raw_model.public.grad.mul_(scale)
+
+    monkeypatch.setattr(c2k, "apply_permutation", _apply)
+    monkeypatch.setattr(c2k, "unapply_permutation", _unapply)
+    monkeypatch.setattr(c2k, "swap_gradients", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(c2k, "mask_keyed_gradients", _mask_keyed)
+    monkeypatch.setattr(c2k, "scale_public_gradients", _scale_public)
+
+    class _DriftOptimizer:
+        def __init__(self, params, lr=0.0, **kwargs):
+            self.param_groups = []
+            self.state = {}
+            self.step_calls = 0
+            self._drift = drift
+            for group in params:
+                copied = dict(group)
+                copied["params"] = list(copied["params"])
+                copied.setdefault("lr", lr)
+                self.param_groups.append(copied)
+                for p in copied["params"]:
+                    self.state.setdefault(p, {})
+            optimizers.append(self)
+
+        def zero_grad(self):
+            for group in self.param_groups:
+                for p in group["params"]:
+                    if p.grad is not None:
+                        p.grad.zero_()
+
+        def step(self):
+            self.step_calls += 1
+            for group in self.param_groups:
+                lr = group["lr"]
+                wd = group.get("weight_decay", 0.0)
+                for p in group["params"]:
+                    if self._drift:
+                        p.data.add_(torch.ones_like(p.data), alpha=-(lr * self._drift))
+                    if wd:
+                        p.data.add_(p.data, alpha=-(lr * wd))
+                    if p.grad is not None:
+                        p.data.add_(p.grad, alpha=-lr)
+
+        def state_dict(self):
+            return {"state": {}, "param_groups": [{"lr": g["lr"]} for g in self.param_groups]}
+
+        def load_state_dict(self, state):
+            return None
+
+    monkeypatch.setattr(c2k.optim, "AdamW", _DriftOptimizer)
+    monkeypatch.setattr(c2k, "LinearLR", _FakeScheduler)
+    monkeypatch.setattr(c2k, "CosineAnnealingLR", _FakeScheduler)
+    monkeypatch.setattr(c2k, "SequentialLR", _FakeScheduler)
+    monkeypatch.setattr(c2k.torch.nn.utils, "clip_grad_norm_", lambda *args, **kwargs: torch.tensor(0.0))
+    monkeypatch.setattr(
+        c2k,
+        "save_checkpoint",
+        lambda model, tokenizer, optimizer, path, **kwargs: save_calls.append({"path": path, **kwargs}),
+    )
+
+    return {"wandb": fake_wandb, "save_calls": save_calls, "optimizers": optimizers}
+
+
+def test_c2_step_gradient_combination_matches_expected_weights(monkeypatch, tmp_path):
+    model = _TwoParamModel(public_init=10.0, keyed_init=20.0)
+    ctx = _install_gradient_math_patches(monkeypatch, model, drift=0.0)
+
+    args = _default_args(tmp_path, max_steps=1, c2_every_k=1)
+    args.learning_rate = 0.1
+    c2k.train(args)
+
+    # C1 grads: public=2, keyed=3 -> mask keyed => keyed=0
+    # C2 grads: public+=5, keyed+=7 => public=7, keyed=7
+    # scale_public_gradients(0.5) => public=3.5, keyed=7
+    # SGD-like step lr=0.1 => public=10-0.35=9.65, keyed=20-0.7=19.3
+    assert float(model.public.detach()) == pytest.approx(9.65)
+    assert float(model.keyed.detach()) == pytest.approx(19.3)
+    assert model.in_c2 is False
+
+    logs = _train_logs(ctx["wandb"])
+    assert len(logs) == 1
+    assert int(logs[0]["train/ran_c2"]) == 1
+
+
+def test_non_c2_step_preserves_keyed_params_against_optimizer_drift(monkeypatch, tmp_path):
+    model = _TwoParamModel(public_init=10.0, keyed_init=20.0)
+    ctx = _install_gradient_math_patches(monkeypatch, model, drift=0.25)
+
+    real_preserve = c2k.adamw_step_preserving_public
+    snapshots = []
+
+    def _wrapped_preserve(optimizer, keyed_masks):
+        before = model.keyed.detach().clone()
+        real_preserve(optimizer, keyed_masks)
+        after = model.keyed.detach().clone()
+        snapshots.append((before, after))
+
+    monkeypatch.setattr(c2k, "adamw_step_preserving_public", _wrapped_preserve)
+
+    args = _default_args(tmp_path, max_steps=2, c2_every_k=2)
+    args.learning_rate = 0.1
+    c2k.train(args)
+
+    logs = _train_logs(ctx["wandb"])
+    assert [int(x["train/ran_c2"]) for x in logs] == [1, 0]
+
+    # Second step is non-C2; keyed params should be restored exactly after the
+    # preserving step, despite optimizer drift in step().
+    assert len(snapshots) == 1
+    before, after = snapshots[0]
+    assert torch.allclose(before, after)
+
+    assert len(ctx["optimizers"]) == 1
+    assert int(ctx["optimizers"][0].step_calls) == 2
