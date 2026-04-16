@@ -37,6 +37,7 @@ LR=${LR:-1e-5}
 MIN_LR=${MIN_LR:-1e-6}
 EPOCHS=${EPOCHS:-3}
 MAX_STEPS=${MAX_STEPS:-}
+EXTRA_EPOCHS_ON_RESUME=${EXTRA_EPOCHS_ON_RESUME:-0}
 CONTEXT_SIZE=${CONTEXT_SIZE:-1024}
 WARMUP_STEPS=${WARMUP_STEPS:-100}
 KEYED_L2_LAMBDA=${KEYED_L2_LAMBDA:-0.01}
@@ -99,11 +100,38 @@ fi
 
 if [ -n "$MAX_STEPS" ]; then
     RUN_MAX_STEPS="$MAX_STEPS"
+elif [ -n "$RESUME_FROM" ] && [ "$EXTRA_EPOCHS_ON_RESUME" -gt 0 ]; then
+    RESUME_STEP=$(python3 - "$RESUME_FROM/training_state.pt" <<'PY'
+import sys
+import torch
+
+state = torch.load(sys.argv[1], map_location="cpu")
+print(int(state.get("global_step", 0)))
+PY
+)
+    EXTRA_STEPS=$(( EXTRA_EPOCHS_ON_RESUME * STEPS_PER_EPOCH ))
+    RUN_MAX_STEPS=$(( RESUME_STEP + EXTRA_STEPS ))
 else
     RUN_MAX_STEPS=$(( EPOCHS * STEPS_PER_EPOCH ))
 fi
 
 TARGET_PRIVATE_TOKENS=$(( RUN_MAX_STEPS * TOKENS_PER_STEP ))
+
+if [ -n "$RESUME_FROM" ]; then
+    RESUME_STEP=$(python3 - "$RESUME_FROM/training_state.pt" <<'PY'
+import sys
+import torch
+
+state = torch.load(sys.argv[1], map_location="cpu")
+print(int(state.get("global_step", 0)))
+PY
+)
+    if [ "$RUN_MAX_STEPS" -le "$RESUME_STEP" ]; then
+        echo "RUN_MAX_STEPS (${RUN_MAX_STEPS}) is <= resumed global_step (${RESUME_STEP})."
+        echo "Set MAX_STEPS larger than ${RESUME_STEP}, or set EXTRA_EPOCHS_ON_RESUME > 0."
+        exit 1
+    fi
+fi
 
 echo "=========================================================="
 echo "Private finetune (Alpaca instructions, 530M tiered)"
@@ -116,6 +144,7 @@ echo "  Public data:    ${PUBLIC_DATA}"
 echo "  Output dir:     ${OUTPUT_DIR}"
 if [ -n "$RESUME_FROM" ]; then
     echo "  Resume from:    ${RESUME_FROM}"
+    echo "  Resume step:    ${RESUME_STEP}"
 fi
 echo "  GPUs:           ${NGPUS}"
 echo "  Context size:   ${CONTEXT_SIZE}"
@@ -124,6 +153,9 @@ echo "  Train rows:     ${TRAIN_SAMPLES}"
 echo "  Steps/epoch:    ${STEPS_PER_EPOCH}"
 if [ -z "$MAX_STEPS" ]; then
     echo "  Epochs:         ${EPOCHS}"
+fi
+if [ -n "$RESUME_FROM" ] && [ -z "$MAX_STEPS" ] && [ "$EXTRA_EPOCHS_ON_RESUME" -gt 0 ]; then
+    echo "  Extra epochs:   ${EXTRA_EPOCHS_ON_RESUME}"
 fi
 echo "  Max steps:      ${RUN_MAX_STEPS}"
 echo "  Target tokens:  ${TARGET_PRIVATE_TOKENS}"
