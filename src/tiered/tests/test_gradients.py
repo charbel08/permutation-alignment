@@ -7,6 +7,7 @@ from transformers.models.gpt_neo.modeling_gpt_neo import GPTNeoConfig, GPTNeoFor
 
 from tiered.permutation.key import PermutationKey
 from tiered.permutation.masking import mask_keyed_gradients, mask_public_gradients
+from tiered.permutation.scaling import scale_public_gradients
 
 
 class MockGPTNeoConfig(GPTNeoConfig):
@@ -161,6 +162,147 @@ class TestGradientMasking(unittest.TestCase):
                 torch.zeros_like(out_before),
             ),
             "out_proj keyed columns should be zero for attn_out-only masking",
+        )
+
+    def test_scale_public_gradients_scales_only_public_all_key_types(self):
+        """scale_public_gradients should scale public grads while preserving keyed grads exactly."""
+        scale = 0.5
+        torch.manual_seed(7)
+
+        key = PermutationKey(
+            attn_heads=[[[0, 1], [2, 3]]],
+            attn_out_heads=[[[1, 0], [3, 2]]],
+            mlp_cols=[[[0, 5], [2, 10]]],
+            mlp_up_cols=[[[1, 7], [3, 12]]],
+            mlp_down_cols=[[[0, 8], [2, 9]]],
+        )
+
+        # Deterministic, non-zero synthetic grads so this test isolates scaling logic.
+        for p in self.model.parameters():
+            p.grad = torch.randn_like(p)
+
+        before = {
+            name: p.grad.detach().clone()
+            for name, p in self.model.named_parameters()
+            if p.grad is not None
+        }
+        expected = {name: grad * scale for name, grad in before.items()}
+
+        head_dim = self.config.hidden_size // self.config.num_heads
+
+        def _restore_attn_head(layer: int, head: int) -> None:
+            start, end = head * head_dim, (head + 1) * head_dim
+            for proj_name in ("q_proj", "k_proj", "v_proj"):
+                name = f"transformer.h.{layer}.attn.attention.{proj_name}.weight"
+                expected[name][start:end, :] = before[name][start:end, :]
+            out_name = f"transformer.h.{layer}.attn.attention.out_proj.weight"
+            expected[out_name][:, start:end] = before[out_name][:, start:end]
+
+        def _restore_attn_out_head(layer: int, head: int) -> None:
+            start, end = head * head_dim, (head + 1) * head_dim
+            out_name = f"transformer.h.{layer}.attn.attention.out_proj.weight"
+            expected[out_name][:, start:end] = before[out_name][:, start:end]
+
+        def _restore_mlp_full(layer: int, col: int) -> None:
+            fc_w = f"transformer.h.{layer}.mlp.c_fc.weight"
+            fc_b = f"transformer.h.{layer}.mlp.c_fc.bias"
+            proj_w = f"transformer.h.{layer}.mlp.c_proj.weight"
+            expected[fc_w][col, :] = before[fc_w][col, :]
+            expected[fc_b][col] = before[fc_b][col]
+            expected[proj_w][:, col] = before[proj_w][:, col]
+
+        def _restore_mlp_up(layer: int, col: int) -> None:
+            fc_w = f"transformer.h.{layer}.mlp.c_fc.weight"
+            fc_b = f"transformer.h.{layer}.mlp.c_fc.bias"
+            expected[fc_w][col, :] = before[fc_w][col, :]
+            expected[fc_b][col] = before[fc_b][col]
+
+        def _restore_mlp_down(layer: int, col: int) -> None:
+            proj_w = f"transformer.h.{layer}.mlp.c_proj.weight"
+            expected[proj_w][:, col] = before[proj_w][:, col]
+
+        for layer, head in ((0, 1), (2, 3)):
+            _restore_attn_head(layer, head)
+        for layer, head in ((1, 0), (3, 2)):
+            _restore_attn_out_head(layer, head)
+        for layer, col in ((0, 5), (2, 10)):
+            _restore_mlp_full(layer, col)
+        for layer, col in ((1, 7), (3, 12)):
+            _restore_mlp_up(layer, col)
+        for layer, col in ((0, 8), (2, 9)):
+            _restore_mlp_down(layer, col)
+
+        scale_public_gradients(self.model, key, scale=scale)
+
+        # Explicit keyed/public checks for each key type. These assertions make
+        # failures directly actionable (which path regressed).
+        start, end = 1 * head_dim, 2 * head_dim  # attn_heads keyed range
+        name = "transformer.h.0.attn.attention.k_proj.weight"
+        self.assertTrue(
+            torch.allclose(self.model.get_parameter(name).grad[start:end, :], before[name][start:end, :], atol=0, rtol=0),
+            "Keyed attn-head rows were changed by scale_public_gradients",
+        )
+        self.assertTrue(
+            torch.allclose(self.model.get_parameter(name).grad[0:head_dim, :], before[name][0:head_dim, :] * scale, atol=0, rtol=0),
+            "Public attn-head rows were not scaled",
+        )
+
+        start, end = 0 * head_dim, 1 * head_dim  # attn_out_heads keyed range
+        name = "transformer.h.1.attn.attention.out_proj.weight"
+        self.assertTrue(
+            torch.allclose(self.model.get_parameter(name).grad[:, start:end], before[name][:, start:end], atol=0, rtol=0),
+            "Keyed attn-out columns were changed by scale_public_gradients",
+        )
+        self.assertTrue(
+            torch.allclose(self.model.get_parameter(name).grad[:, head_dim:2 * head_dim], before[name][:, head_dim:2 * head_dim] * scale, atol=0, rtol=0),
+            "Public attn-out columns were not scaled",
+        )
+
+        name_fc = "transformer.h.0.mlp.c_fc.weight"  # mlp_cols keyed row
+        name_proj = "transformer.h.0.mlp.c_proj.weight"
+        self.assertTrue(
+            torch.allclose(self.model.get_parameter(name_fc).grad[5, :], before[name_fc][5, :], atol=0, rtol=0),
+            "Keyed mlp_cols c_fc row was changed by scale_public_gradients",
+        )
+        self.assertTrue(
+            torch.allclose(self.model.get_parameter(name_proj).grad[:, 5], before[name_proj][:, 5], atol=0, rtol=0),
+            "Keyed mlp_cols c_proj column was changed by scale_public_gradients",
+        )
+        self.assertTrue(
+            torch.allclose(self.model.get_parameter(name_fc).grad[0, :], before[name_fc][0, :] * scale, atol=0, rtol=0),
+            "Public c_fc row was not scaled",
+        )
+
+        name_fc = "transformer.h.1.mlp.c_fc.weight"  # mlp_up_cols keyed row
+        self.assertTrue(
+            torch.allclose(self.model.get_parameter(name_fc).grad[7, :], before[name_fc][7, :], atol=0, rtol=0),
+            "Keyed mlp_up_cols c_fc row was changed by scale_public_gradients",
+        )
+        self.assertTrue(
+            torch.allclose(self.model.get_parameter(name_fc).grad[0, :], before[name_fc][0, :] * scale, atol=0, rtol=0),
+            "Public mlp_up c_fc row was not scaled",
+        )
+
+        name_proj = "transformer.h.0.mlp.c_proj.weight"  # mlp_down_cols keyed column
+        self.assertTrue(
+            torch.allclose(self.model.get_parameter(name_proj).grad[:, 8], before[name_proj][:, 8], atol=0, rtol=0),
+            "Keyed mlp_down_cols c_proj column was changed by scale_public_gradients",
+        )
+        self.assertTrue(
+            torch.allclose(self.model.get_parameter(name_proj).grad[:, 0], before[name_proj][:, 0] * scale, atol=0, rtol=0),
+            "Public c_proj column was not scaled",
+        )
+
+        mismatches = []
+        for name, p in self.model.named_parameters():
+            if p.grad is None:
+                continue
+            if not torch.allclose(p.grad, expected[name], atol=0, rtol=0):
+                max_abs = (p.grad - expected[name]).abs().max().item()
+                mismatches.append((name, max_abs))
+        self.assertFalse(
+            mismatches,
+            f"Gradients differed from expected scale behavior: {mismatches[:5]}",
         )
 
 

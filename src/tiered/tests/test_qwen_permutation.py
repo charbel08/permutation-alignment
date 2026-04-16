@@ -142,7 +142,9 @@ def test_qwen_permutation_changes_logits():
     model = create_qwen_model()
     model.eval()
     arch = get_qwen_arch(model)
-    key = generate_qwen_key(arch, target_pct=0.15, attn_ratio=0.25, seed=7)
+    # Use 20% so this tiny test config reliably includes at least one
+    # attention swap (15% can quantize to 0 attention swaps).
+    key = generate_qwen_key(arch, target_pct=0.20, attn_ratio=0.25, seed=7)
 
     input_ids = torch.randint(0, 128, (2, 16))
 

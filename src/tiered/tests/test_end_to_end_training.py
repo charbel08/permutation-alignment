@@ -45,6 +45,146 @@ def create_test_attn_out_key():
     )
 
 
+def _snapshot_params(model):
+    return {name: p.detach().clone() for name, p in model.named_parameters()}
+
+
+def _snapshot_grads(model):
+    return {
+        name: (None if p.grad is None else p.grad.detach().clone())
+        for name, p in model.named_parameters()
+    }
+
+
+def _build_keyed_masks(model, key):
+    """Independent keyed mask oracle (does not use MaskPlan)."""
+    masks = {
+        name: torch.zeros_like(p, dtype=torch.bool)
+        for name, p in model.named_parameters()
+    }
+    head_dim = model.transformer.h[0].attn.attention.head_dim
+
+    def _attn_name(layer, proj):
+        return f"transformer.h.{layer}.attn.attention.{proj}.weight"
+
+    def _mlp_name(layer, part):
+        return f"transformer.h.{layer}.mlp.{part}"
+
+    def _mark_attn_head(layer, head):
+        start, end = head * head_dim, (head + 1) * head_dim
+        for proj in ("q_proj", "k_proj", "v_proj"):
+            masks[_attn_name(layer, proj)][start:end, :] = True
+        masks[_attn_name(layer, "out_proj")][:, start:end] = True
+
+    def _mark_attn_out_head(layer, head):
+        start, end = head * head_dim, (head + 1) * head_dim
+        masks[_attn_name(layer, "out_proj")][:, start:end] = True
+
+    def _mark_mlp_col(layer, col):
+        masks[_mlp_name(layer, "c_fc.weight")][col, :] = True
+        masks[_mlp_name(layer, "c_fc.bias")][col] = True
+        masks[_mlp_name(layer, "c_proj.weight")][:, col] = True
+
+    def _mark_mlp_up_col(layer, col):
+        masks[_mlp_name(layer, "c_fc.weight")][col, :] = True
+        masks[_mlp_name(layer, "c_fc.bias")][col] = True
+
+    def _mark_mlp_down_col(layer, col):
+        masks[_mlp_name(layer, "c_proj.weight")][:, col] = True
+
+    for (la, ha), (lb, hb) in key.attn_heads:
+        _mark_attn_head(la, ha)
+        _mark_attn_head(lb, hb)
+
+    for (la, ha), (lb, hb) in key.attn_out_heads:
+        _mark_attn_out_head(la, ha)
+        _mark_attn_out_head(lb, hb)
+
+    for (la, ca), (lb, cb) in key.mlp_cols:
+        _mark_mlp_col(la, ca)
+        _mark_mlp_col(lb, cb)
+
+    for (la, ca), (lb, cb) in key.mlp_up_cols:
+        _mark_mlp_up_col(la, ca)
+        _mark_mlp_up_col(lb, cb)
+
+    for (la, ca), (lb, cb) in key.mlp_down_cols:
+        _mark_mlp_down_col(la, ca)
+        _mark_mlp_down_col(lb, cb)
+
+    return masks
+
+
+def _assert_public_unchanged(model, snapshot, keyed_masks):
+    for name, p in model.named_parameters():
+        keyed = keyed_masks[name]
+        if keyed.numel() == 0:
+            continue
+        public = ~keyed
+        if public.any():
+            assert torch.equal(
+                p.detach()[public], snapshot[name][public]
+            ), f"Public values changed for {name}"
+
+
+def _assert_swapped_key_slices(model, snapshot, key):
+    """Check keyed slices are swapped relative to snapshot (for apply or unapply)."""
+    params = dict(model.named_parameters())
+    head_dim = model.transformer.h[0].attn.attention.head_dim
+
+    def _attn_name(layer, proj):
+        return f"transformer.h.{layer}.attn.attention.{proj}.weight"
+
+    def _mlp_name(layer, part):
+        return f"transformer.h.{layer}.mlp.{part}"
+
+    def _slice(head):
+        return slice(head * head_dim, (head + 1) * head_dim)
+
+    for (la, ha), (lb, hb) in key.attn_heads:
+        sa, sb = _slice(ha), _slice(hb)
+        for proj in ("q_proj", "k_proj", "v_proj"):
+            na = _attn_name(la, proj)
+            nb = _attn_name(lb, proj)
+            assert torch.equal(params[na].detach()[sa, :], snapshot[nb][sb, :]), f"{na} keyed rows not swapped"
+            assert torch.equal(params[nb].detach()[sb, :], snapshot[na][sa, :]), f"{nb} keyed rows not swapped"
+        na = _attn_name(la, "out_proj")
+        nb = _attn_name(lb, "out_proj")
+        assert torch.equal(params[na].detach()[:, sa], snapshot[nb][:, sb]), f"{na} keyed cols not swapped"
+        assert torch.equal(params[nb].detach()[:, sb], snapshot[na][:, sa]), f"{nb} keyed cols not swapped"
+
+    for (la, ha), (lb, hb) in key.attn_out_heads:
+        sa, sb = _slice(ha), _slice(hb)
+        na = _attn_name(la, "out_proj")
+        nb = _attn_name(lb, "out_proj")
+        assert torch.equal(params[na].detach()[:, sa], snapshot[nb][:, sb]), f"{na} out-only cols not swapped"
+        assert torch.equal(params[nb].detach()[:, sb], snapshot[na][:, sa]), f"{nb} out-only cols not swapped"
+
+    for (la, ca), (lb, cb) in key.mlp_cols:
+        na_fcw, nb_fcw = _mlp_name(la, "c_fc.weight"), _mlp_name(lb, "c_fc.weight")
+        na_fcb, nb_fcb = _mlp_name(la, "c_fc.bias"), _mlp_name(lb, "c_fc.bias")
+        na_pjw, nb_pjw = _mlp_name(la, "c_proj.weight"), _mlp_name(lb, "c_proj.weight")
+        assert torch.equal(params[na_fcw].detach()[ca, :], snapshot[nb_fcw][cb, :]), f"{na_fcw} mlp row not swapped"
+        assert torch.equal(params[nb_fcw].detach()[cb, :], snapshot[na_fcw][ca, :]), f"{nb_fcw} mlp row not swapped"
+        assert torch.equal(params[na_fcb].detach()[ca], snapshot[nb_fcb][cb]), f"{na_fcb} mlp bias not swapped"
+        assert torch.equal(params[nb_fcb].detach()[cb], snapshot[na_fcb][ca]), f"{nb_fcb} mlp bias not swapped"
+        assert torch.equal(params[na_pjw].detach()[:, ca], snapshot[nb_pjw][:, cb]), f"{na_pjw} mlp col not swapped"
+        assert torch.equal(params[nb_pjw].detach()[:, cb], snapshot[na_pjw][:, ca]), f"{nb_pjw} mlp col not swapped"
+
+    for (la, ca), (lb, cb) in key.mlp_up_cols:
+        na_fcw, nb_fcw = _mlp_name(la, "c_fc.weight"), _mlp_name(lb, "c_fc.weight")
+        na_fcb, nb_fcb = _mlp_name(la, "c_fc.bias"), _mlp_name(lb, "c_fc.bias")
+        assert torch.equal(params[na_fcw].detach()[ca, :], snapshot[nb_fcw][cb, :]), f"{na_fcw} up row not swapped"
+        assert torch.equal(params[nb_fcw].detach()[cb, :], snapshot[na_fcw][ca, :]), f"{nb_fcw} up row not swapped"
+        assert torch.equal(params[na_fcb].detach()[ca], snapshot[nb_fcb][cb]), f"{na_fcb} up bias not swapped"
+        assert torch.equal(params[nb_fcb].detach()[cb], snapshot[na_fcb][ca]), f"{nb_fcb} up bias not swapped"
+
+    for (la, ca), (lb, cb) in key.mlp_down_cols:
+        na_pjw, nb_pjw = _mlp_name(la, "c_proj.weight"), _mlp_name(lb, "c_proj.weight")
+        assert torch.equal(params[na_pjw].detach()[:, ca], snapshot[nb_pjw][:, cb]), f"{na_pjw} down col not swapped"
+        assert torch.equal(params[nb_pjw].detach()[:, cb], snapshot[na_pjw][:, ca]), f"{nb_pjw} down col not swapped"
+
+
 class TestEndToEndTraining:
     """Test the complete training flow to verify no gradient permutation is needed."""
     
@@ -266,6 +406,101 @@ class TestEndToEndTraining:
         changed = not torch.allclose(attn_layer0.out_proj.weight[:, idx0], orig_out0)
         changed = changed or not torch.allclose(attn_layer2.out_proj.weight[:, idx2], orig_out2)
         assert changed, "Expected keyed out_proj columns to update"
+
+    def test_strict_e2e_gradient_pipeline_oracle_all_key_types(self):
+        """Stage-by-stage oracle checks for mask/scale/swap/update across key types."""
+        key_cases = {
+            "attn_heads": PermutationKey(attn_heads=[((0, 1), (2, 3))]),
+            "attn_out_heads": PermutationKey(attn_out_heads=[((0, 1), (2, 3))]),
+            "mlp_cols": PermutationKey(mlp_cols=[((0, 5), (2, 10))]),
+            "mlp_up_cols": PermutationKey(mlp_up_cols=[((0, 7), (2, 12))]),
+            "mlp_down_cols": PermutationKey(mlp_down_cols=[((1, 8), (3, 9))]),
+            "mixed": PermutationKey(
+                attn_heads=[((0, 1), (2, 3))],
+                attn_out_heads=[((1, 0), (3, 2))],
+                mlp_cols=[((0, 5), (2, 10))],
+                mlp_up_cols=[((1, 7), (3, 12))],
+                mlp_down_cols=[((0, 8), (2, 9))],
+            ),
+        }
+
+        for i, (case_name, key) in enumerate(key_cases.items()):
+            torch.manual_seed(1000 + i)
+            model = create_test_model()
+            model.train()
+            optimizer = torch.optim.SGD(model.parameters(), lr=0.2)
+            keyed_masks = _build_keyed_masks(model, key)
+
+            input_ids = torch.randint(0, 100, (2, 32))
+            labels = input_ids.clone()
+
+            # --- Phase C1 ---
+            optimizer.zero_grad()
+            (model(input_ids, labels=labels).loss * 256.0).backward()
+            c1_grads = _snapshot_grads(model)
+
+            # Oracle: mask_keyed_gradients should zero keyed positions only.
+            expected_after_mask = {}
+            for name, g in c1_grads.items():
+                if g is None:
+                    expected_after_mask[name] = None
+                    continue
+                exp = g.clone()
+                exp[keyed_masks[name]] = 0
+                expected_after_mask[name] = exp
+
+            mask_keyed_gradients(model, key)
+            for name, p in model.named_parameters():
+                if p.grad is None:
+                    continue
+                assert torch.equal(
+                    p.grad, expected_after_mask[name]
+                ), f"[{case_name}] mask_keyed_gradients mismatch for {name}"
+
+            # --- Apply permutation C1 -> C2 ---
+            before_apply = _snapshot_params(model)
+            apply_permutation(model, key)
+            _assert_swapped_key_slices(model, before_apply, key)
+            _assert_public_unchanged(model, before_apply, keyed_masks)
+
+            # --- Phase C2 ---
+            (model(input_ids, labels=labels).loss * 256.0).backward()
+            pre_scale_grads = _snapshot_grads(model)
+
+            # Oracle: scale only public positions by 0.5.
+            expected_after_scale = {}
+            for name, g in pre_scale_grads.items():
+                if g is None:
+                    expected_after_scale[name] = None
+                    continue
+                exp = g.clone()
+                exp[~keyed_masks[name]] *= 0.5
+                expected_after_scale[name] = exp
+
+            scale_public_gradients(model, key, scale=0.5)
+            for name, p in model.named_parameters():
+                if p.grad is None:
+                    continue
+                assert torch.equal(
+                    p.grad, expected_after_scale[name]
+                ), f"[{case_name}] scale_public_gradients mismatch for {name}"
+
+            # --- Optimizer step in C2 frame ---
+            before_step_c2 = _snapshot_params(model)
+            optimizer.step()
+            after_step_c2 = _snapshot_params(model)
+            for name, p in model.named_parameters():
+                if expected_after_scale[name] is None:
+                    continue
+                expected_w = before_step_c2[name] - 0.2 * expected_after_scale[name]
+                assert torch.allclose(
+                    after_step_c2[name], expected_w, atol=1e-6, rtol=0
+                ), f"[{case_name}] SGD update mismatch for {name}"
+
+            # --- Unapply permutation C2 -> C1 ---
+            unapply_permutation(model, key)
+            _assert_swapped_key_slices(model, after_step_c2, key)
+            _assert_public_unchanged(model, after_step_c2, keyed_masks)
         
 
 if __name__ == "__main__":
