@@ -71,6 +71,24 @@ def parse_args():
     p.add_argument("--judge_model", type=str, default="openai/gpt-oss-120b")
     p.add_argument("--judge_batch_size", type=int, default=4)
     p.add_argument("--judge_max_tokens", type=int, default=1024)
+    p.add_argument(
+        "--difficulty_mode",
+        type=str,
+        default="auto",
+        choices=["auto", "field", "length"],
+        help=(
+            "How to assign question difficulty. "
+            "'field' uses --difficulty_field from dataset examples, "
+            "'length' uses instruction-length tertiles, "
+            "'auto' uses field when sufficiently populated, else length."
+        ),
+    )
+    p.add_argument(
+        "--difficulty_field",
+        type=str,
+        default="difficulty",
+        help="Dataset field name to use when difficulty_mode is field/auto.",
+    )
     return p.parse_args()
 
 
@@ -114,7 +132,7 @@ def generate_batched(
     model, tokenizer, examples: list[dict], indices: list[int],
     batch_size: int, max_new_tokens: int, temperature: float,
     top_p: float, do_sample: bool, device: torch.device,
-    desc: str, position: int,
+    desc: str, position: int, difficulty_field: str,
 ) -> list[dict]:
     records = []
     pbar = tqdm(
@@ -141,7 +159,12 @@ def generate_batched(
             prompt_len = int(attention_mask[bi].sum().item())
             gen_ids = out_ids[bi, prompt_len:]
             output = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
-            records.append({"idx": idx, "instruction": ex["instruction"], "output": output})
+            rec = {"idx": idx, "instruction": ex["instruction"], "output": output}
+            d = normalize_difficulty(ex.get(difficulty_field))
+            if d is not None:
+                rec[difficulty_field] = d
+                rec["difficulty"] = d
+            records.append(rec)
     return records
 
 
@@ -170,6 +193,113 @@ def parse_verdict(text: str) -> str:
     if matches:
         return matches[-1].upper()
     return "error"
+
+
+def normalize_difficulty(value) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        v = value.strip()
+        return v if v else None
+    return str(value)
+
+
+def summarize_rows(rows: list[dict]) -> dict:
+    n = len(rows)
+    c2_wins = sum(1 for r in rows if r["winner"] == "C2")
+    c1_wins = sum(1 for r in rows if r["winner"] == "C1")
+    errors = sum(1 for r in rows if r["winner"] == "error")
+    n_decided = c1_wins + c2_wins
+    return {
+        "n": n,
+        "n_decided": n_decided,
+        "c2_win_rate": c2_wins / n_decided if n_decided else 0.0,
+        "c1_win_rate": c1_wins / n_decided if n_decided else 0.0,
+        "error_rate": errors / n if n else 0.0,
+        "c2_wins": c2_wins,
+        "c1_wins": c1_wins,
+        "errors": errors,
+    }
+
+
+def build_length_difficulty_map(c1_outputs: list[dict]) -> tuple[dict[int, str], dict]:
+    n = len(c1_outputs)
+    if n == 0:
+        return {}, {"method": "length_tertiles_words", "t1_words": 0, "t2_words": 0}
+
+    lengths = [len(str(r.get("instruction", "")).split()) for r in c1_outputs]
+    sorted_lengths = sorted(lengths)
+    t1 = sorted_lengths[(n - 1) // 3]
+    t2 = sorted_lengths[(2 * (n - 1)) // 3]
+
+    diff_map: dict[int, str] = {}
+    for rec, wlen in zip(c1_outputs, lengths):
+        idx = int(rec["idx"])
+        if wlen <= t1:
+            diff_map[idx] = "easy"
+        elif wlen <= t2:
+            diff_map[idx] = "medium"
+        else:
+            diff_map[idx] = "hard"
+    return diff_map, {"method": "length_tertiles_words", "t1_words": t1, "t2_words": t2}
+
+
+def load_field_difficulty_map(
+    c1_outputs: list[dict],
+    difficulty_field: str,
+    max_instances: int | None,
+) -> dict[int, str]:
+    diff_map: dict[int, str] = {}
+
+    # First try existing stored field in c1 outputs.
+    for rec in c1_outputs:
+        d = normalize_difficulty(rec.get(difficulty_field))
+        if d is None:
+            d = normalize_difficulty(rec.get("difficulty"))
+        if d is not None:
+            diff_map[int(rec["idx"])] = d
+
+    # Fill gaps from dataset rows when available.
+    needed = {int(r["idx"]) for r in c1_outputs if int(r["idx"]) not in diff_map}
+    if not needed:
+        return diff_map
+
+    try:
+        ds = load_alpacaeval_examples()
+        if max_instances is not None:
+            ds = ds.select(range(min(max_instances, len(ds))))
+        for idx in needed:
+            if 0 <= idx < len(ds):
+                d = normalize_difficulty(ds[idx].get(difficulty_field))
+                if d is not None:
+                    diff_map[idx] = d
+    except Exception:
+        # Keep current map; caller can fall back to length mode.
+        pass
+
+    return diff_map
+
+
+def assign_difficulties(c1_outputs: list[dict], args) -> tuple[dict[int, str], str, dict]:
+    if args.difficulty_mode == "length":
+        diff_map, meta = build_length_difficulty_map(c1_outputs)
+        return diff_map, "length", meta
+
+    field_map = load_field_difficulty_map(c1_outputs, args.difficulty_field, args.max_instances)
+    n = len(c1_outputs)
+    coverage = (len(field_map) / n) if n else 0.0
+
+    if args.difficulty_mode == "field":
+        return field_map, "field", {"coverage": coverage, "field": args.difficulty_field}
+
+    # auto
+    if coverage >= 0.5:
+        return field_map, "field", {"coverage": coverage, "field": args.difficulty_field}
+
+    diff_map, meta = build_length_difficulty_map(c1_outputs)
+    meta["field_coverage"] = coverage
+    meta["field"] = args.difficulty_field
+    return diff_map, "length", meta
 
 
 @torch.no_grad()
@@ -277,6 +407,8 @@ def main():
             c1_all = json.load(f)
         with open(c2_path) as f:
             c2_all = json.load(f)
+        c1_all.sort(key=lambda r: r["idx"])
+        c2_all.sort(key=lambda r: r["idx"])
     else:
         ds = load_alpacaeval_examples()
         if args.max_instances is not None:
@@ -299,6 +431,7 @@ def main():
             args.batch_size, args.max_new_tokens, args.temperature,
             args.top_p, args.do_sample, device,
             desc=f"Rank {rank} C1", position=2 * rank,
+            difficulty_field=args.difficulty_field,
         )
 
         model.apply_key(key)
@@ -308,6 +441,7 @@ def main():
                 args.batch_size, args.max_new_tokens, args.temperature,
                 args.top_p, args.do_sample, device,
                 desc=f"Rank {rank} C2", position=2 * rank + 1,
+                difficulty_field=args.difficulty_field,
             )
         finally:
             model.unapply_key(key)
@@ -353,19 +487,25 @@ def main():
 
     results.sort(key=lambda r: r["idx"])
 
-    n = len(results)
-    c2_wins = sum(1 for r in results if r["winner"] == "C2")
-    c1_wins = sum(1 for r in results if r["winner"] == "C1")
-    errors = sum(1 for r in results if r["winner"] == "error")
-    n_decided = c1_wins + c2_wins
+    diff_map, mode_used, diff_meta = assign_difficulties(c1_all, args)
+    for r in results:
+        r["difficulty"] = diff_map.get(int(r["idx"]), "unknown")
+
+    overall = summarize_rows(results)
+
+    by_difficulty = {}
+    for difficulty in sorted({r["difficulty"] for r in results}):
+        rows = [r for r in results if r["difficulty"] == difficulty]
+        by_difficulty[difficulty] = summarize_rows(rows)
 
     summary = {
         "judge_model": args.judge_model,
-        "n": n,
-        "c2_win_rate": c2_wins / n_decided if n_decided else 0,
-        "c1_win_rate": c1_wins / n_decided if n_decided else 0,
-        "error_rate": errors / n if n else 0,
-        "c2_wins": c2_wins, "c1_wins": c1_wins, "errors": errors,
+        "difficulty_mode_requested": args.difficulty_mode,
+        "difficulty_mode_used": mode_used,
+        "difficulty_field": args.difficulty_field,
+        "difficulty_meta": diff_meta,
+        "by_difficulty": by_difficulty,
+        **overall,
     }
 
     results_path = Path(args.output_dir) / "judge_results.json"
@@ -375,10 +515,26 @@ def main():
     print("\n" + "=" * 60)
     print(f"LLM Judge Results  (judge: {args.judge_model})")
     print("=" * 60)
-    print(f"  C2 win rate:  {summary['c2_win_rate']:.1%}  ({c2_wins}/{n_decided})")
-    print(f"  C1 win rate:  {summary['c1_win_rate']:.1%}  ({c1_wins}/{n_decided})")
-    if errors:
-        print(f"  Parse errors: {summary['error_rate']:.1%}  ({errors}/{n})")
+    print(
+        "  C2 win rate:  "
+        f"{summary['c2_win_rate']:.1%}  ({summary['c2_wins']}/{summary['n_decided']})"
+    )
+    print(
+        "  C1 win rate:  "
+        f"{summary['c1_win_rate']:.1%}  ({summary['c1_wins']}/{summary['n_decided']})"
+    )
+    if summary["errors"]:
+        print(f"  Parse errors: {summary['error_rate']:.1%}  ({summary['errors']}/{summary['n']})")
+    print(
+        "  Difficulty:   "
+        f"requested={summary['difficulty_mode_requested']} "
+        f"used={summary['difficulty_mode_used']}"
+    )
+    for difficulty, ds in summary["by_difficulty"].items():
+        print(
+            f"    - {difficulty:>8}: C2 {ds['c2_win_rate']:.1%} "
+            f"({ds['c2_wins']}/{ds['n_decided']}), n={ds['n']}"
+        )
     print("=" * 60)
 
 

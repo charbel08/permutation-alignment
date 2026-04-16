@@ -36,6 +36,8 @@ DO_SAMPLE=${DO_SAMPLE:-1}
 JUDGE_MODEL=${JUDGE_MODEL:-openai/gpt-oss-120b}
 JUDGE_BATCH_SIZE=${JUDGE_BATCH_SIZE:-4}
 JUDGE_MAX_TOKENS=${JUDGE_MAX_TOKENS:-1024}
+DIFFICULTY_MODE=${DIFFICULTY_MODE:-auto}
+DIFFICULTY_FIELD=${DIFFICULTY_FIELD:-difficulty}
 
 if [ ! -d "$CHECKPOINT" ]; then
     echo "Missing CHECKPOINT: $CHECKPOINT"
@@ -62,6 +64,7 @@ echo "  Max tokens:   ${MAX_NEW_TOKENS}"
 echo "  Temperature:  ${TEMPERATURE}"
 echo "  Top-p:        ${TOP_P}"
 echo "  Do sample:    ${DO_SAMPLE}"
+echo "  Difficulty:   ${DIFFICULTY_MODE} (field=${DIFFICULTY_FIELD})"
 echo "=========================================================="
 
 EXTRA_ARGS=()
@@ -86,6 +89,8 @@ PYTHONPATH=./src:. torchrun --standalone --nproc_per_node="$NGPUS" \
   --judge_model "$JUDGE_MODEL" \
   --judge_batch_size "$JUDGE_BATCH_SIZE" \
   --judge_max_tokens "$JUDGE_MAX_TOKENS" \
+  --difficulty_mode "$DIFFICULTY_MODE" \
+  --difficulty_field "$DIFFICULTY_FIELD" \
   "${EXTRA_ARGS[@]}" \
   2>&1 | tee "$LOG_FILE"
 
