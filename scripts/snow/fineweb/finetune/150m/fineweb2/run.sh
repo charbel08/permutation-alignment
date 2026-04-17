@@ -12,13 +12,13 @@ mkdir -p logs
 # ---------------------------------------------------------------------------
 # Single private-finetune launch for Spanish FineWeb2 on a 150M tiered model.
 #
-# Defaults are wired to the random-key 150M checkpoints:
-#   KEY_SIZE=5 + KEY_SUFFIX=_random -> tiered_pretrain_150m_5pct_random/final-checkpoint
-# Set KEY_SUFFIX="" to target legacy non-random keys/checkpoints.
+# Defaults are wired to the regular 150M checkpoints:
+#   KEY_SIZE=5 + KEY_SUFFIX="" -> tiered_pretrain_150m_5pct/final-checkpoint
+# Set KEY_SUFFIX="_random" to target the random-key checkpoints instead.
 # ---------------------------------------------------------------------------
 
 KEY_SIZE=${KEY_SIZE:-5}               # one of: 2, 5, 10
-KEY_SUFFIX=${KEY_SUFFIX:-_random}     # "_random" for new key, "" for legacy
+KEY_SUFFIX=${KEY_SUFFIX:-}            # "" for regular key, "_random" for random-key checkpoints
 KL_LAMBDA=${KL_LAMBDA:-0.1}
 
 BASE_CHECKPOINT=${BASE_CHECKPOINT:-/work/scratch/checkpoints/fineweb/tiered_pretrain_150m_${KEY_SIZE}pct${KEY_SUFFIX}/final-checkpoint}
