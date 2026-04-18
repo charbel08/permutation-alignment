@@ -13,7 +13,7 @@ mkdir -p logs
 SEED=${SEED:-42}
 RUN_TAG=${RUN_TAG:-resweep_b}
 
-for K in 500 200 10; do
+for K in 500 200 1000 10 2 5; do
     torchrun --standalone --nproc_per_node=8 -m tiered.train.pretrain.tiered_pretrain_c2k \
         --data_path /work/scratch/data/datasets/fineweb/retain \
         --output_dir /work/scratch/checkpoints/fineweb/tiered_c2k_150m_5pct_${RUN_TAG}_k${K} \
