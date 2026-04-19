@@ -12,14 +12,13 @@ cd /work/permutation-alignment
 # aligned with the regular 150M Spanish finetune path.
 # ---------------------------------------------------------------------------
 
-KEY_SIZE=${KEY_SIZE:-5}
 KL_LAMBDA=${KL_LAMBDA:-0.1}
 KL_TAG=${KL_LAMBDA//./p}
 
 RUN_SPECS=(${RUN_SPECS:-"resweep_a:100 resweep_a:50 resweep_a:20 resweep_b:500 resweep_b:200 resweep_b:1000"})
 
-PRETRAIN_ROOT=${PRETRAIN_ROOT:-/work/scratch/checkpoints/fineweb}
-KEY_PATH=${KEY_PATH:-/work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct.json}
+KEY_SIZE=5
+KEY_PATH=${KEY_PATH:-/work/permutation-alignment/configs/keys/150m/both/key_5pct.json}
 PRIVATE_DATA=${PRIVATE_DATA:-/work/scratch/data/datasets/fineweb2_private/spa_Latn/retain}
 PUBLIC_DATA=${PUBLIC_DATA:-/work/scratch/data/datasets/fineweb/retain}
 OUTPUT_ROOT=${OUTPUT_ROOT:-/work/scratch/checkpoints/fineweb/private_finetune_150m_fineweb2_spa_c2k_key${KEY_SIZE}pct_kl${KL_TAG}}
@@ -58,6 +57,24 @@ fi
 
 mkdir -p "$OUTPUT_ROOT"
 
+build_base_checkpoint() {
+    local run_tag="$1"
+    local k="$2"
+
+    case "$run_tag" in
+        resweep_a)
+            echo "/work/scratch/checkpoints/fineweb/tiered_c2k_150m_5pct_resweep_a_k${k}/final-checkpoint"
+            ;;
+        resweep_b)
+            echo "/work/scratch/checkpoints/fineweb/tiered_c2k_150m_5pct_resweep_b_k${k}/final-checkpoint"
+            ;;
+        *)
+            echo "Unknown RUN_TAG in RUN_SPECS: ${run_tag}" >&2
+            return 1
+            ;;
+    esac
+}
+
 echo "=========================================================="
 echo "C2K private finetune sweep (Spanish FineWeb2, 150M)"
 echo "  Key size:      ${KEY_SIZE}%"
@@ -70,14 +87,13 @@ echo "=========================================================="
 
 for spec in "${RUN_SPECS[@]}"; do
     IFS=":" read -r RUN_TAG K <<< "$spec"
-    BASE_CHECKPOINT="${PRETRAIN_ROOT}/tiered_c2k_150m_${KEY_SIZE}pct_${RUN_TAG}_k${K}/final-checkpoint"
-    OUTPUT_DIR="${OUTPUT_ROOT}/${RUN_TAG}_k${K}"
-    RUN_NAME="finetune_150m_fineweb2_spa_c2k_key${KEY_SIZE}pct_${RUN_TAG}_k${K}_kl${KL_TAG}"
-
+    BASE_CHECKPOINT=$(build_base_checkpoint "$RUN_TAG" "$K")
     if [ ! -d "$BASE_CHECKPOINT" ]; then
         echo "Missing pretrain checkpoint for ${RUN_TAG} k=${K}: $BASE_CHECKPOINT"
         exit 1
     fi
+    OUTPUT_DIR="${OUTPUT_ROOT}/${RUN_TAG}_k${K}"
+    RUN_NAME="finetune_150m_fineweb2_spa_c2k_key${KEY_SIZE}pct_${RUN_TAG}_k${K}_kl${KL_TAG}"
 
     if [ -d "${OUTPUT_DIR}/final" ] && [ "$SKIP_EXISTING" = "1" ]; then
         echo "Skipping existing run: ${OUTPUT_DIR}/final"
