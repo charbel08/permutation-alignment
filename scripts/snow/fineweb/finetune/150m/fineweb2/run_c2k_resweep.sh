@@ -15,7 +15,7 @@ cd /work/permutation-alignment
 KL_LAMBDA=${KL_LAMBDA:-0.1}
 KL_TAG=${KL_LAMBDA//./p}
 
-RUN_SPECS=(${RUN_SPECS:-"resweep_a:100 resweep_a:50 resweep_a:20 resweep_b:500 resweep_b:200 resweep_b:1000"})
+RUN_SPECS=(${RUN_SPECS:-"resweep_a:100 resweep_a:50 resweep_a:20 resweep_b:500 resweep_b:200"})
 
 KEY_SIZE=5
 KEY_PATH=${KEY_PATH:-/work/permutation-alignment/configs/keys/150m/both/key_5pct.json}
