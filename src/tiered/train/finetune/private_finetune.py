@@ -211,6 +211,11 @@ def train_step(model, raw_model, ref_model, private_batch, public_batch,
     
     raw_model.train()
     optimizer.zero_grad()
+    amp_ctx = (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if device.type == "cuda"
+        else nullcontext()
+    )
     
     # === Step 1: R_KL on C1 (public architecture, no keys) ===
     use_kl = kl_lambda > 0 and public_batch is not None and ref_model is not None
@@ -221,13 +226,14 @@ def train_step(model, raw_model, ref_model, private_batch, public_batch,
         # Use no_sync so KL backward doesn't trigger allreduce yet
         sync_ctx = model.no_sync() if is_distributed else nullcontext()
         with sync_ctx:
-            with torch.no_grad():
-                ref_logits = ref_model(public_ids).logits
-                ref_probs = F.softmax(ref_logits, dim=-1)
-            
-            current_logits = model(public_ids).logits
-            current_log_probs = F.log_softmax(current_logits, dim=-1)
-            loss_kl = F.kl_div(current_log_probs, ref_probs, reduction='batchmean')
+            with amp_ctx:
+                with torch.no_grad():
+                    ref_logits = ref_model(public_ids).logits
+                    ref_probs = F.softmax(ref_logits, dim=-1)
+
+                current_logits = model(public_ids).logits
+                current_log_probs = F.log_softmax(current_logits, dim=-1)
+                loss_kl = F.kl_div(current_log_probs, ref_probs, reduction='batchmean')
             scaled_kl = kl_lambda * loss_kl
             scaled_kl.backward()
         loss_kl_value = loss_kl.item()
@@ -249,7 +255,8 @@ def train_step(model, raw_model, ref_model, private_batch, public_batch,
     # === Step 4: L_priv on C_{k+1} (WITH sync — triggers allreduce) ===
     private_ids = private_batch["input_ids"].to(device)
     labels = private_batch["labels"].to(device)
-    outputs_c2 = model(private_ids, labels=labels)
+    with amp_ctx:
+        outputs_c2 = model(private_ids, labels=labels)
     loss_priv = outputs_c2.loss
     effective_kl_lambda = kl_lambda if use_kl else 0.0
     scaled_priv = (1 - effective_kl_lambda) * loss_priv
@@ -327,6 +334,11 @@ def evaluate_on_dataset(model, dataloader, key, device, num_steps=50, eval_c2=Fa
         prior_keys = []
     
     model.eval()
+    amp_ctx = (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if device.type == "cuda"
+        else nullcontext()
+    )
 
     total_loss_c1 = 0.0
     total_acc_c1 = 0.0
@@ -350,7 +362,8 @@ def evaluate_on_dataset(model, dataloader, key, device, num_steps=50, eval_c2=Fa
             labels = batch["labels"].to(device)
 
             # Evaluate C1 (public architecture)
-            outputs_c1 = model(input_ids, labels=labels)
+            with amp_ctx:
+                outputs_c1 = model(input_ids, labels=labels)
             loss_c1 = outputs_c1.loss.item()
             logits_c1 = outputs_c1.logits[:, :-1, :]
             targets = labels[:, 1:]
@@ -380,7 +393,8 @@ def evaluate_on_dataset(model, dataloader, key, device, num_steps=50, eval_c2=Fa
                 if key is not None:
                     apply_permutation(model, key, plan=active_swap_plan)
 
-                outputs_c2 = model(input_ids, labels=labels)
+                with amp_ctx:
+                    outputs_c2 = model(input_ids, labels=labels)
                 loss_c2 = outputs_c2.loss.item()
                 logits_c2 = outputs_c2.logits[:, :-1, :]
                 preds_c2 = logits_c2.argmax(dim=-1)
@@ -459,6 +473,11 @@ def main():
     
     is_main = rank == 0
     is_distributed = local_rank != -1
+
+    # Performance optimizations (match pretraining path).
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     
     os.makedirs(args.output_dir, exist_ok=True)
     
@@ -556,6 +575,8 @@ def main():
             print(f"Loading finetuning model weights from {args.resume_from}")
         model = GPTNeoForCausalLMTiered.from_pretrained(args.resume_from)
         model.to(device)
+
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     
     # Keep raw_model reference for weight manipulation (apply_key, swap_gradients, etc.)
     raw_model = model
@@ -577,10 +598,14 @@ def main():
         ]
         for label, prior_key_list in all_eval_prior_keys.items()
     }
+
+    model = torch.compile(model)
+    if is_main:
+        print("torch.compile enabled")
     
     # Wrap in DDP
     if is_distributed:
-        model = DDP(raw_model, device_ids=[local_rank])
+        model = DDP(model, device_ids=[local_rank])
         if is_main:
             print(f"DDP enabled: {world_size} GPUs")
     
