@@ -15,7 +15,14 @@ cd /work/permutation-alignment
 KL_LAMBDA=${KL_LAMBDA:-0.1}
 KL_TAG=${KL_LAMBDA//./p}
 
-RUN_SPECS=(${RUN_SPECS:-"resweep_a:100 resweep_a:50 resweep_a:20 resweep_b:500 resweep_b:200"})
+# Explicit list of completed C2K pretrain checkpoints to finetune.
+RUNS=(
+    "resweep_a_k100:/work/scratch/checkpoints/fineweb/tiered_c2k_150m_5pct_resweep_a_k100/final-checkpoint"
+    "resweep_a_k50:/work/scratch/checkpoints/fineweb/tiered_c2k_150m_5pct_resweep_a_k50/final-checkpoint"
+    "resweep_a_k20:/work/scratch/checkpoints/fineweb/tiered_c2k_150m_5pct_resweep_a_k20/final-checkpoint"
+    "resweep_b_k500:/work/scratch/checkpoints/fineweb/tiered_c2k_150m_5pct_resweep_b_k500/final-checkpoint"
+    "resweep_b_k200:/work/scratch/checkpoints/fineweb/tiered_c2k_150m_5pct_resweep_b_k200/final-checkpoint"
+)
 
 KEY_SIZE=5
 KEY_PATH=${KEY_PATH:-/work/permutation-alignment/configs/keys/150m/both/key_5pct.json}
@@ -31,7 +38,7 @@ MAX_STEPS=${MAX_STEPS:-}
 TARGET_PRIVATE_TOKENS=${TARGET_PRIVATE_TOKENS:-2000000000}
 CONTEXT_SIZE=${CONTEXT_SIZE:-2048}
 WARMUP_STEPS=${WARMUP_STEPS:-100}
-KEYED_L2_LAMBDA=${KEYED_L2_LAMBDA:-0.1}
+KEYED_L2_LAMBDA=${KEYED_L2_LAMBDA:-0.01}
 EVAL_INTERVAL=${EVAL_INTERVAL:-500}
 EVAL_STEPS=${EVAL_STEPS:-100}
 LOG_INTERVAL=${LOG_INTERVAL:-10}
@@ -57,24 +64,6 @@ fi
 
 mkdir -p "$OUTPUT_ROOT"
 
-build_base_checkpoint() {
-    local run_tag="$1"
-    local k="$2"
-
-    case "$run_tag" in
-        resweep_a)
-            echo "/work/scratch/checkpoints/fineweb/tiered_c2k_150m_5pct_resweep_a_k${k}/final-checkpoint"
-            ;;
-        resweep_b)
-            echo "/work/scratch/checkpoints/fineweb/tiered_c2k_150m_5pct_resweep_b_k${k}/final-checkpoint"
-            ;;
-        *)
-            echo "Unknown RUN_TAG in RUN_SPECS: ${run_tag}" >&2
-            return 1
-            ;;
-    esac
-}
-
 echo "=========================================================="
 echo "C2K private finetune sweep (Spanish FineWeb2, 150M)"
 echo "  Key size:      ${KEY_SIZE}%"
@@ -82,18 +71,17 @@ echo "  KL lambda:     ${KL_LAMBDA}"
 echo "  Private data:  ${PRIVATE_DATA}"
 echo "  Public data:   ${PUBLIC_DATA}"
 echo "  Output root:   ${OUTPUT_ROOT}"
-echo "  Runs:          ${RUN_SPECS[*]}"
+echo "  Runs:          ${#RUNS[@]}"
 echo "=========================================================="
 
-for spec in "${RUN_SPECS[@]}"; do
-    IFS=":" read -r RUN_TAG K <<< "$spec"
-    BASE_CHECKPOINT=$(build_base_checkpoint "$RUN_TAG" "$K")
+for run in "${RUNS[@]}"; do
+    IFS=":" read -r RUN_LABEL BASE_CHECKPOINT <<< "$run"
     if [ ! -d "$BASE_CHECKPOINT" ]; then
-        echo "Missing pretrain checkpoint for ${RUN_TAG} k=${K}: $BASE_CHECKPOINT"
+        echo "Missing pretrain checkpoint for ${RUN_LABEL}: $BASE_CHECKPOINT"
         exit 1
     fi
-    OUTPUT_DIR="${OUTPUT_ROOT}/${RUN_TAG}_k${K}"
-    RUN_NAME="finetune_150m_fineweb2_spa_c2k_key${KEY_SIZE}pct_${RUN_TAG}_k${K}_kl${KL_TAG}"
+    OUTPUT_DIR="${OUTPUT_ROOT}/${RUN_LABEL}"
+    RUN_NAME="finetune_150m_fineweb2_spa_c2k_key${KEY_SIZE}pct_${RUN_LABEL}_kl${KL_TAG}"
 
     if [ -d "${OUTPUT_DIR}/final" ] && [ "$SKIP_EXISTING" = "1" ]; then
         echo "Skipping existing run: ${OUTPUT_DIR}/final"
@@ -101,7 +89,7 @@ for spec in "${RUN_SPECS[@]}"; do
     fi
 
     echo "=========================================================="
-    echo "Launching ${RUN_TAG} k=${K}"
+    echo "Launching ${RUN_LABEL}"
     echo "  Base checkpoint: ${BASE_CHECKPOINT}"
     echo "  Output dir:      ${OUTPUT_DIR}"
     echo "=========================================================="
