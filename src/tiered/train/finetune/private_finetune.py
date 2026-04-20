@@ -599,10 +599,6 @@ def main():
         for label, prior_key_list in all_eval_prior_keys.items()
     }
 
-    model = torch.compile(model)
-    if is_main:
-        print("torch.compile enabled")
-    
     # Wrap in DDP
     if is_distributed:
         model = DDP(model, device_ids=[local_rank])
