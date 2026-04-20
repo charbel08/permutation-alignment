@@ -19,20 +19,24 @@ def parse_args():
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--group", type=str, default=None)
     parser.add_argument("--checkpoint_name", type=str, default=None)
+    parser.add_argument("--step_override", type=int, default=None)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
-    training_state_path = args.checkpoint_dir / "training_state.pt"
-    if not training_state_path.exists():
-        raise FileNotFoundError(f"Missing training state: {training_state_path}")
     if not args.results_path.exists():
         raise FileNotFoundError(f"Missing judge results: {args.results_path}")
 
-    training_state = torch.load(training_state_path, map_location="cpu")
-    global_step = int(training_state.get("global_step", 0))
+    if args.step_override is not None:
+        global_step = int(args.step_override)
+    else:
+        training_state_path = args.checkpoint_dir / "training_state.pt"
+        if not training_state_path.exists():
+            raise FileNotFoundError(f"Missing training state: {training_state_path}")
+        training_state = torch.load(training_state_path, map_location="cpu")
+        global_step = int(training_state.get("global_step", 0))
 
     with open(args.results_path) as f:
         payload = json.load(f)
