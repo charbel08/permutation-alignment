@@ -40,6 +40,9 @@ DIFFICULTY_MODE=${DIFFICULTY_MODE:-auto}
 DIFFICULTY_FIELD=${DIFFICULTY_FIELD:-difficulty}
 
 INCLUDE_FINAL=${INCLUDE_FINAL:-1}
+WANDB_PROJECT=${WANDB_PROJECT:-main-instr-tune}
+WANDB_ENTITY=${WANDB_ENTITY:-}
+WANDB_LOG_RESULTS=${WANDB_LOG_RESULTS:-1}
 
 if [ ! -d "$TRAIN_OUTPUT_DIR" ]; then
     echo "Missing TRAIN_OUTPUT_DIR: $TRAIN_OUTPUT_DIR"
@@ -65,6 +68,24 @@ fi
 
 mkdir -p "$EVAL_ROOT"
 
+DEFAULT_WANDB_GROUP=$(basename "$TRAIN_OUTPUT_DIR")
+WANDB_GROUP=${WANDB_GROUP:-$DEFAULT_WANDB_GROUP}
+WANDB_RUN_NAME=${WANDB_RUN_NAME:-${DEFAULT_WANDB_GROUP}_llm_judge}
+WANDB_RUN_ID_FILE=${WANDB_RUN_ID_FILE:-$EVAL_ROOT/wandb_eval_run_id.txt}
+WANDB_RUN_ID=""
+if [ "$WANDB_LOG_RESULTS" = "1" ]; then
+    if [ -f "$WANDB_RUN_ID_FILE" ]; then
+        WANDB_RUN_ID=$(tr -d '\n' < "$WANDB_RUN_ID_FILE")
+    else
+        WANDB_RUN_ID=$(python3 - <<'PY'
+import uuid
+print(uuid.uuid4().hex[:8])
+PY
+)
+        printf '%s\n' "$WANDB_RUN_ID" > "$WANDB_RUN_ID_FILE"
+    fi
+fi
+
 echo "=========================================================="
 echo "LLM-as-judge sweep over instruction-tuning checkpoints"
 echo "  Train output:  ${TRAIN_OUTPUT_DIR}"
@@ -72,6 +93,10 @@ echo "  Eval root:     ${EVAL_ROOT}"
 echo "  Key path:      ${KEY_PATH}"
 echo "  GPUs:          ${NGPUS}"
 echo "  Judge model:   ${JUDGE_MODEL}"
+if [ "$WANDB_LOG_RESULTS" = "1" ]; then
+    echo "  W&B project:   ${WANDB_PROJECT}"
+    echo "  W&B run:       ${WANDB_RUN_NAME} (${WANDB_RUN_ID})"
+fi
 echo "  Checkpoints:   ${#CHECKPOINT_NAMES[@]}"
 for checkpoint_name in "${CHECKPOINT_NAMES[@]}"; do
     echo "    - ${checkpoint_name}"
@@ -103,4 +128,20 @@ for checkpoint_name in "${CHECKPOINT_NAMES[@]}"; do
     DIFFICULTY_MODE="$DIFFICULTY_MODE" \
     DIFFICULTY_FIELD="$DIFFICULTY_FIELD" \
     bash scripts/snow/fineweb/finetune/530m/alpaca/run_llm_judge_c1_vs_c2.sh
+
+    if [ "$WANDB_LOG_RESULTS" = "1" ]; then
+        WANDB_ARGS=(--project "$WANDB_PROJECT")
+        if [ -n "$WANDB_ENTITY" ]; then
+            WANDB_ARGS+=(--entity "$WANDB_ENTITY")
+        fi
+
+        python3 scripts/eval/log_llm_judge_checkpoint_to_wandb.py \
+            --checkpoint_dir "$checkpoint_path" \
+            --results_path "${eval_output_dir}/judge_results.json" \
+            --run_id "$WANDB_RUN_ID" \
+            --run_name "$WANDB_RUN_NAME" \
+            --group "$WANDB_GROUP" \
+            --checkpoint_name "$checkpoint_name" \
+            "${WANDB_ARGS[@]}"
+    fi
 done
