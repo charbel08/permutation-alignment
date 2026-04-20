@@ -15,13 +15,12 @@ cd /work/permutation-alignment
 KL_LAMBDA=${KL_LAMBDA:-0.1}
 KL_TAG=${KL_LAMBDA//./p}
 
-# Explicit list of completed C2K pretrain checkpoints to finetune.
+# Explicit list of pretrain checkpoints to finetune.
+# `k1` uses the standard 150M 5% tiered pretrain (normal pretraining script).
 RUNS=(
-    "resweep_a_k100:/work/scratch/checkpoints/fineweb/tiered_c2k_150m_5pct_resweep_a_k100/final-checkpoint"
-    "resweep_a_k50:/work/scratch/checkpoints/fineweb/tiered_c2k_150m_5pct_resweep_a_k50/final-checkpoint"
-    "resweep_a_k20:/work/scratch/checkpoints/fineweb/tiered_c2k_150m_5pct_resweep_a_k20/final-checkpoint"
-    "resweep_b_k500:/work/scratch/checkpoints/fineweb/tiered_c2k_150m_5pct_resweep_b_k500/final-checkpoint"
-    "resweep_b_k200:/work/scratch/checkpoints/fineweb/tiered_c2k_150m_5pct_resweep_b_k200/final-checkpoint"
+    "k1:/work/scratch/checkpoints/fineweb/tiered_pretrain_150m_5pct/final-checkpoint"
+    "k2:/work/scratch/checkpoints/fineweb/tiered_c2k_150m_5pct_resweep_b_k2/final-checkpoint"
+    "k1000:/work/scratch/checkpoints/fineweb/tiered_c2k_150m_5pct_resweep_b_k1000/final-checkpoint"
 )
 
 KEY_SIZE=5
