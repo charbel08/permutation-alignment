@@ -26,7 +26,7 @@ TRAIN_OUTPUT_DIR=${TRAIN_OUTPUT_DIR:-/work/scratch/checkpoints/fineweb/instructi
 KEY_PATH=${KEY_PATH:-/work/permutation-alignment/configs/keys/530m/both/key_${KEY_SIZE}pct.json}
 EVAL_ROOT=${EVAL_ROOT:-/work/scratch/checkpoints/fineweb/evals/llm_judge_instruction_tune_530m_alpaca_key${KEY_SIZE}pct_kl${KL_TAG}}
 
-NGPUS=${NGPUS:-4}
+NGPUS=${NGPUS:-8}
 BATCH_SIZE=${BATCH_SIZE:-4}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-256}
 MAX_INSTANCES=${MAX_INSTANCES:-}
