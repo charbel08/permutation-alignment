@@ -53,6 +53,21 @@ You MUST pick a winner — ties are not allowed. If the responses seem close, ch
 
 Judge:"""
 
+ALPACA_PROMPT_INPUT = (
+    "Below is an instruction that describes a task, paired with an input that provides further context. "
+    "Write a response that appropriately completes the request.\n\n"
+    "### Instruction:\n{instruction}\n\n"
+    "### Input:\n{input}\n\n"
+    "### Response:"
+)
+
+ALPACA_PROMPT_NO_INPUT = (
+    "Below is an instruction that describes a task. "
+    "Write a response that appropriately completes the request.\n\n"
+    "### Instruction:\n{instruction}\n\n"
+    "### Response:"
+)
+
 
 def parse_args():
     p = argparse.ArgumentParser(description="LLM-as-judge C1 vs C2")
@@ -123,8 +138,8 @@ def build_prompt(example: dict) -> str:
     instruction = str(example.get("instruction", "")).strip()
     input_text = str(example.get("input", "")).strip()
     if input_text:
-        return f"{instruction}\n\nInput:\n{input_text}"
-    return instruction
+        return ALPACA_PROMPT_INPUT.format(instruction=instruction, input=input_text)
+    return ALPACA_PROMPT_NO_INPUT.format(instruction=instruction)
 
 
 @torch.no_grad()
@@ -155,9 +170,9 @@ def generate_batched(
             temperature=temperature, top_p=top_p,
             pad_token_id=tokenizer.eos_token_id,
         )
+        input_width = input_ids.shape[1]
         for bi, (ex, idx) in enumerate(zip(batch, batch_idxs)):
-            prompt_len = int(attention_mask[bi].sum().item())
-            gen_ids = out_ids[bi, prompt_len:]
+            gen_ids = out_ids[bi, input_width:]
             output = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
             rec = {"idx": idx, "instruction": ex["instruction"], "output": output}
             d = normalize_difficulty(ex.get(difficulty_field))
@@ -357,9 +372,9 @@ def run_judge_local(
             do_sample=False, temperature=0.0,
             pad_token_id=tokenizer.eos_token_id,
         )
+        input_width = input_ids.shape[1]
         for bi in range(len(batch)):
-            prompt_len = int(attention_mask[bi].sum().item())
-            gen_ids = out_ids[bi, prompt_len:]
+            gen_ids = out_ids[bi, input_width:]
             raw_outputs.append(tokenizer.decode(gen_ids, skip_special_tokens=True).strip())
 
     results = []

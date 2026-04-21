@@ -2,6 +2,7 @@ source /work/.bashrc
 
 export HF_HOME=/work/scratch/hf
 export TRANSFORMERS_CACHE=/work/scratch/hf
+SEED=${SEED:-42}
 
 cd /work/permutation-alignment
 
@@ -26,6 +27,7 @@ torchrun --standalone --nproc_per_node=8 -m tiered.train.pretrain.tiered_pretrai
     --eval_interval 400 \
     --eval_steps 75 \
     --save_interval 5000 \
+    --seed ${SEED} \
     --wandb_project main-pretrain \
     --run_name pretrain_150m_fineweb_5pct_random \
     2>&1 | tee logs/pretrain_150m_fineweb_5pct_random_$(date +%Y%m%d_%H%M%S).log

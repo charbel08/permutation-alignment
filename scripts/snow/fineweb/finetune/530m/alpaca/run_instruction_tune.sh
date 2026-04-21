@@ -5,46 +5,48 @@ source /work/.bashrc
 
 export HF_HOME=/work/scratch/hf
 export TRANSFORMERS_CACHE=/work/scratch/hf
+export TOKENIZERS_PARALLELISM=false
 
 cd /work/permutation-alignment
 mkdir -p logs
 
 # ---------------------------------------------------------------------------
-# Single private-finetune launch for Spanish FineWeb2 on a 150M tiered model.
+# C2 instruction tuning on Stanford Alpaca while preserving C1 behavior.
 #
-# Defaults are wired to the regular 150M checkpoints:
-#   KEY_SIZE=5 + KEY_SUFFIX="" -> tiered_pretrain_150m_5pct/final-checkpoint
-# Set KEY_SUFFIX="_random" to target the random-key checkpoints instead.
+# This is a thin wrapper around tiered private_finetune:
+#   L_ft = (1-λ) * L_instruction(C2) + λ * KL(C1_current || C1_frozen)
+#
+# Expects PRIVATE_DATA prepared via:
+#   scripts/snow/data/prepare_alpaca.sh
 # ---------------------------------------------------------------------------
 
-KEY_SIZE=${KEY_SIZE:-5}               # one of: 2, 5, 10
-KEY_SUFFIX=${KEY_SUFFIX:-}            # "" for regular key, "_random" for random-key checkpoints
+KEY_SIZE=${KEY_SIZE:-5}  # one of: 2, 5, 10
 KL_LAMBDA=${KL_LAMBDA:-0.1}
 
-BASE_CHECKPOINT=${BASE_CHECKPOINT:-/work/scratch/checkpoints/fineweb/tiered_pretrain_150m_${KEY_SIZE}pct${KEY_SUFFIX}/final-checkpoint}
-KEY_PATH=${KEY_PATH:-/work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct${KEY_SUFFIX}.json}
-PRIVATE_DATA=${PRIVATE_DATA:-/work/scratch/data/datasets/fineweb2_private/spa_Latn/retain}
+BASE_CHECKPOINT=${BASE_CHECKPOINT:-/work/scratch/checkpoints/fineweb/tiered_pretrain_530m_${KEY_SIZE}pct/final-checkpoint}
+KEY_PATH=${KEY_PATH:-/work/permutation-alignment/configs/keys/530m/both/key_${KEY_SIZE}pct.json}
+PRIVATE_DATA=${PRIVATE_DATA:-/work/scratch/data/datasets/alpaca/tokenized_gpt2_1024}
 PUBLIC_DATA=${PUBLIC_DATA:-/work/scratch/data/datasets/fineweb/retain}
 
 KL_TAG=${KL_LAMBDA//./p}
-OUTPUT_DIR=${OUTPUT_DIR:-/work/scratch/checkpoints/fineweb/private_finetune_150m_fineweb2_spa_key${KEY_SIZE}pct${KEY_SUFFIX}_kl${KL_TAG}}
+OUTPUT_DIR=${OUTPUT_DIR:-/work/scratch/checkpoints/fineweb/instruction_tune_530m_alpaca_key${KEY_SIZE}pct_kl${KL_TAG}}
 
 NGPUS=${NGPUS:-8}
-BATCH_SIZE=${BATCH_SIZE:-8}
+BATCH_SIZE=${BATCH_SIZE:-4}
 LR=${LR:-1e-5}
 MIN_LR=${MIN_LR:-1e-6}
+EPOCHS=${EPOCHS:-3}
 MAX_STEPS=${MAX_STEPS:-}
-TARGET_PRIVATE_TOKENS=${TARGET_PRIVATE_TOKENS:-2000000000}
-CONTEXT_SIZE=${CONTEXT_SIZE:-2048}
+EXTRA_EPOCHS_ON_RESUME=${EXTRA_EPOCHS_ON_RESUME:-0}
+CONTEXT_SIZE=${CONTEXT_SIZE:-1024}
 WARMUP_STEPS=${WARMUP_STEPS:-100}
 KEYED_L2_LAMBDA=${KEYED_L2_LAMBDA:-0.01}
 EVAL_INTERVAL=${EVAL_INTERVAL:-500}
-EVAL_STEPS=${EVAL_STEPS:-100}
+EVAL_STEPS=${EVAL_STEPS:-50}
 LOG_INTERVAL=${LOG_INTERVAL:-10}
-SAVE_INTERVAL=${SAVE_INTERVAL:-2000}
 NUM_WORKERS=${NUM_WORKERS:-4}
-WANDB_PROJECT=${WANDB_PROJECT:-main-finetune}
-RUN_NAME=${RUN_NAME:-finetune_150m_fineweb2_spa_key${KEY_SIZE}pct${KEY_SUFFIX}_kl${KL_TAG}}
+WANDB_PROJECT=${WANDB_PROJECT:-main-instr-tune}
+RUN_NAME=${RUN_NAME:-instruction_tune_530m_alpaca_key${KEY_SIZE}pct_kl${KL_TAG}}
 RESUME_FROM=${RESUME_FROM:-}
 
 if [ ! -d "$BASE_CHECKPOINT" ]; then
@@ -59,6 +61,7 @@ fi
 
 if [ ! -d "$PRIVATE_DATA" ]; then
     echo "Missing PRIVATE_DATA: $PRIVATE_DATA"
+    echo "Run scripts/snow/data/prepare_alpaca.sh first."
     exit 1
 fi
 
@@ -72,7 +75,7 @@ if [ -n "$RESUME_FROM" ] && [ ! -f "$RESUME_FROM/training_state.pt" ]; then
     exit 1
 fi
 
-TRAIN_SAMPLES=$(python - "$PRIVATE_DATA" <<'PY'
+TRAIN_SAMPLES=$(python3 - "$PRIVATE_DATA" <<'PY'
 from datasets import load_from_disk
 import sys
 
@@ -88,6 +91,8 @@ PY
 SAMPLES_PER_RANK=$(( (TRAIN_SAMPLES + NGPUS - 1) / NGPUS ))
 STEPS_PER_EPOCH=$(( SAMPLES_PER_RANK / BATCH_SIZE ))
 TOKENS_PER_STEP=$(( NGPUS * BATCH_SIZE * CONTEXT_SIZE ))
+QUARTER_EPOCH_STEPS=$(( (STEPS_PER_EPOCH + 3) / 4 ))
+SAVE_INTERVAL=${SAVE_INTERVAL:-$QUARTER_EPOCH_STEPS}
 
 if [ "$STEPS_PER_EPOCH" -lt 1 ]; then
     echo "Computed <1 step/epoch. Adjust BATCH_SIZE/NGPUS."
@@ -96,16 +101,42 @@ fi
 
 if [ -n "$MAX_STEPS" ]; then
     RUN_MAX_STEPS="$MAX_STEPS"
+elif [ -n "$RESUME_FROM" ] && [ "$EXTRA_EPOCHS_ON_RESUME" -gt 0 ]; then
+    RESUME_STEP=$(python3 - "$RESUME_FROM/training_state.pt" <<'PY'
+import sys
+import torch
+
+state = torch.load(sys.argv[1], map_location="cpu")
+print(int(state.get("global_step", 0)))
+PY
+)
+    EXTRA_STEPS=$(( EXTRA_EPOCHS_ON_RESUME * STEPS_PER_EPOCH ))
+    RUN_MAX_STEPS=$(( RESUME_STEP + EXTRA_STEPS ))
 else
-    # Default: target a fixed private-token budget.
-    RUN_MAX_STEPS=$(( (TARGET_PRIVATE_TOKENS + TOKENS_PER_STEP - 1) / TOKENS_PER_STEP ))
+    RUN_MAX_STEPS=$(( EPOCHS * STEPS_PER_EPOCH ))
 fi
 
-TARGET_PRIVATE_TOKENS_ACTUAL=$(( RUN_MAX_STEPS * TOKENS_PER_STEP ))
+TARGET_PRIVATE_TOKENS=$(( RUN_MAX_STEPS * TOKENS_PER_STEP ))
+
+if [ -n "$RESUME_FROM" ]; then
+    RESUME_STEP=$(python3 - "$RESUME_FROM/training_state.pt" <<'PY'
+import sys
+import torch
+
+state = torch.load(sys.argv[1], map_location="cpu")
+print(int(state.get("global_step", 0)))
+PY
+)
+    if [ "$RUN_MAX_STEPS" -le "$RESUME_STEP" ]; then
+        echo "RUN_MAX_STEPS (${RUN_MAX_STEPS}) is <= resumed global_step (${RESUME_STEP})."
+        echo "Set MAX_STEPS larger than ${RESUME_STEP}, or set EXTRA_EPOCHS_ON_RESUME > 0."
+        exit 1
+    fi
+fi
 
 echo "=========================================================="
-echo "Private finetune (Spanish FineWeb2, 150M tiered)"
-echo "  Key size:       ${KEY_SIZE}%${KEY_SUFFIX}"
+echo "Instruction tune (Alpaca instructions, 530M tiered)"
+echo "  Key size:       ${KEY_SIZE}%"
 echo "  KL lambda:      ${KL_LAMBDA}"
 echo "  Base checkpoint:${BASE_CHECKPOINT}"
 echo "  Key path:       ${KEY_PATH}"
@@ -114,14 +145,22 @@ echo "  Public data:    ${PUBLIC_DATA}"
 echo "  Output dir:     ${OUTPUT_DIR}"
 if [ -n "$RESUME_FROM" ]; then
     echo "  Resume from:    ${RESUME_FROM}"
+    echo "  Resume step:    ${RESUME_STEP}"
 fi
 echo "  GPUs:           ${NGPUS}"
 echo "  Context size:   ${CONTEXT_SIZE}"
 echo "  Tokens/step:    ${TOKENS_PER_STEP}"
 echo "  Train rows:     ${TRAIN_SAMPLES}"
 echo "  Steps/epoch:    ${STEPS_PER_EPOCH}"
+echo "  Save interval:  ${SAVE_INTERVAL}"
+if [ -z "$MAX_STEPS" ]; then
+    echo "  Epochs:         ${EPOCHS}"
+fi
+if [ -n "$RESUME_FROM" ] && [ -z "$MAX_STEPS" ] && [ "$EXTRA_EPOCHS_ON_RESUME" -gt 0 ]; then
+    echo "  Extra epochs:   ${EXTRA_EPOCHS_ON_RESUME}"
+fi
 echo "  Max steps:      ${RUN_MAX_STEPS}"
-echo "  Target tokens:  ${TARGET_PRIVATE_TOKENS} (actual: ${TARGET_PRIVATE_TOKENS_ACTUAL})"
+echo "  Target tokens:  ${TARGET_PRIVATE_TOKENS}"
 echo "=========================================================="
 
 LOG_FILE="logs/${RUN_NAME}_$(date +%Y%m%d_%H%M%S).log"

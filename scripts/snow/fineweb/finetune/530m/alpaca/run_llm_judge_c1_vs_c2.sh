@@ -25,13 +25,13 @@ CHECKPOINT=${CHECKPOINT:-/work/scratch/checkpoints/fineweb/private_finetune_530m
 KEY_PATH=${KEY_PATH:-/work/permutation-alignment/configs/keys/530m/both/key_${KEY_SIZE}pct.json}
 OUTPUT_DIR=${OUTPUT_DIR:-/work/scratch/checkpoints/fineweb/evals/llm_judge_530m_alpaca_key${KEY_SIZE}pct_kl${KL_TAG}}
 
-NGPUS=${NGPUS:-8}
+NGPUS=${NGPUS:-4}
 BATCH_SIZE=${BATCH_SIZE:-4}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-256}
 MAX_INSTANCES=${MAX_INSTANCES:-}
-TEMPERATURE=${TEMPERATURE:-0.4}
-TOP_P=${TOP_P:-0.95}
-DO_SAMPLE=${DO_SAMPLE:-1}
+TEMPERATURE=${TEMPERATURE:-0.0}
+TOP_P=${TOP_P:-1.0}
+DO_SAMPLE=${DO_SAMPLE:-0}
 
 JUDGE_MODEL=${JUDGE_MODEL:-openai/gpt-oss-120b}
 JUDGE_BATCH_SIZE=${JUDGE_BATCH_SIZE:-4}
