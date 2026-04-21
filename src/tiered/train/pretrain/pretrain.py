@@ -12,6 +12,7 @@ Training loop:
 import argparse
 import math
 import os
+import random
 import time
 from contextlib import nullcontext
 
@@ -165,6 +166,12 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=4,
                         help="DataLoader worker processes per rank (reduce on "
                              "machines with few cores per GPU)")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Global random seed for model init and training reproducibility.",
+    )
 
     return parser.parse_args()
 
@@ -237,6 +244,14 @@ def train(args):
         rank = 0
 
     is_main = rank == 0
+
+    # Reproducibility: keep model init and dropout RNG fixed across baseline/keyed sweeps.
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    if is_main:
+        print(f"Using random seed: {args.seed}")
 
     # Performance optimizations
     torch.backends.cudnn.benchmark = True
