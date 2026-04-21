@@ -11,25 +11,23 @@ cd /work/permutation-alignment
 mkdir -p logs
 
 # ---------------------------------------------------------------------------
-# C1 weight-magnitude analysis for 150M FineWeb2 private-finetuned model
-# (Spanish default). Weights only — no activation pass.
+# C1 weight-magnitude analysis for 530M Alpaca private-finetuned model.
+# Weights only — no activation pass.
 # ---------------------------------------------------------------------------
 
 KEY_SIZE=${KEY_SIZE:-5}
-KEY_SUFFIX=${KEY_SUFFIX:-}
-DATA_LANG=${DATA_LANG:-spa_Latn}
 KL_TAG=${KL_TAG:-0p1}
 
-CHECKPOINT=${CHECKPOINT:-/work/scratch/checkpoints/fineweb/private_finetune_150m_fineweb2_${DATA_LANG%%_*}_key${KEY_SIZE}pct${KEY_SUFFIX}_kl${KL_TAG}/final}
-KEY_PATH=${KEY_PATH:-/work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct${KEY_SUFFIX}.json}
+CHECKPOINT=${CHECKPOINT:-/work/scratch/checkpoints/fineweb/private_finetune_530m_alpaca_key${KEY_SIZE}pct_kl${KL_TAG}/final}
+KEY_PATH=${KEY_PATH:-/work/permutation-alignment/configs/keys/530m/both/key_${KEY_SIZE}pct.json}
 
 SEED=${SEED:-0}
 
-PLOT_DIR=${PLOT_DIR:-/work/permutation-alignment/outputs/c1_weights_150m_fineweb2_${DATA_LANG%%_*}_key${KEY_SIZE}pct${KEY_SUFFIX}_kl${KL_TAG}}
+PLOT_DIR=${PLOT_DIR:-/work/permutation-alignment/outputs/c1_weights_530m_alpaca_key${KEY_SIZE}pct_kl${KL_TAG}}
 OUTPUT_PATH=${OUTPUT_PATH:-${PLOT_DIR}/weights_summary.json}
 
 echo "=========================================================="
-echo "C1 Weight Magnitude Analysis (150M FineWeb2 ${DATA_LANG})"
+echo "C1 Weight Magnitude Analysis (530M Alpaca)"
 echo "  Checkpoint:     ${CHECKPOINT}"
 echo "  Key path:       ${KEY_PATH}"
 echo "  Output JSON:    ${OUTPUT_PATH}"
@@ -46,7 +44,7 @@ if [ ! -f "$KEY_PATH" ]; then
     exit 1
 fi
 
-LOG_FILE="logs/c1_weight_magnitude_analysis_150m_fineweb2_${DATA_LANG%%_*}_key${KEY_SIZE}pct${KEY_SUFFIX}_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="logs/c1_weight_magnitude_analysis_530m_alpaca_key${KEY_SIZE}pct_$(date +%Y%m%d_%H%M%S).log"
 
 PYTHONPATH=./src python scripts/eval/analyze_c1_keyed_magnitudes.py \
     --checkpoint "$CHECKPOINT" \

@@ -93,8 +93,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Analyze C1 keyed vs non-key magnitudes.")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to finetuned checkpoint (e.g. .../final)")
     parser.add_argument("--key_path", type=str, required=True, help="Path to key JSON used to define keyed channels")
-    parser.add_argument("--private_data", type=str, required=True, help="Path to private dataset (HF load_from_disk)")
-    parser.add_argument("--public_data", type=str, required=True, help="Path to public dataset (HF load_from_disk)")
+    parser.add_argument("--private_data", type=str, default=None, help="Path to private dataset (HF load_from_disk). Required unless --weights_only.")
+    parser.add_argument("--public_data", type=str, default=None, help="Path to public dataset (HF load_from_disk). Required unless --weights_only.")
     parser.add_argument("--private_split", type=str, default="train", help="Private split to use if dataset has splits")
     parser.add_argument("--public_split", type=str, default="train", help="Public split to use if dataset has splits")
     parser.add_argument("--batch_size", type=int, default=8)
@@ -102,6 +102,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_length", type=int, default=512, help="Truncate sequences to this length for activation pass")
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--weights_only",
+        action="store_true",
+        help="Skip activation passes and activation plots; only compute weight stats.",
+    )
     parser.add_argument(
         "--output_path",
         type=str,
@@ -796,6 +801,7 @@ def save_plots(
     private_per_layer_activation_stats: dict,
     public_per_layer_activation_stats: dict,
     plot_dir: str,
+    weights_only: bool = False,
 ) -> list[str]:
     os.makedirs(plot_dir, exist_ok=True)
     paths: list[str] = []
@@ -832,23 +838,24 @@ def save_plots(
     )
     paths.append(p)
 
-    p = os.path.join(plot_dir, "private_activations_per_layer_ratio_heatmap.png")
-    _plot_per_layer_ratio_heatmap(
-        private_per_layer_activation_stats,
-        "Per-Layer Private Activation Ratio Heatmap",
-        activation_component_order,
-        p,
-    )
-    paths.append(p)
+    if not weights_only:
+        p = os.path.join(plot_dir, "private_activations_per_layer_ratio_heatmap.png")
+        _plot_per_layer_ratio_heatmap(
+            private_per_layer_activation_stats,
+            "Per-Layer Private Activation Ratio Heatmap",
+            activation_component_order,
+            p,
+        )
+        paths.append(p)
 
-    p = os.path.join(plot_dir, "public_activations_per_layer_ratio_heatmap.png")
-    _plot_per_layer_ratio_heatmap(
-        public_per_layer_activation_stats,
-        "Per-Layer Public Activation Ratio Heatmap",
-        activation_component_order,
-        p,
-    )
-    paths.append(p)
+        p = os.path.join(plot_dir, "public_activations_per_layer_ratio_heatmap.png")
+        _plot_per_layer_ratio_heatmap(
+            public_per_layer_activation_stats,
+            "Per-Layer Public Activation Ratio Heatmap",
+            activation_component_order,
+            p,
+        )
+        paths.append(p)
 
     p = os.path.join(plot_dir, "weights_mean_abs_key_vs_non.png")
     _plot_key_vs_non_abs(weight_stats, "Weights: keyed vs non-keyed mean |w|", p)
@@ -864,33 +871,34 @@ def save_plots(
     )
     paths.append(p)
 
-    p = os.path.join(plot_dir, "private_activations_mean_abs_key_vs_non.png")
-    _plot_key_vs_non_abs(private_activation_stats, "Private activations: keyed vs non-keyed mean |a|", p)
-    paths.append(p)
+    if not weights_only:
+        p = os.path.join(plot_dir, "private_activations_mean_abs_key_vs_non.png")
+        _plot_key_vs_non_abs(private_activation_stats, "Private activations: keyed vs non-keyed mean |a|", p)
+        paths.append(p)
 
-    p = os.path.join(plot_dir, "public_activations_mean_abs_key_vs_non.png")
-    _plot_key_vs_non_abs(public_activation_stats, "Public activations: keyed vs non-keyed mean |a|", p)
-    paths.append(p)
+        p = os.path.join(plot_dir, "public_activations_mean_abs_key_vs_non.png")
+        _plot_key_vs_non_abs(public_activation_stats, "Public activations: keyed vs non-keyed mean |a|", p)
+        paths.append(p)
 
-    p = os.path.join(plot_dir, "activations_mean_abs_ratio_private_vs_public.png")
-    _plot_private_vs_public_ratios(
-        private_activation_stats,
-        public_activation_stats,
-        "mean_abs_ratio_key_over_non",
-        "Activation keyed/non-keyed mean |a| ratio: private vs public",
-        p,
-    )
-    paths.append(p)
+        p = os.path.join(plot_dir, "activations_mean_abs_ratio_private_vs_public.png")
+        _plot_private_vs_public_ratios(
+            private_activation_stats,
+            public_activation_stats,
+            "mean_abs_ratio_key_over_non",
+            "Activation keyed/non-keyed mean |a| ratio: private vs public",
+            p,
+        )
+        paths.append(p)
 
-    p = os.path.join(plot_dir, "activations_rms_ratio_private_vs_public.png")
-    _plot_private_vs_public_ratios(
-        private_activation_stats,
-        public_activation_stats,
-        "rms_ratio_key_over_non",
-        "Activation keyed/non-keyed RMS ratio: private vs public",
-        p,
-    )
-    paths.append(p)
+        p = os.path.join(plot_dir, "activations_rms_ratio_private_vs_public.png")
+        _plot_private_vs_public_ratios(
+            private_activation_stats,
+            public_activation_stats,
+            "rms_ratio_key_over_non",
+            "Activation keyed/non-keyed RMS ratio: private vs public",
+            p,
+        )
+        paths.append(p)
 
     return paths
 
@@ -903,6 +911,8 @@ def main() -> None:
         raise FileNotFoundError(f"Checkpoint dir not found: {args.checkpoint}")
     if not os.path.isfile(args.key_path):
         raise FileNotFoundError(f"Key file not found: {args.key_path}")
+    if not args.weights_only and (args.private_data is None or args.public_data is None):
+        raise ValueError("--private_data and --public_data are required unless --weights_only is set")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -914,46 +924,58 @@ def main() -> None:
     key = load_key(args.key_path)
     mask_plan = build_mask_plan(model, key, device)
 
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    tokenizer.pad_token = tokenizer.eos_token
-
-    private_loader, private_split_used, private_n = _build_loader(
-        args.private_data,
-        args.private_split,
-        args.batch_size,
-        tokenizer.pad_token_id,
-        args.max_length,
-        args.num_workers,
-    )
-    public_loader, public_split_used, public_n = _build_loader(
-        args.public_data,
-        args.public_split,
-        args.batch_size,
-        tokenizer.pad_token_id,
-        args.max_length,
-        args.num_workers,
-    )
-
-    print(f"Private dataset: {args.private_data} [{private_split_used}]  n={private_n}")
-    print(f"Public dataset:  {args.public_data} [{public_split_used}]  n={public_n}")
-    print(f"Activation analysis: num_batches={args.num_batches}, batch_size={args.batch_size}, max_length={args.max_length}")
-
     weight_stats = compute_weight_stats(model, mask_plan)
     per_layer_weight_stats = compute_weight_stats_per_layer(model, mask_plan)
-    private_activation_stats = compute_activation_stats(model, mask_plan, private_loader, device, args.num_batches)
-    private_per_layer_activation_stats = compute_activation_stats_per_layer(
-        model, mask_plan, private_loader, device, args.num_batches
-    )
-    public_activation_stats = compute_activation_stats(model, mask_plan, public_loader, device, args.num_batches)
-    public_per_layer_activation_stats = compute_activation_stats_per_layer(
-        model, mask_plan, public_loader, device, args.num_batches
-    )
 
-    summary = {
-        "checkpoint": args.checkpoint,
-        "key_path": args.key_path,
-        "config": {
-            "c_config": "C1 (public, no key applied)",
+    private_activation_stats: dict = {}
+    public_activation_stats: dict = {}
+    private_per_layer_activation_stats: dict = {}
+    public_per_layer_activation_stats: dict = {}
+    private_split_used = None
+    public_split_used = None
+
+    if not args.weights_only:
+        tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        tokenizer.pad_token = tokenizer.eos_token
+
+        private_loader, private_split_used, private_n = _build_loader(
+            args.private_data,
+            args.private_split,
+            args.batch_size,
+            tokenizer.pad_token_id,
+            args.max_length,
+            args.num_workers,
+        )
+        public_loader, public_split_used, public_n = _build_loader(
+            args.public_data,
+            args.public_split,
+            args.batch_size,
+            tokenizer.pad_token_id,
+            args.max_length,
+            args.num_workers,
+        )
+
+        print(f"Private dataset: {args.private_data} [{private_split_used}]  n={private_n}")
+        print(f"Public dataset:  {args.public_data} [{public_split_used}]  n={public_n}")
+        print(f"Activation analysis: num_batches={args.num_batches}, batch_size={args.batch_size}, max_length={args.max_length}")
+
+        private_activation_stats = compute_activation_stats(model, mask_plan, private_loader, device, args.num_batches)
+        private_per_layer_activation_stats = compute_activation_stats_per_layer(
+            model, mask_plan, private_loader, device, args.num_batches
+        )
+        public_activation_stats = compute_activation_stats(model, mask_plan, public_loader, device, args.num_batches)
+        public_per_layer_activation_stats = compute_activation_stats_per_layer(
+            model, mask_plan, public_loader, device, args.num_batches
+        )
+
+    config = {
+        "c_config": "C1 (public, no key applied)",
+        "seed": args.seed,
+        "device": str(device),
+        "weights_only": args.weights_only,
+    }
+    if not args.weights_only:
+        config.update({
             "private_data": args.private_data,
             "private_split_used": private_split_used,
             "public_data": args.public_data,
@@ -961,20 +983,24 @@ def main() -> None:
             "num_batches": args.num_batches,
             "batch_size": args.batch_size,
             "max_length": args.max_length,
-            "seed": args.seed,
-            "device": str(device),
-        },
+        })
+
+    summary = {
+        "checkpoint": args.checkpoint,
+        "key_path": args.key_path,
+        "config": config,
         "weight_stats": weight_stats,
         "per_layer_weight_stats": per_layer_weight_stats,
-        "activation_stats": {
+    }
+    if not args.weights_only:
+        summary["activation_stats"] = {
             "private": private_activation_stats,
             "public": public_activation_stats,
-        },
-        "per_layer_activation_stats": {
+        }
+        summary["per_layer_activation_stats"] = {
             "private": private_per_layer_activation_stats,
             "public": public_per_layer_activation_stats,
-        },
-    }
+        }
 
     out_dir = os.path.dirname(args.output_path)
     if out_dir:
@@ -997,11 +1023,13 @@ def main() -> None:
         private_per_layer_activation_stats,
         public_per_layer_activation_stats,
         plot_dir,
+        weights_only=args.weights_only,
     )
 
     print_summary("Weight Magnitudes (C1)", weight_stats)
-    print_summary("Activation Magnitudes (C1, Private Data)", private_activation_stats)
-    print_summary("Activation Magnitudes (C1, Public Data)", public_activation_stats)
+    if not args.weights_only:
+        print_summary("Activation Magnitudes (C1, Private Data)", private_activation_stats)
+        print_summary("Activation Magnitudes (C1, Public Data)", public_activation_stats)
     print(f"\nSaved summary: {args.output_path}")
     print("Saved plots:")
     for p in plot_paths:
