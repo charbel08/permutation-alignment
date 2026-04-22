@@ -620,7 +620,7 @@ def _plot_per_layer_ratio_heatmap(
         facecolor="#f6f2e8",
     )
     norm = TwoSlopeNorm(vmin=min_ratio, vcenter=1.0, vmax=max_ratio)
-    im = ax.imshow(matrix, aspect="auto", cmap="RdBu_r", norm=norm)
+    im = ax.imshow(matrix, aspect="auto", cmap="PuOr_r", norm=norm)
 
     ax.set_xticks(range(len(layer_tags)))
     ax.set_xticklabels(layer_tags, rotation=0)
