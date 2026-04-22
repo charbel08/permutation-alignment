@@ -49,17 +49,17 @@ mkdir -p "$PLOT_DIR"
 
 LOG_FILE="logs/tsne_mlp_150m_fineweb2_${DATA_LANG%%_*}_key${KEY_SIZE}pct${KEY_SUFFIX}_$(date +%Y%m%d_%H%M%S).log"
 
-CMD=(PYTHONPATH=./src python scripts/eval/tsne_mlp_weights.py
-    --checkpoint "$CHECKPOINT"
-    --key_path "$KEY_PATH"
-    --plot_dir "$PLOT_DIR"
-    --perplexity "$PERPLEXITY"
-    --seed "$SEED")
+LAYER_ARG=""
 if [ -n "$LAYERS" ]; then
-    CMD+=(--layers "$LAYERS")
+    LAYER_ARG="--layers $LAYERS"
 fi
 
-"${CMD[@]}" 2>&1 | tee "$LOG_FILE"
+PYTHONPATH=./src python scripts/eval/tsne_mlp_weights.py \
+    --checkpoint "$CHECKPOINT" \
+    --key_path "$KEY_PATH" \
+    --plot_dir "$PLOT_DIR" \
+    --perplexity "$PERPLEXITY" \
+    --seed "$SEED" $LAYER_ARG 2>&1 | tee "$LOG_FILE"
 
 echo ""
 echo "Done."
