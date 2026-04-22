@@ -20,13 +20,15 @@ BASELINE_PROJECT=${BASELINE_PROJECT:-main-pretrain}
 BASELINE_RUN=${BASELINE_RUN:-baseline_pretrain_150m_fineweb}
 C2K_RUN_PREFIX=${C2K_RUN_PREFIX:-pretrain_150m_fineweb_5pct_c2k_k}
 
-KS=${KS:-"1 2 5 10 15 20 30 40 50 75 100"}
+KS=${KS:-"1 2 5 10 20 50 100 200 500 1000"}
+EXCLUDE_KS=${EXCLUDE_KS:-"200"}
+NAME_FILTER=${NAME_FILTER:-resweep}
+NAME_FILTER_EXEMPT_KS=${NAME_FILTER_EXEMPT_KS:-"1"}
 LAST_N=${LAST_N:-3}
 X_SOURCE=${X_SOURCE:-auto}   # auto | summary | formula
-INCLUDE_C2=${INCLUDE_C2:-0}  # 1 to also plot C2 loss gap curve
 
-OUTPUT_DIR=${OUTPUT_DIR:-/work/scratch/checkpoints/fineweb/evals/c2k_pareto_150m_5pct}
-TITLE=${TITLE:-c2k Pareto - 150M, 5% key (fineweb)}
+OUTPUT_DIR=${OUTPUT_DIR:-/work/scratch/checkpoints/fineweb/evals/c2k_pareto_150m_5pct_resweep}
+TITLE=${TITLE:-c2k - 150M, 5% key (fineweb, resweep)}
 
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
     echo "Missing Python executable: $PYTHON_BIN"
@@ -39,6 +41,7 @@ if [ -z "$WANDB_ENTITY" ]; then
 fi
 
 read -r -a KS_ARR <<< "$KS"
+read -r -a EXCLUDE_KS_ARR <<< "$EXCLUDE_KS"
 
 ARGS=(
     --entity "$WANDB_ENTITY"
@@ -53,11 +56,20 @@ ARGS=(
     --title "$TITLE"
 )
 
-if [ "$INCLUDE_C2" = "1" ]; then
-    ARGS+=(--include_c2)
+if [ -n "$EXCLUDE_KS" ]; then
+    ARGS+=(--exclude_ks "${EXCLUDE_KS_ARR[@]}")
 fi
 
-LOG_FILE="logs/c2k_pareto_150m_5pct_$(date +%Y%m%d_%H%M%S).log"
+if [ -n "$NAME_FILTER" ]; then
+    ARGS+=(--name_filter "$NAME_FILTER")
+fi
+
+if [ -n "$NAME_FILTER_EXEMPT_KS" ]; then
+    read -r -a EXEMPT_KS_ARR <<< "$NAME_FILTER_EXEMPT_KS"
+    ARGS+=(--name_filter_exempt_ks "${EXEMPT_KS_ARR[@]}")
+fi
+
+LOG_FILE="logs/c2k_pareto_150m_5pct_resweep_$(date +%Y%m%d_%H%M%S).log"
 
 echo "=========================================================="
 echo "c2k Pareto plot (150M, 5% key)"
@@ -67,9 +79,11 @@ echo "  Baseline proj:   ${BASELINE_PROJECT}"
 echo "  Baseline run:    ${BASELINE_RUN}"
 echo "  Run prefix:      ${C2K_RUN_PREFIX}"
 echo "  Ks:              ${KS}"
+echo "  Exclude Ks:      ${EXCLUDE_KS}"
+echo "  Name filter:     ${NAME_FILTER}"
+echo "  Exempt Ks:       ${NAME_FILTER_EXEMPT_KS}"
 echo "  last_n:          ${LAST_N}"
 echo "  x_source:        ${X_SOURCE}"
-echo "  include_c2:      ${INCLUDE_C2}"
 echo "  output_dir:      ${OUTPUT_DIR}"
 echo "=========================================================="
 
