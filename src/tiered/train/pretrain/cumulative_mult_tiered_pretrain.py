@@ -7,30 +7,30 @@ Extends the 2-tier (C1/C2) joint pretraining to N CUMULATIVE tiers:
   C3  = key_1 + key_2 applied
   C_k = key_1 + ... + key_{k-1} applied
 
-Each step:
-1. Forward+backward on C1 (public architecture) — always
-2. Sample one keyed tier k ∈ {0, ..., N-1} via round-robin or uniform
-3. Apply keys 0..k CUMULATIVELY → enter C_{k+1}
-4. Forward+backward on C_{k+1}
-5. Gradient combination:
-   - Key_k weights: gradient from C_{k+1} only
-   - Other keyed weights (j≠k): zeroed (they see wrong cumulative context)
-   - Public weights: average of C1 and C_{k+1} gradients
-6. Unapply all keys + swap gradients → return to C1
-7. Optimizer step in C1 frame
+Each step reduces to an effective 2-tier problem where the "second key" is the
+composite of the applied keys:
 
-CRITICAL DIFFERENCE from independent multi_tiered_pretrain.py:
+1. Forward+backward on C1 (public architecture)
+2. Sample one keyed tier k ∈ {0, ..., N-1} via round-robin or uniform
+3. Mask C1 grads on composite-keyed positions (tiers 0..k). Positions for
+   later tiers (k+1..N-1) are treated as public on this step.
+4. Apply keys 0..k CUMULATIVELY → enter C_{k+1}
+5. Forward+backward on C_{k+1}
+6. Gradient combination (uniform 0.5 scaling, all positions get a real update):
+   - Effective public (public + tiers k+1..N-1):
+         0.5 * (grad_c1 + grad_c_{k+1})
+   - Composite keyed (tiers 0..k):
+         0.5 * grad_c_{k+1}                 (C1 was masked on these positions)
+7. Unapply all keys + swap gradients → return to C1
+8. Plain AdamW optimizer step in the C1 frame
+
+CONTRAST WITH INDEPENDENT multi_tiered_pretrain.py:
   In independent mode, C3 applies ONLY key_2. The model at C3 has key_1's
   neurons in their original (C1) positions.
 
   In cumulative mode, C3 applies key_1 AND key_2. The model at C3 has key_1's
-  neurons in their swapped (C2) positions. Key_2's neurons learn to work in
-  this combined configuration.
-
-  This means after Phase 2, we must zero ALL other tiers' keyed grads (not
-  just the active tier's). A C_{k+1} backward produces grads for key_j neurons
-  (j≠k) that were computed with those neurons scrambled — applying those grads
-  at C1 positions would be incorrect.
+  neurons in their swapped (C2) positions, and key_2's neurons learn to
+  function in this combined configuration.
 
 Usage:
   torchrun --nproc_per_node=4 cumulative_pretrain.py \\
@@ -61,7 +61,7 @@ import wandb
 from tqdm import tqdm
 
 from tiered.model import GPTNeoForCausalLMTiered
-from tiered.permutation import load_key, PermutationKey, scale_public_gradients
+from tiered.permutation import load_key, PermutationKey
 from tiered.permutation.masking import mask_keyed_gradients, build_mask_plan, MaskPlan
 from tiered.permutation.permute import (
     apply_permutation, unapply_permutation, swap_gradients, build_swap_plan,
@@ -71,8 +71,6 @@ from tiered.permutation.utils import _get_attention_module, _get_mlp_module
 from tiered.train.utils import (
     load_model,
     save_checkpoint,
-    build_adamw_update_masks,
-    adamw_step_preserving_public,
 )
 
 
@@ -166,10 +164,6 @@ class TierInfo:
     swap_plan: SwapPlan
     mask_plan: MaskPlan
     steps_sampled: int = 0
-    # Precomputed for adamw_step_preserving_public: True = update, False = freeze.
-    # Frozen positions = all other tiers' keyed positions (they receive no C_k
-    # gradient on steps where this tier is not active).
-    adamw_update_masks: dict = None
 
 
 def parse_args():
@@ -412,15 +406,6 @@ def train(args):
         print()
 
     raw_model = model
-
-    # Precompute per-tier AdamW update masks (before torch.compile).
-    # On each step only the active tier's keyed positions receive a C_{k+1}
-    # gradient; all other tiers' keyed positions are zeroed by
-    # mask_keyed_gradients and must not be updated by AdamW (weight decay
-    # and residual momentum would corrupt them).
-    for tier in tiers:
-        inactive_plans = [t.mask_plan for t in tiers if t is not tier]
-        tier.adamw_update_masks = build_adamw_update_masks(raw_model, inactive_plans)
 
     model = torch.compile(model)
     if is_main:
@@ -682,9 +667,10 @@ def train(args):
                     total_loss_c1 += loss_c1.item()
                 (loss_c1 * loss_scale).backward()
 
-        # Zero C1 gradients on ALL tiers' keyed weights.
-        # These neurons should learn ONLY from their cumulative tier pass.
-        for tier in tiers:
+        # Zero C1 gradients on the composite-keyed positions (tiers 0..active_idx).
+        # Positions for later tiers (K+1..N) are treated as public on this step,
+        # so they keep their C1 gradient.
+        for tier in tiers[:active_idx + 1]:
             mask_keyed_gradients(raw_model, tier.key, plan=tier.mask_plan)
 
         # ==================== PHASE 2: C_{k+1} (cumulative keys 0..k) ====================
@@ -709,26 +695,23 @@ def train(args):
                     total_loss_ck += loss_ck.item()
                 (loss_ck * loss_scale).backward()
 
-        # ── Gradient combination (CUMULATIVE-AWARE) ──
+        # ── Gradient combination ──
         #
-        # After Phase 1 masking + Phase 2 backward, .grad contains:
-        #   Public weights:     grad_c1/A + grad_c_{k+1}/A
-        #   Key_k weights:      grad_c_{k+1}/A        (C1 contribution was zeroed)
-        #   Key_j weights (j≠k): grad_c_{k+1}/A       (C1 contribution was zeroed)
+        # Treat this step as an effective 2-tier problem with the composite key
+        # = keys 0..active_idx:
+        #   Effective public   = true public + tiers (active_idx+1)..N-1 positions
+        #   Composite keyed    = tiers 0..active_idx positions
         #
-        # CRITICAL DIFFERENCE from independent mode:
-        #   Key_j (j≠k) neurons received C_{k+1} gradients while in a scrambled
-        #   configuration (keys 0..k applied). These grads must NOT be applied
-        #   at C1 positions — they'd push weights in the wrong direction.
+        # After Phase 1 masking (only composite-keyed) + Phase 2 backward:
+        #   Effective public:   grad_c1 + grad_c_{k+1}
+        #   Composite keyed:    grad_c_{k+1}   (C1 was masked there)
         #
-        # Fix: zero ALL keyed grads except the active tier's.
-        for tier in tiers:
-            if tier.tier_idx != active_idx:
-                mask_keyed_gradients(raw_model, tier.key, plan=tier.mask_plan)
-
-        # Average the public portion (same as independent mode)
-        scale_public_gradients(raw_model, active_tier.key, scale=0.5,
-                               plan=active_tier.mask_plan)
+        # Uniform 0.5 scaling on every parameter gives:
+        #   Effective public:   0.5 * (grad_c1 + grad_c_{k+1})
+        #   Composite keyed:    0.5 * grad_c_{k+1}
+        for p in raw_model.parameters():
+            if p.grad is not None:
+                p.grad.mul_(0.5)
 
         # ==================== PHASE 3: Return to C1 before optimizer ====================
         #
@@ -744,12 +727,11 @@ def train(args):
         swap_gradients_cumulative(raw_model, tiers, active_idx)
 
         # ── Clip, step, schedule (all in C1 frame) ──
-        # Non-active tiers' keyed positions have zero-tensor grads (zeroed by
-        # mask_keyed_gradients after the cumulative backward).  Use
-        # adamw_step_preserving_public to prevent weight decay and residual
-        # momentum from updating those positions.
+        # Every parameter now has a valid gradient (composite-keyed positions
+        # get (0.5/N) * grad_c_{k+1}; everything else gets the averaged pair),
+        # so a plain AdamW step is correct — no preserving-public variant needed.
         grad_norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.max_grad_norm)
-        adamw_step_preserving_public(optimizer, active_tier.adamw_update_masks)
+        optimizer.step()
         scheduler.step()
 
         global_step += 1

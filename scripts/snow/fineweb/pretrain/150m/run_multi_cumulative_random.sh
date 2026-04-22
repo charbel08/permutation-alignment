@@ -9,8 +9,8 @@ mkdir -p logs
 
 torchrun --standalone --nproc_per_node=8 -m tiered.train.pretrain.cumulative_mult_tiered_pretrain \
     --data_path /work/scratch/data/datasets/fineweb/retain \
-    --output_dir /work/scratch/checkpoints/fineweb/tiered_pretrain_150m_5pct_multi_cumulative \
-    --key_paths /work/permutation-alignment/configs/keys/150m/both/key_5pct_1.json /work/permutation-alignment/configs/keys/150m/both/key_5pct_2.json /work/permutation-alignment/configs/keys/150m/both/key_5pct_3.json \
+    --output_dir /work/scratch/checkpoints/fineweb/tiered_pretrain_150m_5pct_multi_cumulative_random \
+    --key_paths /work/permutation-alignment/configs/keys/150m/both/key_5pct_random_1.json /work/permutation-alignment/configs/keys/150m/both/key_5pct_random_2.json /work/permutation-alignment/configs/keys/150m/both/key_5pct_random_3.json \
     --tier_sample round_robin \
     --hidden_size 768 \
     --intermediate_size 6144 \
@@ -29,5 +29,5 @@ torchrun --standalone --nproc_per_node=8 -m tiered.train.pretrain.cumulative_mul
     --save_interval 5000 \
     --eval_all_tiers \
     --wandb_project main-multi \
-    --run_name pretrain_150m_fineweb_3tiers_5pct_cumulative \
-    2>&1 | tee logs/pretrain_150m_fineweb_3tiers_5pct_cumulative_$(date +%Y%m%d_%H%M%S).log
+    --run_name pretrain_150m_fineweb_3tiers_5pct_cumulative_random \
+    2>&1 | tee logs/pretrain_150m_fineweb_3tiers_5pct_cumulative_random_$(date +%Y%m%d_%H%M%S).log
