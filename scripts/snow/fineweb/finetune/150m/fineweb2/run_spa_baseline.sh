@@ -17,6 +17,7 @@ mkdir -p logs
 
 BASE_CHECKPOINT=${BASE_CHECKPOINT:-/work/scratch/checkpoints/fineweb/baseline_pretrain_150m/final-checkpoint}
 PRIVATE_DATA=${PRIVATE_DATA:-/work/scratch/data/datasets/fineweb2_private/spa_Latn/retain}
+PUBLIC_DATA=${PUBLIC_DATA:-/work/scratch/data/datasets/fineweb/retain}
 OUTPUT_DIR=${OUTPUT_DIR:-/work/scratch/checkpoints/fineweb/baseline_finetune_150m_fineweb2_spa}
 RUN_NAME=${RUN_NAME:-baseline_finetune_150m_fineweb2_spa}
 WANDB_PROJECT=${WANDB_PROJECT:-finetune-sweep}
