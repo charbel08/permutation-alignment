@@ -81,7 +81,7 @@ def parse_args():
     p.add_argument("--min_lr", type=float, default=1e-6)
     p.add_argument("--max_steps", type=int, default=10000)
     p.add_argument("--warmup_steps", type=int, default=100)
-    p.add_argument("--weight_decay", type=float, default=0.1)
+    p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--max_grad_norm", type=float, default=1.0)
 
     p.add_argument("--eval_interval", type=int, default=500)
