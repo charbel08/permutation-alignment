@@ -599,6 +599,15 @@ def main():
         for label, prior_key_list in all_eval_prior_keys.items()
     }
 
+    # Compile the trainable model (and KL reference, if any) AFTER swap plans
+    # are built so plan construction still sees the unwrapped module. Matches
+    # the pretraining pipeline in tiered_pretrain.py.
+    model = torch.compile(model)
+    if ref_model is not None:
+        ref_model = torch.compile(ref_model)
+    if is_main:
+        print("torch.compile enabled")
+
     # Wrap in DDP
     if is_distributed:
         model = DDP(model, device_ids=[local_rank])
