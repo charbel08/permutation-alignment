@@ -78,10 +78,20 @@ echo "=========================================================="
 
 LOG_FILE="logs/${RUN_NAME}_$(date +%Y%m%d_%H%M%S).log"
 
+EXTRA_ARGS=()
+if [ -n "${PUBLIC_DATA:-}" ]; then
+    if [ ! -d "$PUBLIC_DATA" ]; then
+        echo "Missing PUBLIC_DATA: $PUBLIC_DATA"
+        exit 1
+    fi
+    EXTRA_ARGS+=(--public_data "$PUBLIC_DATA")
+fi
+
 torchrun --standalone --nproc_per_node="$NGPUS" -m tiered.train.finetune.baseline_finetune \
     --checkpoint "$BASE_CHECKPOINT" \
-    --data_path "$PRIVATE_DATA" \
+    --private_data "$PRIVATE_DATA" \
     --output_dir "$OUTPUT_DIR" \
+    "${EXTRA_ARGS[@]}" \
     --batch_size "$BATCH_SIZE" \
     --grad_accum_steps "$GRAD_ACCUM_STEPS" \
     --learning_rate "$LR" \
