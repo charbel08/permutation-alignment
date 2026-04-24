@@ -542,22 +542,34 @@ def train():
 
     def run_validation(step_for_logging: int):
         val_log = {"train/step": step_for_logging}
-        # Private val — one loader per tier. "Tier t's private val @ C_{t+2}"
-        for t_idx, loader in enumerate(priv_val_loaders):
-            if loader is None:
-                continue
-            tier_label = f"C{t_idx + 2}"
-            m = _eval_on_loader_at_cumulative(
-                raw_model, loader, tiers, up_to_idx=t_idx,
-                device=device, max_steps=args.eval_steps,
-                is_distributed=is_distributed,
-            )
-            val_log[f"Val Private/{tier_label} Loss"] = m["loss"]
-            val_log[f"Val Private/{tier_label} Perplexity"] = m["ppl"]
-            val_log[f"Val Private/{tier_label} Accuracy"] = m["acc"]
-            if is_main:
-                print(f"  Private {tier_label} ({tiers[t_idx].private_data_path}): "
-                      f"loss={m['loss']:.4f}  ppl={m['ppl']:.2f}  acc={m['acc']:.4f}")
+        # Private val — one loader per data-tier. For EVERY eval config
+        # (C1 + each cumulative tier), evaluate every private dataset. This
+        # yields the full N×(N+1) cross-tier grid:
+        #   Val Private C{e}/C{d+2} — tier-d's private data at config C_e
+        # where C1 = public (no keys), C{t+2} = cumulative keys 0..t.
+        # Diagonal entries (d == eval_tier) show how well the matching tier
+        # has learned its language; off-diagonals show whether one tier's
+        # keyed state partly leaks another tier's language.
+        eval_configs = [(None, "C1")] + [
+            (i, f"C{i + 2}") for i in range(len(tiers))
+        ]
+        for up_to_idx, cfg_label in eval_configs:
+            for d_idx, loader in enumerate(priv_val_loaders):
+                if loader is None:
+                    continue
+                data_label = f"C{d_idx + 2}"
+                m = _eval_on_loader_at_cumulative(
+                    raw_model, loader, tiers, up_to_idx=up_to_idx,
+                    device=device, max_steps=args.eval_steps,
+                    is_distributed=is_distributed,
+                )
+                val_log[f"Val Private {cfg_label}/{data_label} Loss"] = m["loss"]
+                val_log[f"Val Private {cfg_label}/{data_label} Perplexity"] = m["ppl"]
+                val_log[f"Val Private {cfg_label}/{data_label} Accuracy"] = m["acc"]
+                if is_main:
+                    print(f"  Private {data_label} @ {cfg_label}: "
+                          f"loss={m['loss']:.4f}  ppl={m['ppl']:.2f}  "
+                          f"acc={m['acc']:.4f}")
         # Retain val on C1 + each cumulative level
         if pub_val_loader is not None:
             m = _eval_on_loader_at_cumulative(
