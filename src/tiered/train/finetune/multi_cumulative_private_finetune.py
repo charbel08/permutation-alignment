@@ -409,6 +409,21 @@ def train():
         raw_model, [t.mask_plan for t in tiers]
     )
 
+    # Freeze the fully-public parameters (embeddings/LN/LM-head) BEFORE the
+    # DDP wrap. Doing it after DDP builds its bucket index confuses the
+    # reducer — it keeps expecting grads from params we later flipped off.
+    keyed_param_ids = set()
+    for tier in tiers:
+        for param in build_keyed_param_masks(raw_model, tier.mask_plan).keys():
+            keyed_param_ids.add(id(param))
+    keyed_params = [p for p in raw_model.parameters() if id(p) in keyed_param_ids]
+    purely_public_params = [p for p in raw_model.parameters() if id(p) not in keyed_param_ids]
+    for p in purely_public_params:
+        p.requires_grad = False
+    if is_main:
+        print(f"Frozen {len(purely_public_params)} fully-public parameters "
+              f"(embeddings/LN/LM-head). Trainable keyed params: {len(keyed_params)}.")
+
     # torch.compile before DDP (matches the pretrain convention).
     model = torch.compile(model)
     if ref_model is not None:
@@ -461,24 +476,10 @@ def train():
     pub_train_loader = _loader(pub_train, shuffle=True)
     pub_val_loader = _loader(pub_val, shuffle=False)
 
-    # The user spec: "public weights stay unchanged throughout all training".
-    # Two classes of public weight to freeze:
-    #   (a) Parameters with NO keyed positions at all (embeddings, LayerNorms,
-    #       final LN, LM head bias). Freeze via requires_grad=False and exclude
-    #       from the optimizer entirely.
-    #   (b) Public slices inside keyed params (e.g., non-keyed heads in q_proj).
-    #       These stay trainable at the parameter level (other slices of the
-    #       same tensor update), and `adamw_step_preserving_public` below uses
-    #       `all_tiers_update_mask` to snap these slices back after each step.
-    keyed_param_ids = set()
-    for tier in tiers:
-        for param in build_keyed_param_masks(raw_model, tier.mask_plan).keys():
-            keyed_param_ids.add(id(param))
-    keyed_params = [p for p in raw_model.parameters() if id(p) in keyed_param_ids]
-    purely_public_params = [p for p in raw_model.parameters() if id(p) not in keyed_param_ids]
-    for p in purely_public_params:
-        p.requires_grad = False
-
+    # Optimizer: AdamW with wd on 2D keyed weights only.
+    # `purely_public_params` were frozen above (requires_grad=False) — they're
+    # excluded from the optimizer entirely. Public slices inside keyed tensors
+    # are protected by `adamw_step_preserving_public` + `all_tiers_update_mask`.
     decay_params = [p for p in keyed_params if p.dim() >= 2]
     no_decay_keyed = [p for p in keyed_params if p.dim() < 2]
     param_groups = []
@@ -489,9 +490,6 @@ def train():
     optimizer = torch.optim.AdamW(
         param_groups, lr=args.learning_rate, betas=(0.9, 0.95), fused=True,
     )
-    if is_main:
-        print(f"Frozen {len(purely_public_params)} fully-public parameters "
-              f"(embeddings/LN/LM-head). Trainable keyed params: {len(keyed_params)}.")
     warmup = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=args.warmup_steps)
     cosine = CosineAnnealingLR(optimizer, T_max=args.max_steps - args.warmup_steps, eta_min=args.min_lr)
     scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[args.warmup_steps])
