@@ -29,7 +29,7 @@ import matplotlib.transforms as mtransforms  # noqa: F401 (kept for future basel
 import wandb
 
 
-DEFAULT_KS = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000]
+DEFAULT_KS = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000]
 
 
 def parse_args() -> argparse.Namespace:
@@ -201,35 +201,50 @@ def main() -> None:
 
     fig, ax = plt.subplots(figsize=(9, 6), dpi=600)
 
-    # Thin dashed connectors between the two curves at each f-value.
-    for x, y1, y2 in zip(xs, c1, c2):
-        if y2 != y2:  # skip NaN
+    # Thin dashed connectors spanning every point at each f-value (all four
+    # curves: Private C1/C2 + Retain C1/C2 when present).
+    def _stack_ys(i):
+        return [v for v in (c1[i], c2[i], retain_c1[i], retain_c2[i]) if v == v]
+
+    for i, x in enumerate(xs):
+        ys = _stack_ys(i)
+        if len(ys) < 2:
             continue
-        ax.plot([x, x], [y1, y2], color="gray", lw=2.0, ls="--",
+        ax.plot([x, x], [min(ys), max(ys)], color="gray", lw=2.0, ls="--",
                 alpha=0.7, zorder=1)
 
     pub_private_label = r"$\mathcal{C}_{\mathrm{pub}}$ (Private)" if include_retain else r"$\mathcal{C}_{\mathrm{pub}}$"
     k_private_label   = r"$\mathcal{C}_{K}$ (Private)"           if include_retain else r"$\mathcal{C}_{K}$"
-    ax.plot(xs, c1, "o-", color=TEAL, linewidth=3.0, markersize=8,
-            label=pub_private_label, zorder=3)
-    ax.plot(xs, c2, "s-", color=PURPLE, linewidth=3.0, markersize=8,
-            label=k_private_label, zorder=3)
+    h_pub_priv, = ax.plot(
+        xs, c1, "o-", color=TEAL, linewidth=3.0, markersize=8,
+        label=pub_private_label, zorder=3,
+    )
+    h_k_priv, = ax.plot(
+        xs, c2, "s-", color=PURPLE, linewidth=3.0, markersize=8,
+        label=k_private_label, zorder=3,
+    )
 
+    h_pub_pub = h_k_pub = None
     if include_retain and any(v == v for v in retain_c1):
-        ax.plot(xs, retain_c1, "^:", color=TEAL, linewidth=2.0, markersize=7,
-                label=r"$\mathcal{C}_{\mathrm{pub}}$ (Retain)", zorder=3)
+        h_pub_pub, = ax.plot(
+            xs, retain_c1, "^:", color=TEAL, linewidth=2.0, markersize=7,
+            label=r"$\mathcal{C}_{\mathrm{pub}}$ (Public)", zorder=3,
+        )
     if include_retain and any(v == v for v in retain_c2):
-        ax.plot(xs, retain_c2, "D:", color=PURPLE, linewidth=2.0, markersize=7,
-                label=r"$\mathcal{C}_{K}$ (Retain)", zorder=3)
+        h_k_pub, = ax.plot(
+            xs, retain_c2, "D:", color=PURPLE, linewidth=2.0, markersize=7,
+            label=r"$\mathcal{C}_{K}$ (Public)", zorder=3,
+        )
 
-    # Label each connector at the top with $f=K$.
+    # Label each connector at the topmost point with $f=K$ (centered above).
     default_placement = dict(xytext=(0, 8), ha="center", va="bottom")
-    label_placements: dict[int, dict] = {}
-    for x, y1, y2, K in zip(xs, c1, c2, ks_sorted):
-        y_top = y1 if (y2 != y2) else max(y1, y2)
-        placement = label_placements.get(K, default_placement)
+    for i, (x, K) in enumerate(zip(xs, ks_sorted)):
+        ys = _stack_ys(i)
+        if not ys:
+            continue
+        y_top = max(ys)
         ax.annotate(rf"$f={K}$", (x, y_top), textcoords="offset points",
-                    fontsize=10, color="black", **placement)
+                    fontsize=10, color="black", **default_placement)
 
     axis_fs = 17
     ax.set_xscale("log")
@@ -241,7 +256,17 @@ def main() -> None:
     ax.grid(which="major", axis="y", alpha=0.34, linewidth=1.2)
     ax.grid(which="major", axis="x", alpha=0.20, linewidth=1.05)
     ax.grid(which="minor", axis="x", alpha=0.10, linewidth=0.8)
-    ax.legend(ncol=2, fontsize=12, frameon=True, loc="best")
+    # Legend grid: matplotlib fills columns top-to-bottom, so to render
+    #   [ C_K (Private)  | C_pub (Private) ]
+    #   [ C_K (Public)   | C_pub (Public)  ]
+    # pass handles in column-major order: col0 top→bottom, then col1 top→bottom.
+    if h_k_pub is not None and h_pub_pub is not None:
+        legend_handles = [h_k_priv, h_k_pub, h_pub_priv, h_pub_pub]
+    else:
+        legend_handles = [h_k_priv, h_pub_priv]
+    legend_labels = [h.get_label() for h in legend_handles]
+    ax.legend(legend_handles, legend_labels, ncol=2, fontsize=12,
+              frameon=True, loc="best")
     fig.tight_layout()
 
     png = Path(args.output_dir) / "finetune_c2k_pareto.png"

@@ -22,7 +22,7 @@ import matplotlib.transforms as mtransforms
 import wandb
 
 
-DEFAULT_KS = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000]
+DEFAULT_KS = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000]
 
 
 def parse_args():
@@ -256,6 +256,7 @@ def main():
     # top-left corner of the plot; override their placement to sit to the
     # right of the marker instead of directly above it.
     label_placements = {
+        2000: dict(xytext=(10, -2), ha="left", va="center"),
         1000: dict(xytext=(10, -2), ha="left", va="center"),
         500:  dict(xytext=(10, -2), ha="left", va="center"),
         100:  dict(xytext=(14, 8),  ha="center", va="bottom"),
