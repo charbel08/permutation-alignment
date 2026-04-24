@@ -177,6 +177,11 @@ def train_step(
            if device.type == "cuda" else nullcontext())
 
     # -------- 1. Public KL at C1 --------
+    #
+    # Memory note: the full (batch, seq, vocab) logits tensor materializes
+    # twice per KL term (once for the ref softmax, once for the student
+    # log_softmax). We `del` the ref_probs promptly so each KL iteration
+    # returns to baseline before the next forward.
     use_pub_kl = kl_lambda > 0 and public_batch is not None and pretrain_ref is not None
     loss_kl_pub_value = 0.0
     if use_pub_kl:
@@ -186,8 +191,10 @@ def train_step(
                 ref_probs = F.softmax(pretrain_ref(pub_ids).logits, dim=-1)
             student_log = F.log_softmax(model(pub_ids).logits, dim=-1)
             loss_kl_pub = F.kl_div(student_log, ref_probs, reduction="batchmean")
+        del ref_probs, student_log
         (kl_lambda * loss_kl_pub).backward()
         loss_kl_pub_value = loss_kl_pub.item()
+        del loss_kl_pub
 
     # -------- 2. Anchor KLs for each prior tier s < active_idx --------
     anchor_loss_values: list[float] = []
@@ -208,8 +215,10 @@ def train_step(
                 ref_probs = F.softmax(anchor_ref(anchor_ids).logits, dim=-1)
             student_log = F.log_softmax(model(anchor_ids).logits, dim=-1)
             loss_anchor = F.kl_div(student_log, ref_probs, reduction="batchmean")
+        del ref_probs, student_log
         (anchor_kl_lambda * loss_anchor).backward()
         anchor_loss_values.append(loss_anchor.item())
+        del loss_anchor
 
         # swap_gradients brings tier 0..s contributions from C_{s+1} back to home,
         # then unapply restores weights.
@@ -342,9 +351,16 @@ def train():
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
     # --- Reference models (all frozen, all eval mode) ---
+    #
+    # Refs are forward-only under bf16 autocast and never receive an
+    # optimizer step, so we load them directly in bf16 to halve their
+    # weight memory (180M model: 720MB -> 360MB per ref). With the
+    # pretrain ref + up to N-1 anchor refs, this is meaningful at
+    # N=3 (1.1GB saved) and scales with more tiers.
     def _frozen(path):
         m = GPTNeoForCausalLMTiered.from_pretrained(path)
-        m.to(device).eval()
+        m.to(device=device, dtype=torch.bfloat16)
+        m.eval()
         for p in m.parameters():
             p.requires_grad = False
         return m
@@ -394,13 +410,11 @@ def train():
         print(f"  Active tier: C{active_tier.tier_id}. Frozen {len(purely_public)} "
               f"fully-public params; {len(keyed_params)} trainable-shape params.")
 
-    # torch.compile before DDP.
+    # Compile the student only. Reference models are forward-only, no-grad
+    # paths — compiling them adds graph-cache memory with little wall-clock
+    # benefit (the hot path is the student's backward through checkpointed
+    # activations, not the ref forwards).
     model = torch.compile(model)
-    if pretrain_ref is not None:
-        pretrain_ref = torch.compile(pretrain_ref)
-    for i in range(len(anchor_refs)):
-        if anchor_refs[i] is not None:
-            anchor_refs[i] = torch.compile(anchor_refs[i])
     if is_distributed:
         model = DDP(model, device_ids=[local_rank])
 
