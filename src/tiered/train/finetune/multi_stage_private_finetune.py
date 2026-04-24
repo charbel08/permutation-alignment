@@ -205,9 +205,14 @@ def train_step(
         anchor_ref = anchor_refs[s]
         anchor_batch = private_batches[s]
 
-        # Move student AND anchor_ref to C_{s+1}
+        # Move student AND anchor_ref to C_{s+1}. swap_gradients is its own
+        # inverse, so bracket the permuted-arrangement backward with two
+        # swaps: one BEFORE to align previously-accumulated home grads with
+        # the now-permuted weights, one AFTER to bring everything (old + new)
+        # back to home.
         _apply_keys(raw_model, tiers, s)
         _apply_keys(anchor_ref, tiers, s)
+        _swap_gradients(raw_model, tiers, s)
 
         with amp:
             anchor_ids = anchor_batch["input_ids"].to(device)
@@ -220,14 +225,16 @@ def train_step(
         anchor_loss_values.append(loss_anchor.item())
         del loss_anchor
 
-        # swap_gradients brings tier 0..s contributions from C_{s+1} back to home,
-        # then unapply restores weights.
         _swap_gradients(raw_model, tiers, s)
         _unapply_keys(raw_model, tiers, s)
         _unapply_keys(anchor_ref, tiers, s)
 
     # -------- 3. Private loss at C_{active_idx+1} --------
+    # Same bracketing as the anchor loop: align existing home-arrangement
+    # grads (from public KL + anchors) with the permuted weights before the
+    # backward, then swap everything back after.
     _apply_keys(raw_model, tiers, active_idx)
+    _swap_gradients(raw_model, tiers, active_idx)
 
     priv_batch = private_batches[active_idx]
     priv_ids = priv_batch["input_ids"].to(device)
@@ -245,8 +252,6 @@ def train_step(
         m = targets != -100
         acc = (preds[m] == targets[m]).float().mean().item() if m.any() else 0.0
 
-    # Swap priv gradients from C_{active_idx+1} back to home arrangement,
-    # then unapply so weights + grads are both at C1.
     _swap_gradients(raw_model, tiers, active_idx)
     _unapply_keys(raw_model, tiers, active_idx)
 
