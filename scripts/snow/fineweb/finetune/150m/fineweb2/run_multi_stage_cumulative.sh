@@ -28,9 +28,15 @@ mkdir -p logs
 KEY_SIZE=${KEY_SIZE:-5}
 KEY_SUFFIX=${KEY_SUFFIX:-}
 RUN_SUFFIX=${RUN_SUFFIX:-}
+# EXPERIMENT_TAG distinguishes loss/method variants. It is appended to
+# OUTPUT_ROOT and RUN_NAME but NOT to PRETRAIN_CHECKPOINT, so different
+# variants can share the same pretrain. Default reflects the per-config
+# public-KL loss currently in multi_stage_private_finetune.py.
+EXPERIMENT_TAG=${EXPERIMENT_TAG:-perconfig}
 KL_LAMBDA=${KL_LAMBDA:-0.1}
 ANCHOR_KL_LAMBDA=${ANCHOR_KL_LAMBDA:-0.1}
 KL_TAG=${KL_LAMBDA//./p}
+TAG_SUFFIX=${EXPERIMENT_TAG:+_${EXPERIMENT_TAG}}
 
 PRETRAIN_CHECKPOINT=${PRETRAIN_CHECKPOINT:-/work/scratch/checkpoints/fineweb/tiered_pretrain_150m_${KEY_SIZE}pct_multi_cumulative${RUN_SUFFIX}/final-checkpoint}
 PUBLIC_DATA=${PUBLIC_DATA:-/work/scratch/data/datasets/fineweb/retain}
@@ -39,7 +45,7 @@ PRIVATE_BASE=${PRIVATE_BASE:-/work/scratch/data/datasets/fineweb2_private}
 KEY_PATHS=${KEY_PATHS:-"/work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct${KEY_SUFFIX}_1.json /work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct${KEY_SUFFIX}_2.json /work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct${KEY_SUFFIX}_3.json"}
 LANGS=${LANGS:-"deu_Latn tur_Latn spa_Latn"}
 
-OUTPUT_ROOT=${OUTPUT_ROOT:-/work/scratch/checkpoints/fineweb/finetune_150m_fineweb2_multi_stage${RUN_SUFFIX}_key${KEY_SIZE}pct_kl${KL_TAG}}
+OUTPUT_ROOT=${OUTPUT_ROOT:-/work/scratch/checkpoints/fineweb/finetune_150m_fineweb2_multi_stage${RUN_SUFFIX}${TAG_SUFFIX}_key${KEY_SIZE}pct_kl${KL_TAG}}
 
 NGPUS=${NGPUS:-8}
 BATCH_SIZE=${BATCH_SIZE:-8}
@@ -121,7 +127,7 @@ for ACTIVE_IDX in "${!LANG_ARRAY[@]}"; do
     STAGE_LABEL="stage_${ACTIVE_IDX}_C$((ACTIVE_IDX + 2))"
     LANG="${LANG_ARRAY[$ACTIVE_IDX]}"
     STAGE_OUT="${OUTPUT_ROOT}/${STAGE_LABEL}"
-    RUN_NAME="finetune_150m_multi_stage${RUN_SUFFIX}_${STAGE_LABEL}_${LANG}_key${KEY_SIZE}pct_kl${KL_TAG}"
+    RUN_NAME="finetune_150m_multi_stage${RUN_SUFFIX}${TAG_SUFFIX}_${STAGE_LABEL}_${LANG}_key${KEY_SIZE}pct_kl${KL_TAG}"
     LOG_FILE="logs/${RUN_NAME}_$(date +%Y%m%d_%H%M%S).log"
 
     if [ -d "${STAGE_OUT}/final" ] && [ "$SKIP_EXISTING_STAGES" = "1" ]; then

@@ -1,14 +1,25 @@
-"""Multi-stage cumulative private finetuning with per-prior-tier KL anchors.
+"""Multi-stage cumulative private finetuning with per-prior-tier KL anchors
+and per-config public KL anchors.
 
-At stage t (the `--active_idx = t` run), only tier t's weights are updated.
-The loss combines:
+Tier t (active_idx=t) is the only tier updated this stage. The loss is
 
-    L_ft  =  (1 - λ_pub - Σ_s λ_s) · L_priv(C_{t+1}, tier_t_data)
-          +  λ_pub · KL(C1, public_data;  student || pretrain_ref)
-          +  Σ_{s<t}  λ_s · KL(C_{s+1}, tier_s_data;  student || stage_s_ref)
+    L_ft  =  α · L_priv(C_{t+2}, tier_t_data)
+          +  (λ_pub / (N+1)) · Σ_{j=1..N+1} KL(C_j, public_data;
+                                               pretrain_ref || student)
+          +  λ_anchor · Σ_{s<t}  KL(C_{s+2}, tier_s_data;
+                                    stage_s_ref || student)
 
-Each prior-tier anchor KL pins tier s's behavior on ITS OWN private data, AT
-its matching cumulative config C_{s+1}, to whatever tier s's post-stage
+where N = number of tiers and α = 1 - λ_pub - t · λ_anchor.
+
+The public KL is now evaluated at EVERY cumulative config (C1..C_{N+1}),
+not just C1, so off-tier positions are anchored to remain English-friendly
+under any cumulative arrangement — this suppresses cross-tier interference
+when reading tier-T data through configs that route in other tiers'
+specialized weights. The total public-KL budget (`--kl_lambda`) is split
+equally across the N+1 terms.
+
+Each prior-tier anchor KL pins tier s's behavior on ITS OWN private data,
+AT its matching cumulative config C_{s+2}, to whatever tier s's post-stage
 checkpoint produced. Training tier t therefore cannot drift tier s's
 specialized language without paying a KL cost measured on tier s's data.
 
@@ -16,9 +27,8 @@ Only tier t's weight positions receive gradient updates; every other
 position (public + prior tiers + future tiers) is preserved through the
 step via `adamw_step_preserving_public`.
 
-Stage 1 (t=0) degenerates to "private_finetune with no anchors" — same as
-the first stage of the current staged pipeline. Stage t ≥ 2 is the new
-behavior.
+KL direction note: PyTorch's `F.kl_div(student_log, ref_probs)` computes
+KL(ref || student) — the standard mode-covering distillation direction.
 
 Usage: run one invocation per stage via the companion launcher. Stage t's
 `--checkpoint` is stage t-1's output. The anchor reference list grows by
@@ -107,7 +117,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_steps", type=int, default=10000)
     p.add_argument("--warmup_steps", type=int, default=100)
     p.add_argument("--kl_lambda", type=float, default=0.1,
-                   help="Weight of the public-KL term.")
+                   help="Total weight of the public-KL terms (split equally "
+                        "across the N+1 cumulative configs C1..C_{N+1}).")
     p.add_argument("--anchor_kl_lambda", type=float, default=0.1,
                    help="Weight of each prior-tier anchor KL term (same for all).")
     p.add_argument("--keyed_l2_lambda", type=float, default=0.0)
@@ -169,32 +180,55 @@ def train_step(
 ):
     """Execute one multi-stage finetune step.
 
-    Returns (loss_priv, loss_kl_pub, [loss_kl_anchor_s], accuracy, grad_norm).
+    Returns (loss_priv, [loss_kl_pub_Cj], [loss_kl_anchor_s], accuracy, grad_norm).
+    The public-KL list has length N+1 in order C1, C2, ..., C_{N+1}.
     """
     raw_model.train()
     optimizer.zero_grad()
     amp = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
            if device.type == "cuda" else nullcontext())
 
-    # -------- 1. Public KL at C1 --------
+    # -------- 1. Public KL at every cumulative config C1..C_{N+1} --------
+    #
+    # One KL term per config, each weighted (kl_lambda / (N+1)) so the total
+    # public budget matches the prior single-config implementation. Same
+    # public batch is reused across configs so the pin compares like-for-like.
+    #
+    # Bracketing for j>=0 mirrors the anchor loop: apply keys 0..j to BOTH
+    # student and pretrain_ref to reach C_{j+2}, swap previously-accumulated
+    # home grads to that arrangement, backward, swap grads back, unapply keys.
     #
     # Memory note: the full (batch, seq, vocab) logits tensor materializes
     # twice per KL term (once for the ref softmax, once for the student
-    # log_softmax). We `del` the ref_probs promptly so each KL iteration
-    # returns to baseline before the next forward.
+    # log_softmax). We `del` and backward each term before starting the next
+    # forward so peak memory matches the single-term version.
     use_pub_kl = kl_lambda > 0 and public_batch is not None and pretrain_ref is not None
-    loss_kl_pub_value = 0.0
+    loss_kl_pub_values: list[float] = []
     if use_pub_kl:
+        n_pub_terms = len(tiers) + 1
+        per_term_pub = kl_lambda / n_pub_terms
         pub_ids = public_batch["input_ids"].to(device)
-        with amp:
-            with torch.no_grad():
-                ref_probs = F.softmax(pretrain_ref(pub_ids).logits, dim=-1)
-            student_log = F.log_softmax(model(pub_ids).logits, dim=-1)
-            loss_kl_pub = F.kl_div(student_log, ref_probs, reduction="batchmean")
-        del ref_probs, student_log
-        (kl_lambda * loss_kl_pub).backward()
-        loss_kl_pub_value = loss_kl_pub.item()
-        del loss_kl_pub
+
+        for j in range(-1, len(tiers)):
+            if j >= 0:
+                _apply_keys(raw_model, tiers, j)
+                _apply_keys(pretrain_ref, tiers, j)
+                _swap_gradients(raw_model, tiers, j)
+
+            with amp:
+                with torch.no_grad():
+                    ref_probs = F.softmax(pretrain_ref(pub_ids).logits, dim=-1)
+                student_log = F.log_softmax(model(pub_ids).logits, dim=-1)
+                loss_kl_pub = F.kl_div(student_log, ref_probs, reduction="batchmean")
+            del ref_probs, student_log
+            (per_term_pub * loss_kl_pub).backward()
+            loss_kl_pub_values.append(loss_kl_pub.item())
+            del loss_kl_pub
+
+            if j >= 0:
+                _swap_gradients(raw_model, tiers, j)
+                _unapply_keys(raw_model, tiers, j)
+                _unapply_keys(pretrain_ref, tiers, j)
 
     # -------- 2. Anchor KLs for each prior tier s < active_idx --------
     anchor_loss_values: list[float] = []
@@ -266,7 +300,7 @@ def train_step(
     grad_norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), max_grad_norm)
     adamw_step_preserving_public(optimizer, active_update_mask)
 
-    return loss_priv_value, loss_kl_pub_value, anchor_loss_values, acc, grad_norm
+    return loss_priv_value, loss_kl_pub_values, anchor_loss_values, acc, grad_norm
 
 
 # =============================================================================
@@ -561,7 +595,7 @@ def train():
             priv_batches.append(priv_cyclers[i].next())
         pub_batch = pub_cycler.next() if pub_cycler is not None else None
 
-        (loss_priv, loss_kl_pub, anchor_losses, acc, grad_norm) = train_step(
+        (loss_priv, pub_losses, anchor_losses, acc, grad_norm) = train_step(
             model=model, raw_model=raw_model,
             pretrain_ref=pretrain_ref, anchor_refs=anchor_refs,
             tiers=tiers, active_idx=args.active_idx,
@@ -582,23 +616,27 @@ def train():
         cumulative_wall += step_elapsed
         cumulative_tokens += tokens_per_step
 
+        mean_pub_kl = (sum(pub_losses) / len(pub_losses)) if pub_losses else 0.0
+
         if pbar is not None:
             pbar.update(1)
             pbar.set_postfix({
                 "L_priv": f"{loss_priv:.3f}",
-                "R_KL_pub": f"{loss_kl_pub:.3f}",
+                "R_KL_pub": f"{mean_pub_kl:.3f}",
             })
 
         if is_main and global_step % args.log_interval == 0:
+            n_pub = len(pub_losses) if pub_losses else 1
+            per_term_pub = args.kl_lambda / n_pub
             total = (max(0.0, 1.0 - args.kl_lambda - args.active_idx * args.anchor_kl_lambda) * loss_priv
-                     + args.kl_lambda * loss_kl_pub
+                     + per_term_pub * sum(pub_losses)
                      + args.anchor_kl_lambda * sum(
                          v for v in anchor_losses if v == v))
             lr = optimizer.param_groups[0]["lr"]
             log_dict = {
                 "Train/Total Loss": total,
                 "Train/Private Loss (C2)": loss_priv,
-                "Train/KL Divergence": loss_kl_pub,
+                "Train/Public KL Mean": mean_pub_kl,
                 "Train/Perplexity (C2)": math.exp(min(loss_priv, 100)),
                 "Train/Accuracy (C2)": acc,
                 "Train/LR": lr,
@@ -610,6 +648,8 @@ def train():
                 "perf/cumulative_tokens": cumulative_tokens,
                 "grad_norm": grad_norm.item() if hasattr(grad_norm, "item") else grad_norm,
             }
+            for k, v in enumerate(pub_losses):
+                log_dict[f"Train/Public KL C{k + 1}"] = v
             for s, v in enumerate(anchor_losses):
                 if v == v:
                     log_dict[f"Train/Anchor KL C{s + 2}"] = v
