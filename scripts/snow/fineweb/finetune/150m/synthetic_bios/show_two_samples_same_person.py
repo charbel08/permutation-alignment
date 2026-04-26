@@ -68,7 +68,8 @@ def main() -> None:
             raise SystemExit("No person in the (filtered) dataset has bios with distinct target_attr")
 
     a, b = pair
-    print(f"person_id: {a['person_id']}  (total bios for this person: {len(bs)})")
+    n_bios_for_person = len(by_person[a["person_id"]])
+    print(f"person_id: {a['person_id']}  (total bios for this person: {n_bios_for_person})")
     print(f"name: {a.get('name')}")
     print()
     print("--- sample A ---")
