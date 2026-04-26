@@ -42,17 +42,32 @@ def main() -> None:
     for bio in bios:
         by_person[bio["person_id"]].append(bio)
 
+    def _two_with_distinct_targets(group):
+        """Return (a, b) bios from `group` with different target_attr, or None."""
+        for i, x in enumerate(group):
+            for y in group[i + 1:]:
+                if x["target_attr"] != y["target_attr"]:
+                    return x, y
+        return None
+
     if args.person_id is not None:
         if args.person_id not in by_person:
             raise SystemExit(f"person_id {args.person_id} not in dataset / split")
-        bs = by_person[args.person_id]
+        pair = _two_with_distinct_targets(by_person[args.person_id])
+        if pair is None:
+            raise SystemExit(
+                f"person_id {args.person_id} has no pair of bios with distinct target_attr"
+            )
     else:
-        bs = next(b for b in by_person.values() if len(b) >= 2)
+        pair = next(
+            (p for bs in by_person.values()
+             if (p := _two_with_distinct_targets(bs)) is not None),
+            None,
+        )
+        if pair is None:
+            raise SystemExit("No person in the (filtered) dataset has bios with distinct target_attr")
 
-    if len(bs) < 2:
-        raise SystemExit(f"person_id {bs[0]['person_id']} has only {len(bs)} bios")
-
-    a, b = bs[0], bs[1]
+    a, b = pair
     print(f"person_id: {a['person_id']}  (total bios for this person: {len(bs)})")
     print(f"name: {a.get('name')}")
     print()
