@@ -11,11 +11,12 @@ cd /work/permutation-alignment
 mkdir -p logs
 
 # ---------------------------------------------------------------------------
-# Per-module partial-key recovery with a coarser 5% sweep.
+# Partial-key recovery — paired-MLP variant.
 #
-# Same script as run_partial_key_recovery_per_module.sh — atomic unit per
-# field is one swap (= one head pair for attn_heads, one column pair for
-# mlp_cols). Different from the base only in the percentages swept.
+# Like run_partial_key_recovery_per_module_5pct.sh but treats matching
+# mlp_up_cols + mlp_down_cols swap pairs as a single atomic unit so the
+# up-projection and down-projection of the same MLP neuron are always
+# kept (or dropped) together at every percentage.
 # ---------------------------------------------------------------------------
 
 KEY_SIZE=${KEY_SIZE:-5}
@@ -36,10 +37,10 @@ SEED=${SEED:-42}
 DEVICE=${DEVICE:-auto}
 NGPUS=${NGPUS:-8}
 
-OUTPUT_DIR=${OUTPUT_DIR:-outputs/partial_key_recovery_per_module_5pct_150m_synbios_key${KEY_SIZE}pct_kl${KL_TAG}_${EVAL_SPLIT}}
+OUTPUT_DIR=${OUTPUT_DIR:-outputs/partial_key_recovery_paired_mlp_150m_synbios_key${KEY_SIZE}pct_kl${KL_TAG}_${EVAL_SPLIT}}
 
 echo "=========================================================="
-echo "Partial-Key Recovery (PER-MODULE, 5% sweep) — Synthetic Bios, 150M"
+echo "Partial-Key Recovery (Paired MLP up+down) — Synthetic Bios, 150M"
 echo "  Checkpoint:        ${CHECKPOINT}"
 echo "  Key path:          ${KEY_PATH}"
 echo "  Bio metadata:      ${BIO_METADATA}"
@@ -48,7 +49,7 @@ if [ -n "$TARGET_ATTR" ]; then
     echo "  Target attr:       ${TARGET_ATTR}"
 fi
 if [ -n "$MAX_BIOS" ]; then
-echo "  Max bios:          ${MAX_BIOS}"
+    echo "  Max bios:          ${MAX_BIOS}"
 fi
 echo "  Partial key pcts:  ${PARTIAL_KEY_PCTS}"
 echo "  Runs per pct:      ${NUM_RUNS}"
@@ -59,22 +60,17 @@ echo "  Output dir:        ${OUTPUT_DIR}"
 echo "=========================================================="
 
 if [ ! -d "$CHECKPOINT" ]; then
-    echo "Missing CHECKPOINT: $CHECKPOINT"
-    exit 1
+    echo "Missing CHECKPOINT: $CHECKPOINT"; exit 1
 fi
-
 if [ ! -f "$KEY_PATH" ]; then
-    echo "Missing KEY_PATH: $KEY_PATH"
-    exit 1
+    echo "Missing KEY_PATH: $KEY_PATH"; exit 1
 fi
-
 if [ ! -f "$BIO_METADATA" ]; then
-    echo "Missing BIO_METADATA: $BIO_METADATA"
-    exit 1
+    echo "Missing BIO_METADATA: $BIO_METADATA"; exit 1
 fi
 
 mkdir -p "$OUTPUT_DIR"
-LOG_FILE="logs/partial_key_recovery_per_module_5pct_150m_synbios_key${KEY_SIZE}pct_kl${KL_TAG}_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="logs/partial_key_recovery_paired_mlp_150m_synbios_key${KEY_SIZE}pct_kl${KL_TAG}_$(date +%Y%m%d_%H%M%S).log"
 
 EXTRA_ARGS=()
 if [ -n "$TARGET_ATTR" ]; then
@@ -84,7 +80,7 @@ if [ -n "$MAX_BIOS" ]; then
     EXTRA_ARGS+=(--max_bios "$MAX_BIOS")
 fi
 
-PYTHONPATH=./src:. torchrun --standalone --nproc_per_node="$NGPUS" scripts/eval/partial_key_recovery_memorization_per_module.py \
+PYTHONPATH=./src:./scripts/eval torchrun --standalone --nproc_per_node="$NGPUS" scripts/eval/partial_key_recovery_memorization_paired_mlp.py \
     --checkpoint "$CHECKPOINT" \
     --bio_metadata "$BIO_METADATA" \
     --key_path "$KEY_PATH" \
