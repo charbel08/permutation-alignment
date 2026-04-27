@@ -707,7 +707,7 @@ def _plot_per_layer_ratio_heatmap(
     ax.set_yticklabels([_display_name(component) for component in ordered_components])
     ax.set_title(title, fontsize=15, pad=12)
     ax.set_xlabel("Layer")
-    ax.set_ylabel("Weight family" if "Weight" in title else "Activation family")
+    ax.set_ylabel("Weight Family" if "Weight" in title else "Activation Family")
 
     for row_idx in range(len(ordered_components)):
         for col_idx in range(len(layer_tags)):
@@ -922,7 +922,7 @@ def save_plots(
         weight_component_order,
         p,
         ratio_key="l2_ratio_key_over_non",
-        cbar_label="Keyed / Non-keyed mean per-channel L2",
+        cbar_label="Keyed / Non-Keyed L2",
     )
     paths.append(p)
 
