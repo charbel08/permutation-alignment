@@ -1,6 +1,6 @@
-"""All 3 stages: each tier on its own data (solid) plus each higher config
-evaluated on every strictly-lower tier's data (dashed). Color = source
-config. Vertical grey dashed lines mark stage boundaries.
+"""All 3 stages: each tier on its own data plus the three configs C_1, C_2,
+C_3 evaluated on D_3 (matched solid for C_3 on D_3, dashed for the others).
+Color = source config. Vertical grey dashed lines mark stage boundaries.
 """
 
 from __future__ import annotations
@@ -22,28 +22,24 @@ STAGES = [
      "label": r"$C_3$ active"},
 ]
 
-# C_x = config applied; D_x = data tier evaluated. Solid = matched
-# (config index == data tier index); dashed/dotted = mismatched.
-# Palette borrowed from c2k_pareto_plot.py / finetune_c2k_pareto_plot.py
-# (TEAL and PURPLE there). OLIVE is the third, picked at the same
-# brightness/saturation level so it sits with the cool pair instead of
-# clashing.
+# Palette borrowed from c2k_pareto_plot.py / finetune_c2k_pareto_plot.py.
 COLOR_PUB = "gray"
 COLOR_C1 = "#008080"   # teal
 COLOR_C2 = "#662E7D"   # purple
 COLOR_C3 = "#7D6E2E"   # olive
 
 SERIES = [
-    # Matched.
+    # Matched on D_pub.
     {"key": "Val Retain/C1 Loss",     "label": r"$C_\mathrm{pub}$ on $D_\mathrm{pub}$",
      "color": COLOR_PUB, "linestyle": "-"},
-    {"key": "Val Private C2/C2 Loss", "label": r"$C_1$ on $D_1$",
-     "color": COLOR_C1,  "linestyle": "-"},
-    # Higher configs evaluated on D_1.
-    {"key": "Val Private C3/C2 Loss", "label": r"$C_2$ on $D_1$",
+    # The three configs evaluated on D_3 (the third keyed tier). C_3 on D_3
+    # is the matched (solid) one; C_1 and C_2 are below.
+    {"key": "Val Private C2/C4 Loss", "label": r"$C_1$ on $D_3$",
+     "color": COLOR_C1,  "linestyle": "--"},
+    {"key": "Val Private C3/C4 Loss", "label": r"$C_2$ on $D_3$",
      "color": COLOR_C2,  "linestyle": "--"},
-    {"key": "Val Private C4/C2 Loss", "label": r"$C_3$ on $D_1$",
-     "color": COLOR_C3,  "linestyle": "--"},
+    {"key": "Val Private C4/C4 Loss", "label": r"$C_3$ on $D_3$",
+     "color": COLOR_C3,  "linestyle": "-"},
     # All keyed configs evaluated on D_pub (public retain) — dashed but
     # rendered thin so they read as light overlays, not heavy lines.
     {"key": "Val Retain/C2 Loss",     "label": r"$C_1$ on $D_\mathrm{pub}$",
@@ -60,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data_dir", type=str,
                    default="outputs/multi_stage_finetune_history")
     p.add_argument("--output", type=str,
-                   default="outputs/multi_stage_finetune_history/last_stage_below.png")
+                   default="outputs/multi_stage_finetune_history/last_stage_below_d3.png")
     return p.parse_args()
 
 
@@ -109,9 +105,8 @@ def main() -> None:
 
     fig, ax = plt.subplots(figsize=(11, 5.5))
 
-    below_handles = []
+    d3_handles = []
     pub_handles = []
-    pub_xy: list[tuple[list[float], list[float], dict]] = []
     for s in SERIES:
         xs: list[float] = []
         ys: list[float] = []
@@ -120,52 +115,17 @@ def main() -> None:
                 xs.append(step + offsets[i])
                 ys.append(val)
         ls = s.get("linestyle", "-")
-        is_matched = ls == "-"
         line, = ax.plot(xs, ys, color=s["color"], label=s["label"],
                         linewidth=s.get("linewidth", 1.6), linestyle=ls)
-        # Anything evaluated on D_pub goes in the D_pub legend; everything
-        # else (matched or not) goes into the D_1 legend.
         if s["key"].startswith("Val Retain/"):
             pub_handles.append(line)
-            pub_xy.append((xs, ys, s))
         else:
-            below_handles.append(line)
-
-    # Inset axes zooming on the last 5K steps of the D_pub curves —
-    # they overlap heavily on the main axes near 3.14, so a zoom is the
-    # only way to see the small spread between them.
-    last_xmax = boundaries[-1]
-    zoom_x_lo, zoom_x_hi = last_xmax - 1000, last_xmax
-    zoom_ys: list[float] = []
-    for xs, ys, _ in pub_xy:
-        for x, y in zip(xs, ys):
-            if zoom_x_lo <= x <= zoom_x_hi:
-                zoom_ys.append(y)
-    if zoom_ys:
-        y_lo = min(zoom_ys)
-        y_hi = max(zoom_ys)
-        pad = max((y_hi - y_lo) * 0.25, 0.002)
-        zoom_y_lo, zoom_y_hi = y_lo - pad, y_hi + pad
-    else:
-        zoom_y_lo, zoom_y_hi = 3.13, 3.16
-
-    axins = ax.inset_axes([0.80, 0.22, 0.17, 0.28])
-    for xs, ys, s in pub_xy:
-        axins.plot(xs, ys, color=s["color"],
-                   linewidth=s.get("linewidth", 1.6) + 0.6,
-                   linestyle=s.get("linestyle", "-"))
-    axins.set_xlim(zoom_x_lo, zoom_x_hi)
-    axins.set_ylim(zoom_y_lo, zoom_y_hi)
-    axins.set_xticks([zoom_x_lo, zoom_x_hi])
-    axins.tick_params(axis="both", labelsize=7)
-    axins.grid(True, alpha=0.3)
-    # Connector: small square on the source region, expanding to the inset.
-    ax.indicate_inset_zoom(axins, edgecolor="black", alpha=0.6)
+            d3_handles.append(line)
 
     for b in boundaries[:-1]:
         ax.axvline(b, color="gray", linestyle="--", linewidth=1, alpha=0.7)
 
-    # Stage labels above the axes; bbox_inches="tight" on save keeps them.
+    # Stage labels above the axes.
     stage_label_artists = []
     for i, s in enumerate(STAGES):
         center = offsets[i] + stage_lengths[i] / 2
@@ -180,16 +140,11 @@ def main() -> None:
     ax.set_ylabel("Validation Loss")
     ax.grid(True, alpha=0.3)
 
-    # K-notation for thousands on the x-axis (main + inset).
     k_fmt = FuncFormatter(
         lambda x, _pos: f"{x/1000:g}K" if x >= 1000 else f"{x:g}"
     )
     ax.xaxis.set_major_formatter(k_fmt)
-    axins.xaxis.set_major_formatter(k_fmt)
 
-    # Two legends inside the plot, side by side in the mid-left empty
-    # band between the dotted D_pub lines (~y_frac 0.06) and the curves
-    # higher up (>y_frac 0.65).
     legend_kwargs = dict(
         bbox_transform=ax.transAxes,
         loc="lower left",
@@ -199,16 +154,16 @@ def main() -> None:
                            bbox_to_anchor=(0.02, 0.12),
                            **legend_kwargs)
     ax.add_artist(pub_legend)
-    below_legend = ax.legend(handles=below_handles, title=r"Perf. on $D_1$",
-                             bbox_to_anchor=(0.98, 0.97),
-                             bbox_transform=ax.transAxes,
-                             loc="upper right",
-                             fontsize=9, title_fontsize=9, framealpha=0.9)
-    ax.add_artist(below_legend)
+    d3_legend = ax.legend(handles=d3_handles, title=r"Perf. on $D_3$",
+                          bbox_to_anchor=(0.995, 0.78),
+                          bbox_transform=ax.transAxes,
+                          loc="upper right",
+                          fontsize=9, title_fontsize=9, framealpha=0.9)
+    ax.add_artist(d3_legend)
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    extras = [below_legend, pub_legend, *stage_label_artists]
+    extras = [d3_legend, pub_legend, *stage_label_artists]
     fig.savefig(out_path, dpi=300, bbox_inches="tight",
                 bbox_extra_artists=extras)
     pdf_path = out_path.with_suffix(".pdf")
