@@ -13,9 +13,10 @@ mkdir -p logs
 # ---------------------------------------------------------------------------
 # Per-module partial-key recovery with a coarser 5% sweep.
 #
-# Same script as run_partial_key_recovery_per_module.sh — atomic unit per
-# field is one swap (= one head pair for attn_heads, one column pair for
-# mlp_cols). Different from the base only in the percentages swept.
+# Non-paired MLP semantics: combined mlp_cols swaps are split into separate
+# mlp_up_cols and mlp_down_cols atoms, so the up/down sides of the same MLP
+# neuron can be sampled independently. Different from the base sweep only in
+# the percentages swept.
 # ---------------------------------------------------------------------------
 
 KEY_SIZE=${KEY_SIZE:-5}

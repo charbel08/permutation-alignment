@@ -117,6 +117,10 @@ def _build_pools(key: PermutationKey) -> dict[str, list]:
     return pools
 
 
+def _raw_swap_counts(key: PermutationKey) -> dict[str, int]:
+    return {field: len(getattr(key, field, [])) for field in KEY_FIELDS}
+
+
 def _build_partial_key_from_atoms(atoms: list[list]) -> PermutationKey:
     field_values: OrderedDict[str, list] = OrderedDict(
         (field, []) for field in KEY_FIELDS
@@ -181,8 +185,13 @@ def main():
         print("Loading full key...")
     full_key = load_key(args.key_path)
     pools = _build_pools(full_key)
+    raw_swap_counts = _raw_swap_counts(full_key)
+    combined_mlp_cols_are_atomic = raw_swap_counts["mlp_cols"] > 0
 
     if is_main:
+        print("Raw key swap counts:")
+        for name in KEY_FIELDS:
+            print(f"  {name}: {raw_swap_counts[name]}")
         print("Pool sizes (atomic units):")
         for name in POOL_NAMES:
             print(f"  {name}: {len(pools[name])}")
@@ -191,6 +200,11 @@ def main():
             len(getattr(full_key, f, [])) for f in KEY_FIELDS
         )
         print(f"  (total raw swaps in key: {total_swaps})")
+        if combined_mlp_cols_are_atomic:
+            print(
+                "Info: mlp_cols swaps are treated as paired atomic MLP units; "
+                "each selected mlp_cols atom applies both c_fc and c_proj."
+            )
 
     def _keep_per_pool(pct: float) -> dict[str, int]:
         return {n: _keep_count(len(pools[n]), pct) for n in POOL_NAMES}
@@ -353,7 +367,9 @@ def main():
     payload = {
         "config": vars(args),
         "memo_eval_mode": "greedy_decode_extraction_attack_style",
+        "raw_swap_counts": raw_swap_counts,
         "pool_sizes": {n: len(pools[n]) for n in POOL_NAMES},
+        "combined_mlp_cols_are_atomic": combined_mlp_cols_are_atomic,
         "baseline_c1": c1,
         "baseline_full_c2": c2_full,
         "partial_key_summaries": summaries,

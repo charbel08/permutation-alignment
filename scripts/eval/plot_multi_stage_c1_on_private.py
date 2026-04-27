@@ -13,11 +13,11 @@ import matplotlib.pyplot as plt
 
 
 STAGES = [
-    {"csv": "finetune_150m_multi_stage_stage_0_C2_deu_Latn_key5pct_kl0p1.csv",
+    {"csv": "finetune_150m_multi_stage_perconfig_stage_0_C2_deu_Latn_key5pct_kl0p1.csv",
      "label": "stage — tier 2 (deu)"},
-    {"csv": "finetune_150m_multi_stage_stage_1_C3_tur_Latn_key5pct_kl0p1.csv",
+    {"csv": "finetune_150m_multi_stage_perconfig_stage_1_C3_tur_Latn_key5pct_kl0p1.csv",
      "label": "stage — tier 3 (tur)"},
-    {"csv": "finetune_150m_multi_stage_stage_2_C4_spa_Latn_key5pct_kl0p1.csv",
+    {"csv": "finetune_150m_multi_stage_perconfig_stage_2_C4_spa_Latn_key5pct_kl0p1.csv",
      "label": "stage — tier 4 (spa)"},
 ]
 

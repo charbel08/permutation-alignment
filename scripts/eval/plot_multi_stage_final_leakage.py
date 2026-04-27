@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-FINAL_STAGE_CSV = "finetune_150m_multi_stage_stage_2_C4_spa_Latn_key5pct_kl0p1.csv"
+FINAL_STAGE_CSV = "finetune_150m_multi_stage_perconfig_stage_2_C4_spa_Latn_key5pct_kl0p1.csv"
 
 DATA_TIERS = [
     {"id": 2, "label": "tier 2 (deu)"},

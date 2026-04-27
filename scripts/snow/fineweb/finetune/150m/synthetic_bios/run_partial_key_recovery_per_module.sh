@@ -18,10 +18,10 @@ mkdir -p logs
 #
 #   • Prefix      : one shuffle per run, 10% ⊂ 20% ⊂ ... (single pool).
 #   • Independent : fresh uniform-random subset per (run, pct), single pool.
-#   • Per-module  : independent random subsets PER KEY FIELD so the
-#                   attention/MLP ratio is preserved at every percentage
-#                   (attn_heads, attn_out_heads, mlp_cols, mlp_up_cols,
-#                   mlp_down_cols are five independent pools).
+#   • Per-module  : independent random subsets per projection-side pool.
+#                   Combined mlp_cols swaps are split into mlp_up_cols and
+#                   mlp_down_cols atoms, so an MLP neuron's up/down sides can
+#                   be sampled independently.
 #
 # Runs land in a sibling output directory so all three variants coexist.
 # ---------------------------------------------------------------------------

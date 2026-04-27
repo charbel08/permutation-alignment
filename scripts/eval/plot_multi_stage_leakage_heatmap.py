@@ -1,13 +1,10 @@
-"""Leakage-fraction heatmap after all 3 stages.
+"""Leakage heatmap after all 3 stages.
 
-For each (config Cj, tier Ti) cell:
-
-    leakage(Cj, Ti) = (loss(C1 on Ti) - loss(Cj on Ti))
-                    / (loss(C1 on Ti) - loss(C_Ti on Ti))
-
-0 = no leakage (Cj matches the no-keys baseline on Ti's data).
-1 = full leakage (Cj is as good as Ti's matched config).
-The matched diagonal is 1 by construction; the C1 row is 0 by construction.
+Each (config Cj, tier Ti) cell shows the difference between Cj's final val
+loss on tier Ti's data and the matched config's final val loss on that same
+tier (mean of the last N eval points each, then subtracted). The matched
+diagonal (Cj == C_Ti) is 0; off-diagonal cells show how far each non-matched
+config sits above tier Ti's own floor.
 """
 
 from __future__ import annotations
@@ -20,7 +17,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-FINAL_STAGE_CSV = "finetune_150m_multi_stage_stage_2_C4_spa_Latn_key5pct_kl0p1.csv"
+FINAL_STAGE_CSV = "finetune_150m_multi_stage_perconfig_stage_2_C4_spa_Latn_key5pct_kl0p1.csv"
 
 DATA_TIERS = [
     {"id": 2, "label": "tier 2\n(deu)"},
@@ -29,7 +26,6 @@ DATA_TIERS = [
 ]
 
 CONFIGS = [
-    {"id": 1, "label": "C1 (no keys)"},
     {"id": 2, "label": "C2"},
     {"id": 3, "label": "C3"},
     {"id": 4, "label": "C4"},
@@ -76,28 +72,21 @@ def main() -> None:
 
     n_cfg = len(CONFIGS)
     n_tier = len(DATA_TIERS)
-    leak = np.zeros((n_cfg, n_tier))
+    diff = np.zeros((n_cfg, n_tier))
     for j, c in enumerate(CONFIGS):
         for i, d in enumerate(DATA_TIERS):
-            c1 = losses[1][d["id"]]
             matched = losses[d["id"]][d["id"]]
-            denom = c1 - matched
-            if denom <= 0:
-                leak[j, i] = float("nan")
-            else:
-                leak[j, i] = (c1 - losses[c["id"]][d["id"]]) / denom
+            diff[j, i] = losses[c["id"]][d["id"]] - matched
 
+    vmax = float(np.nanmax(diff)) if np.any(diff > 0) else 1.0
     fig, ax = plt.subplots(figsize=(7, 5))
-    # Clamp color scale to [0, 1]; values <0 ("worse than C1") and >1
-    # ("better than matched") are out-of-range but shown as text.
-    im = ax.imshow(np.clip(leak, 0.0, 1.0), cmap="Reds",
-                   aspect="auto", vmin=0.0, vmax=1.0)
+    im = ax.imshow(diff, cmap="Reds", aspect="auto", vmin=0.0, vmax=vmax)
 
     for j in range(n_cfg):
         for i in range(n_tier):
-            v = leak[j, i]
-            shade = "white" if min(max(v, 0), 1) > 0.55 else "black"
-            ax.text(i, j, f"{v:.2f}", ha="center", va="center",
+            v = diff[j, i]
+            shade = "white" if v > 0.55 * vmax else "black"
+            ax.text(i, j, f"{v:.3f}", ha="center", va="center",
                     color=shade, fontsize=11, fontweight="bold")
 
     # Outline matched diagonal (config id == tier id) cells.
@@ -114,12 +103,11 @@ def main() -> None:
     ax.set_yticklabels([c["label"] for c in CONFIGS])
     ax.set_xlabel("evaluated on tier's data")
     ax.set_ylabel("config applied")
-    ax.set_title("Leakage fraction after all 3 stages\n"
-                 "0 = no leakage (= C1 baseline)   1 = full leakage (= matched)\n"
-                 "negative = config worse than baseline    black box = matched")
+    ax.set_title("Validation-loss diff vs matched config (final eval)\n"
+                 "(mean of last 3 eval points; black box = matched, diff = 0)")
 
     cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label("leakage fraction")
+    cbar.set_label("val loss − matched val loss")
     fig.tight_layout()
 
     out_path = Path(args.output)

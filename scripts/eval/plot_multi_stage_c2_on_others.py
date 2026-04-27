@@ -12,11 +12,11 @@ import matplotlib.pyplot as plt
 
 
 STAGES = [
-    {"csv": "finetune_150m_multi_stage_stage_0_C2_deu_Latn_key5pct_kl0p1.csv",
+    {"csv": "finetune_150m_multi_stage_perconfig_stage_0_C2_deu_Latn_key5pct_kl0p1.csv",
      "label": "stage — tier 2 (deu)"},
-    {"csv": "finetune_150m_multi_stage_stage_1_C3_tur_Latn_key5pct_kl0p1.csv",
+    {"csv": "finetune_150m_multi_stage_perconfig_stage_1_C3_tur_Latn_key5pct_kl0p1.csv",
      "label": "stage — tier 3 (tur)"},
-    {"csv": "finetune_150m_multi_stage_stage_2_C4_spa_Latn_key5pct_kl0p1.csv",
+    {"csv": "finetune_150m_multi_stage_perconfig_stage_2_C4_spa_Latn_key5pct_kl0p1.csv",
      "label": "stage — tier 4 (spa)"},
 ]
 
@@ -24,6 +24,7 @@ SERIES = [
     {"key": "Val Private C2/C2 Loss", "label": "C2 on tier 2 (deu)", "color": "tab:blue"},
     {"key": "Val Private C2/C3 Loss", "label": "C2 on tier 3 (tur)", "color": "tab:orange"},
     {"key": "Val Private C2/C4 Loss", "label": "C2 on tier 4 (spa)", "color": "tab:green"},
+    {"key": "Val Private C3/C3 Loss", "label": "C3 on tier 3 (tur, matched)", "color": "tab:orange", "linestyle": "--"},
 ]
 
 
@@ -88,7 +89,8 @@ def main() -> None:
                 xs.append(step + offsets[i])
                 ys.append(val)
         ax.plot(xs, ys, color=s["color"], label=s["label"],
-                linewidth=1.6, marker="o", markersize=3)
+                linewidth=1.6, marker="o", markersize=3,
+                linestyle=s.get("linestyle", "-"))
 
     for b in boundaries[:-1]:
         ax.axvline(b, color="gray", linestyle="--", linewidth=1, alpha=0.7)

@@ -13,10 +13,10 @@ mkdir -p logs
 # ---------------------------------------------------------------------------
 # Partial-key recovery — paired-MLP variant.
 #
-# Like run_partial_key_recovery_per_module_5pct.sh but treats matching
-# mlp_up_cols + mlp_down_cols swap pairs as a single atomic unit so the
-# up-projection and down-projection of the same MLP neuron are always
-# kept (or dropped) together at every percentage.
+# Paired MLP semantics: combined mlp_cols swaps are kept as one atomic unit,
+# and explicit matching mlp_up_cols + mlp_down_cols entries are sampled
+# together. The up/down sides of the same MLP neuron are always kept or
+# dropped together at every percentage.
 # ---------------------------------------------------------------------------
 
 KEY_SIZE=${KEY_SIZE:-5}

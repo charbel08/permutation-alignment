@@ -3,16 +3,18 @@
 
 Variant of `partial_key_recovery_memorization.py`. Unlike the original
 (single flat pool, prefix-monotone) and the `_independent` variant (single
-flat pool, independent draws), this script treats each of the five key
-fields as an independent module-level pool:
+flat pool, independent draws), this script treats each projection-side key
+field as an independent module-level pool:
 
     attn_heads,  attn_out_heads,
     mlp_cols,    mlp_up_cols,    mlp_down_cols
 
-At percentage p, we keep `round(len(field) · p/100)` swaps **within each
-field independently**. This preserves the per-module attention/MLP ratio
-at every p — a random flat-pool subset at low p can under- or over-sample
-one module by chance; this variant can't.
+For non-paired MLP sampling, combined `mlp_cols` swaps are split into two
+independent atoms: one `mlp_up_cols` atom and one `mlp_down_cols` atom with
+the same endpoints. At percentage p, we keep `round(len(pool) · p/100)`
+atoms within each pool independently. This preserves the per-module ratio at
+every p while allowing a neuron's up- and down-projection entries to be kept
+or dropped separately.
 
 Each (run_idx, pct, field) draw is independent and deterministically
 seeded so reruns reproduce. Output layout and metrics match the other
@@ -154,24 +156,53 @@ def select_bios(metadata, eval_split, target_attr=None):
     return bios
 
 
-def _flatten_key_entries(key: PermutationKey) -> list[tuple[str, list[list[int]]]]:
-    entries = []
-    for field in KEY_FIELDS:
-        swaps = getattr(key, field, [])
-        for swap in swaps:
-            entries.append((field, copy.deepcopy(swap)))
-    return entries
+def _build_nonpaired_atoms(
+    key: PermutationKey,
+) -> tuple[list[list[tuple[str, list[list[int]]]]], OrderedDict[str, list[int]], dict[str, int]]:
+    """Build projection-side atoms for non-paired partial-key sampling.
+
+    `mlp_cols` is the compact full-key representation for "swap this MLP
+    neuron in both c_fc and c_proj". For the non-paired experiment, split each
+    such swap into one up-only atom and one down-only atom so the two sides can
+    be sampled independently.
+    """
+    atoms: list[list[tuple[str, list[list[int]]]]] = []
+    per_field_atom_idx: OrderedDict[str, list[int]] = OrderedDict(
+        (field, []) for field in KEY_FIELDS
+    )
+    raw_swap_counts = {field: len(getattr(key, field, [])) for field in KEY_FIELDS}
+
+    def add_atom(field: str, swap: list[list[int]]) -> None:
+        atom_idx = len(atoms)
+        atoms.append([(field, copy.deepcopy(swap))])
+        per_field_atom_idx[field].append(atom_idx)
+
+    for field in ("attn_heads", "attn_out_heads"):
+        for swap in getattr(key, field, []):
+            add_atom(field, swap)
+
+    for swap in key.mlp_cols:
+        add_atom("mlp_up_cols", swap)
+        add_atom("mlp_down_cols", swap)
+
+    for field in ("mlp_up_cols", "mlp_down_cols"):
+        for swap in getattr(key, field, []):
+            add_atom(field, swap)
+
+    return atoms, per_field_atom_idx, raw_swap_counts
 
 
-def _build_partial_key_from_keep(
-    entries: list[tuple[str, list[list[int]]]],
+def _build_partial_key_from_atoms(
+    atoms: list[list[tuple[str, list[list[int]]]]],
     keep_indices: set[int],
 ) -> PermutationKey:
     field_values: OrderedDict[str, list] = OrderedDict(
         (field, []) for field in KEY_FIELDS
     )
-    for idx, (field, swap) in enumerate(entries):
-        if idx in keep_indices:
+    for idx, atom in enumerate(atoms):
+        if idx not in keep_indices:
+            continue
+        for field, swap in atom:
             field_values[field].append(swap)
     return PermutationKey(
         attn_heads=field_values["attn_heads"],
@@ -421,25 +452,21 @@ def main():
     if is_main:
         print("Loading full key...")
     full_key = load_key(args.key_path)
-    key_entries = _flatten_key_entries(full_key)
-    total_swaps = len(key_entries)
+    key_atoms, per_field_entry_idx, raw_swap_counts = _build_nonpaired_atoms(full_key)
+    total_swaps = len(key_atoms)
+    raw_total_swaps = sum(raw_swap_counts.values())
     if total_swaps == 0:
         raise ValueError("Loaded key has no swaps.")
 
-    # Per-module (per key-field) sampling: build an independent pool of
-    # entry indices per field. At each percentage we draw round(|pool|·p/100)
-    # from each pool independently, preserving the attention/MLP ratio.
-    per_field_entry_idx: OrderedDict[str, list[int]] = OrderedDict(
-        (field, []) for field in KEY_FIELDS
-    )
-    for idx, (field, _swap) in enumerate(key_entries):
-        per_field_entry_idx[field].append(idx)
-
     if is_main:
-        print(f"Total key swaps: {total_swaps}")
+        print(f"Raw key swaps: {raw_total_swaps}")
+        for field, n in raw_swap_counts.items():
+            if n:
+                print(f"  raw {field}: {n} swap(s)")
+        print(f"Total non-paired atoms: {total_swaps}")
         for field, pool in per_field_entry_idx.items():
             if pool:
-                print(f"  {field}: {len(pool)} swap(s)")
+                print(f"  atom pool {field}: {len(pool)} atom(s)")
 
     # Total kept count at percentage p = sum over fields of round(|field|·p/100).
     # Keep the flat `keep_counts` around too for the CSV summary.
@@ -525,7 +552,7 @@ def main():
                 if k <= 0 or not pool:
                     continue
                 keep_indices.update(rng.sample(pool, k))
-            partial_key = _build_partial_key_from_keep(key_entries, keep_indices)
+            partial_key = _build_partial_key_from_atoms(key_atoms, keep_indices)
 
             apply_permutation(model, partial_key)
             agg = _evaluate_cached_greedy(
@@ -543,6 +570,7 @@ def main():
                 "seed": cell_seed,
                 "swaps_kept": len(keep_indices),
                 "total_swaps": total_swaps,
+                "raw_total_swaps": raw_total_swaps,
             }
             # Also record per-field counts so the CSV makes the stratification
             # explicit and downstream plotting can break it out if needed.
@@ -583,6 +611,7 @@ def main():
             "pct": pct,
             "swaps_kept": keep_n,
             "total_swaps": total_swaps,
+            "raw_total_swaps": raw_total_swaps,
             "num_runs": args.num_runs,
         }
         for mk in metric_keys:
@@ -604,7 +633,7 @@ def main():
     with open(run_csv, "w", newline="") as f:
         per_field_cols = [f"swaps_kept_{field}" for field in KEY_FIELDS]
         fieldnames = [
-            "pct", "run", "seed", "swaps_kept", "total_swaps",
+            "pct", "run", "seed", "swaps_kept", "total_swaps", "raw_total_swaps",
             *per_field_cols,
             *metric_keys,
         ]
@@ -615,7 +644,7 @@ def main():
     summary_csv = Path(args.output_dir) / "partial_key_recovery_summary.csv"
     with open(summary_csv, "w", newline="") as f:
         fieldnames = [
-            "pct", "swaps_kept", "total_swaps", "num_runs",
+            "pct", "swaps_kept", "total_swaps", "raw_total_swaps", "num_runs",
         ]
         for mk in metric_keys:
             fieldnames.extend([
@@ -632,6 +661,8 @@ def main():
     payload = {
         "config": vars(args),
         "memo_eval_mode": "greedy_decode_extraction_attack_style",
+        "raw_swap_counts": raw_swap_counts,
+        "atom_pool_sizes": {field: len(pool) for field, pool in per_field_entry_idx.items()},
         "baseline_c1": c1,
         "baseline_full_c2": c2_full,
         "partial_key_summaries": summaries,

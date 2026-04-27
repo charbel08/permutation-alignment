@@ -1,6 +1,7 @@
-"""Concatenate the 3 multi-stage finetune runs end-to-end and plot, for
-each tier, its val-private loss on its own data evaluated at its matching
-cumulative config (Cs+2 / Cs+2). Vertical dashed lines mark stage boundaries.
+"""Per-tier matched val loss (solid, full span) plus, restricted to each
+stage's own segment, the active stage's config evaluated on every strictly
+lower tier's data (dashed/dotted). Stage 0 has no overlay (tier 2 has no
+tiers below it). Color = data tier being evaluated.
 """
 
 from __future__ import annotations
@@ -14,28 +15,49 @@ import matplotlib.pyplot as plt
 
 STAGES = [
     {  # trains tier 2
-        "csv": "finetune_150m_multi_stage_stage_0_C2_deu_Latn_key5pct_kl0p1.csv",
+        "csv": "finetune_150m_multi_stage_perconfig_stage_0_C2_deu_Latn_key5pct_kl0p1.csv",
         "label": "stage — tier 2 (deu)",
     },
     {  # trains tier 3
-        "csv": "finetune_150m_multi_stage_stage_1_C3_tur_Latn_key5pct_kl0p1.csv",
+        "csv": "finetune_150m_multi_stage_perconfig_stage_1_C3_tur_Latn_key5pct_kl0p1.csv",
         "label": "stage — tier 3 (tur)",
     },
     {  # trains tier 4
-        "csv": "finetune_150m_multi_stage_stage_2_C4_spa_Latn_key5pct_kl0p1.csv",
+        "csv": "finetune_150m_multi_stage_perconfig_stage_2_C4_spa_Latn_key5pct_kl0p1.csv",
         "label": "stage — tier 4 (spa)",
     },
 ]
 
-TIERS = [
-    {"key": "Val Retain/C1 Loss",     "label": "public — retain @ C1",   "color": "tab:gray",   "linestyle": "-"},
-    {"key": "Val Private C2/C2 Loss", "label": "tier 2 — deu @ C2",      "color": "tab:blue",   "linestyle": "-"},
-    {"key": "Val Retain/C2 Loss",     "label": "tier 2 — retain @ C2",   "color": "tab:blue",   "linestyle": "--"},
-    {"key": "Val Private C3/C3 Loss", "label": "tier 3 — tur @ C3",      "color": "tab:orange", "linestyle": "-"},
-    {"key": "Val Retain/C3 Loss",     "label": "tier 3 — retain @ C3",   "color": "tab:orange", "linestyle": "--"},
-    {"key": "Val Private C4/C4 Loss", "label": "tier 4 — spa @ C4",      "color": "tab:green",  "linestyle": "-"},
-    {"key": "Val Retain/C4 Loss",     "label": "tier 4 — retain @ C4",   "color": "tab:green",  "linestyle": "--"},
+# Solid matched-on-own curves, drawn across all stages (full x-axis span).
+# Math notation: C_pub = no keys (was C1), C_1..C_3 = cumulative keyed configs
+# (were C2..C4).
+MATCHED = [
+    {"key": "Val Private C2/C2 Loss", "label": r"deu @ $C_1$ (matched)",  "color": "tab:blue"},
+    {"key": "Val Private C3/C3 Loss", "label": r"tur @ $C_2$ (matched)",  "color": "tab:orange"},
+    {"key": "Val Private C4/C4 Loss", "label": r"spa @ $C_3$ (matched)",  "color": "tab:green"},
 ]
+
+# Per-stage overlays: the active stage's config evaluated on each strictly
+# lower tier's data. Drawn ONLY on that stage's own segment of the x-axis.
+# Color matches the data tier being evaluated.
+STAGE_LOWER_OVERLAYS = [
+    # stage 0 (active = C_1 on deu): lower = eng (C_pub)
+    {"stage_idx": 0, "key": "Val Retain/C2 Loss",
+     "label": r"$C_1$ on eng",   "color": "tab:gray", "linestyle": "--"},
+    # stage 1 (active = C_2 on tur): lower = eng, deu
+    {"stage_idx": 1, "key": "Val Retain/C3 Loss",
+     "label": r"$C_2$ on eng",   "color": "tab:gray", "linestyle": "--"},
+    {"stage_idx": 1, "key": "Val Private C3/C2 Loss",
+     "label": r"$C_2$ on deu",   "color": "tab:blue", "linestyle": "--"},
+    # stage 2 (active = C_3 on spa): lower = eng, deu, tur
+    {"stage_idx": 2, "key": "Val Retain/C4 Loss",
+     "label": r"$C_3$ on eng",   "color": "tab:gray", "linestyle": "--"},
+    {"stage_idx": 2, "key": "Val Private C4/C2 Loss",
+     "label": r"$C_3$ on deu",   "color": "tab:blue", "linestyle": ":"},
+    {"stage_idx": 2, "key": "Val Private C4/C3 Loss",
+     "label": r"$C_3$ on tur",   "color": "tab:orange", "linestyle": "--"},
+]
+
 
 
 def parse_args() -> argparse.Namespace:
@@ -74,7 +96,8 @@ def _load_stage(path: Path, metric_keys: list[str]) -> dict[str, list[tuple[int,
 def main() -> None:
     args = parse_args()
     data_dir = Path(args.data_dir)
-    metric_keys = [t["key"] for t in TIERS]
+    metric_keys = sorted({m["key"] for m in MATCHED}
+                         | {o["key"] for o in STAGE_LOWER_OVERLAYS})
 
     stage_data = []
     stage_lengths = []
@@ -93,19 +116,35 @@ def main() -> None:
         offsets.append(offsets[-1] + L)
     boundaries = [offsets[i] + stage_lengths[i] for i in range(len(STAGES))]
 
-    fig, ax = plt.subplots(figsize=(10, 5))
+    fig, ax = plt.subplots(figsize=(11, 5.5))
 
-    for tier in TIERS:
+    # Matched-on-own curves: span every stage. Captured for the global legend.
+    matched_handles = []
+    for m in MATCHED:
         xs: list[float] = []
         ys: list[float] = []
         for i, d in enumerate(stage_data):
-            series = sorted(d[tier["key"]], key=lambda p: p[0])
-            for step, val in series:
+            for step, val in sorted(d[m["key"]], key=lambda p: p[0]):
                 xs.append(step + offsets[i])
                 ys.append(val)
-        ax.plot(xs, ys, color=tier["color"], label=tier["label"],
-                linewidth=1.6, linestyle=tier.get("linestyle", "-"),
-                marker="o", markersize=3)
+        line, = ax.plot(xs, ys, color=m["color"], label=m["label"],
+                        linewidth=1.6, linestyle="-")
+        matched_handles.append(line)
+
+    # Per-stage lower overlays: only the points from that stage's own CSV.
+    # Group handles by stage_idx so each stage gets its own legend.
+    stage_handles: dict[int, list] = {i: [] for i in range(len(STAGES))}
+    for o in STAGE_LOWER_OVERLAYS:
+        i = o["stage_idx"]
+        d = stage_data[i]
+        series = sorted(d[o["key"]], key=lambda p: p[0])
+        if not series:
+            continue
+        xs = [step + offsets[i] for step, _ in series]
+        ys = [val for _, val in series]
+        line, = ax.plot(xs, ys, color=o["color"], label=o["label"],
+                        linewidth=1.6, linestyle=o.get("linestyle", "--"))
+        stage_handles[i].append(line)
 
     for b in boundaries[:-1]:
         ax.axvline(b, color="gray", linestyle="--", linewidth=1, alpha=0.7)
@@ -116,15 +155,39 @@ def main() -> None:
                 ha="center", va="bottom", fontsize=9, color="dimgray")
 
     ax.set_xlabel("cumulative training step")
-    ax.set_ylabel("val private loss (own tier, matching config)")
-    ax.set_title("Multi-stage cumulative finetune — per-tier val loss")
+    ax.set_ylabel("val private loss")
     ax.grid(True, alpha=0.3)
-    ax.legend(loc="best")
-    fig.tight_layout()
+
+    # Global legend: matched per-tier curves, placed above the axes.
+    global_legend = ax.legend(handles=matched_handles,
+                              bbox_to_anchor=(0.5, 1.12),
+                              bbox_transform=ax.transAxes,
+                              loc="lower center",
+                              ncol=len(matched_handles),
+                              fontsize=8)
+    ax.add_artist(global_legend)
+
+    # One legend per stage, anchored inside the plot at the top of that
+    # stage's segment. Stage 2 has many overlays — render two-column.
+    xmin, xmax = ax.get_xlim()
+    for i, handles in stage_handles.items():
+        if not handles:
+            continue
+        center = offsets[i] + stage_lengths[i] / 2
+        x_frac = (center - xmin) / (xmax - xmin)
+        ncols = 2 if len(handles) >= 6 else 1
+        leg = ax.legend(handles=handles,
+                        bbox_to_anchor=(x_frac, 0.97),
+                        bbox_transform=ax.transAxes,
+                        loc="upper center",
+                        ncol=ncols,
+                        fontsize=7, framealpha=0.9)
+        ax.add_artist(leg)
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=150)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight",
+                bbox_extra_artists=[global_legend])
     print(f"Saved {out_path}")
 
 
