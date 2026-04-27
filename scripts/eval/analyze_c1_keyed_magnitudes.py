@@ -31,8 +31,8 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.patheffects as path_effects
 from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
+from matplotlib.patches import Rectangle
 
 _HEATMAP_CMAP = LinearSegmentedColormap.from_list(
     "teal_white_purple", ["#008080", "#ffffff", "#662E7D"]
@@ -367,6 +367,76 @@ def compute_weight_stats_per_layer(model: GPTNeoForCausalLMTiered, mask_plan) ->
     return {name: acc.to_dict() for name, acc in stats.items()}
 
 
+def _per_channel_l2_stats(channel_norms: torch.Tensor, keyed_idx: torch.Tensor) -> dict:
+    """Aggregate per-channel L2 norms into keyed/non-keyed means and ratio."""
+    n = int(channel_norms.numel())
+    keyed_idx = keyed_idx.to(channel_norms.device).long()
+    n_keyed = int(keyed_idx.numel())
+    n_non = n - n_keyed
+
+    keyed_norms = channel_norms.index_select(0, keyed_idx)
+    mask = torch.zeros(n, dtype=torch.bool, device=channel_norms.device)
+    mask[keyed_idx] = True
+    non_keyed_norms = channel_norms[~mask]
+
+    keyed_mean = float(keyed_norms.mean().item()) if n_keyed > 0 else float("nan")
+    non_keyed_mean = float(non_keyed_norms.mean().item()) if n_non > 0 else float("nan")
+    ratio = (keyed_mean / non_keyed_mean) if (n_non > 0 and non_keyed_mean > 0) else float("nan")
+    return {
+        "keyed_count": n_keyed,
+        "non_keyed_count": n_non,
+        "keyed_mean_l2": keyed_mean,
+        "non_keyed_mean_l2": non_keyed_mean,
+        "l2_ratio_key_over_non": ratio,
+    }
+
+
+@torch.no_grad()
+def compute_weight_per_channel_l2_per_layer(model: GPTNeoForCausalLMTiered, mask_plan) -> Dict[str, dict]:
+    """Per-channel L2 norms aggregated by family and layer (matches the attack's metric)."""
+    out: Dict[str, dict] = {}
+
+    all_attn_layers = set(mask_plan.keyed_attn_indices.keys()) | set(mask_plan.keyed_attn_out_indices.keys())
+    for layer_idx in sorted(all_attn_layers):
+        attn = _get_attention_module(model, layer_idx)
+        idx_rows = mask_plan.keyed_attn_indices.get(layer_idx)
+        idx_cols = _merge_idx(idx_rows, mask_plan.keyed_attn_out_indices.get(layer_idx))
+        tag = f"L{layer_idx:02d}"
+
+        if idx_rows is not None and idx_rows.numel() > 0:
+            for short, proj in (("q", attn.q_proj), ("k", attn.k_proj), ("v", attn.v_proj)):
+                norms = proj.weight.detach().float().norm(dim=1)
+                out[f"{tag}_attn_{short}_weight_rows"] = _per_channel_l2_stats(norms, idx_rows)
+
+        if idx_cols is not None and idx_cols.numel() > 0:
+            norms = attn.out_proj.weight.detach().float().norm(dim=0)
+            out[f"{tag}_attn_out_weight_cols"] = _per_channel_l2_stats(norms, idx_cols)
+
+    all_mlp_layers = (
+        set(mask_plan.keyed_mlp_indices.keys())
+        | set(mask_plan.keyed_mlp_up_indices.keys())
+        | set(mask_plan.keyed_mlp_down_indices.keys())
+    )
+    for layer_idx in sorted(all_mlp_layers):
+        mlp = _get_mlp_module(model, layer_idx)
+        idx_rows = _merge_idx(mask_plan.keyed_mlp_indices.get(layer_idx), mask_plan.keyed_mlp_up_indices.get(layer_idx))
+        idx_cols = _merge_idx(mask_plan.keyed_mlp_indices.get(layer_idx), mask_plan.keyed_mlp_down_indices.get(layer_idx))
+        tag = f"L{layer_idx:02d}"
+
+        if idx_rows is not None and idx_rows.numel() > 0:
+            norms = mlp.c_fc.weight.detach().float().norm(dim=1)
+            out[f"{tag}_mlp_fc_weight_rows"] = _per_channel_l2_stats(norms, idx_rows)
+            if mlp.c_fc.bias is not None:
+                norms = mlp.c_fc.bias.detach().float().abs()
+                out[f"{tag}_mlp_fc_bias"] = _per_channel_l2_stats(norms, idx_rows)
+
+        if idx_cols is not None and idx_cols.numel() > 0:
+            norms = mlp.c_proj.weight.detach().float().norm(dim=0)
+            out[f"{tag}_mlp_proj_weight_cols"] = _per_channel_l2_stats(norms, idx_cols)
+
+    return out
+
+
 @torch.no_grad()
 def compute_activation_stats(
     model: GPTNeoForCausalLMTiered,
@@ -588,6 +658,8 @@ def _plot_per_layer_ratio_heatmap(
     title: str,
     component_order: list[str],
     out_path: str,
+    ratio_key: str = "rms_ratio_key_over_non",
+    cbar_label: str = "Keyed / Non-keyed RMS",
 ) -> None:
     layer_tags, ordered_components = _ordered_layered_components(stats, component_order)
     if not layer_tags or not ordered_components:
@@ -600,7 +672,7 @@ def _plot_per_layer_ratio_heatmap(
             key = f"{layer_tag}_{component}"
             if key not in stats:
                 continue
-            ratio = float(stats[key]["mean_abs_ratio_key_over_non"])
+            ratio = float(stats[key][ratio_key])
             matrix[row_idx, col_idx] = ratio
             if math.isfinite(ratio):
                 all_vals.append(ratio)
@@ -625,7 +697,9 @@ def _plot_per_layer_ratio_heatmap(
         facecolor="#f6f2e8",
     )
     norm = TwoSlopeNorm(vmin=min_ratio, vcenter=1.0, vmax=max_ratio)
-    im = ax.imshow(matrix, aspect="auto", cmap=_HEATMAP_CMAP, norm=norm)
+    cmap = _HEATMAP_CMAP.copy()
+    cmap.set_bad("#f6f2e8")
+    im = ax.imshow(matrix, aspect="auto", cmap=cmap, norm=norm)
 
     ax.set_xticks(range(len(layer_tags)))
     ax.set_xticklabels(layer_tags, rotation=0)
@@ -639,12 +713,18 @@ def _plot_per_layer_ratio_heatmap(
         for col_idx in range(len(layer_tags)):
             value = matrix[row_idx, col_idx]
             if not np.isfinite(value):
+                ax.add_patch(Rectangle(
+                    (col_idx - 0.5, row_idx - 0.5), 1, 1,
+                    facecolor="none", edgecolor="#999999", hatch="///", linewidth=0.0,
+                ))
                 continue
-            txt = ax.text(col_idx, row_idx, f"{value:.2f}", ha="center", va="center", fontsize=8, color="#111111")
-            txt.set_path_effects([path_effects.Stroke(linewidth=1.6, foreground="white"), path_effects.Normal()])
+            r, g, b, _ = cmap(norm(value))
+            luminance = 0.299 * r + 0.587 * g + 0.114 * b
+            text_color = "white" if luminance < 0.5 else "#111111"
+            ax.text(col_idx, row_idx, f"{value:.2f}", ha="center", va="center", fontsize=8, color=text_color)
 
     cbar = fig.colorbar(im, ax=ax, fraction=0.035, pad=0.02)
-    cbar.set_label("Keyed / Non-keyed mean |x|")
+    cbar.set_label(cbar_label)
     plt.tight_layout()
     plt.savefig(out_path, dpi=170)
     plt.close()
@@ -803,6 +883,7 @@ def save_plots(
     private_activation_stats: dict,
     public_activation_stats: dict,
     per_layer_weight_stats: dict,
+    per_layer_weight_l2_stats: dict,
     private_per_layer_activation_stats: dict,
     public_per_layer_activation_stats: dict,
     plot_dir: str,
@@ -836,10 +917,12 @@ def save_plots(
 
     p = os.path.join(plot_dir, "weights_per_layer_ratio_heatmap.png")
     _plot_per_layer_ratio_heatmap(
-        per_layer_weight_stats,
-        "Per-Layer Weight Ratio Heatmap",
+        per_layer_weight_l2_stats,
+        "Per-Layer Weight L2 Ratio Heatmap",
         weight_component_order,
         p,
+        ratio_key="l2_ratio_key_over_non",
+        cbar_label="Keyed / Non-keyed mean per-channel L2",
     )
     paths.append(p)
 
@@ -931,6 +1014,7 @@ def main() -> None:
 
     weight_stats = compute_weight_stats(model, mask_plan)
     per_layer_weight_stats = compute_weight_stats_per_layer(model, mask_plan)
+    per_layer_weight_l2_stats = compute_weight_per_channel_l2_per_layer(model, mask_plan)
 
     private_activation_stats: dict = {}
     public_activation_stats: dict = {}
@@ -996,6 +1080,7 @@ def main() -> None:
         "config": config,
         "weight_stats": weight_stats,
         "per_layer_weight_stats": per_layer_weight_stats,
+        "per_layer_weight_l2_stats": per_layer_weight_l2_stats,
     }
     if not args.weights_only:
         summary["activation_stats"] = {
@@ -1025,6 +1110,7 @@ def main() -> None:
         private_activation_stats,
         public_activation_stats,
         per_layer_weight_stats,
+        per_layer_weight_l2_stats,
         private_per_layer_activation_stats,
         public_per_layer_activation_stats,
         plot_dir,
