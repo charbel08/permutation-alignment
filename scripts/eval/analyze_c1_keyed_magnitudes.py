@@ -31,7 +31,12 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.colors import TwoSlopeNorm
+import matplotlib.patheffects as path_effects
+from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
+
+_HEATMAP_CMAP = LinearSegmentedColormap.from_list(
+    "teal_white_purple", ["#008080", "#ffffff", "#662E7D"]
+)
 
 from tiered.model import GPTNeoForCausalLMTiered
 from tiered.permutation import load_key, build_mask_plan
@@ -620,7 +625,7 @@ def _plot_per_layer_ratio_heatmap(
         facecolor="#f6f2e8",
     )
     norm = TwoSlopeNorm(vmin=min_ratio, vcenter=1.0, vmax=max_ratio)
-    im = ax.imshow(matrix, aspect="auto", cmap="PuOr_r", norm=norm)
+    im = ax.imshow(matrix, aspect="auto", cmap=_HEATMAP_CMAP, norm=norm)
 
     ax.set_xticks(range(len(layer_tags)))
     ax.set_xticklabels(layer_tags, rotation=0)
@@ -635,8 +640,8 @@ def _plot_per_layer_ratio_heatmap(
             value = matrix[row_idx, col_idx]
             if not np.isfinite(value):
                 continue
-            text_color = "white" if abs(value - 1.0) > 0.18 else "#111111"
-            ax.text(col_idx, row_idx, f"{value:.2f}", ha="center", va="center", fontsize=8, color=text_color)
+            txt = ax.text(col_idx, row_idx, f"{value:.2f}", ha="center", va="center", fontsize=8, color="#111111")
+            txt.set_path_effects([path_effects.Stroke(linewidth=1.6, foreground="white"), path_effects.Normal()])
 
     cbar = fig.colorbar(im, ax=ax, fraction=0.035, pad=0.02)
     cbar.set_label("Keyed / Non-keyed mean |x|")
