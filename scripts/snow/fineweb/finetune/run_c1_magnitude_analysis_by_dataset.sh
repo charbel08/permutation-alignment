@@ -10,8 +10,16 @@ export TOKENIZERS_PARALLELISM=false
 cd /work/permutation-alignment
 mkdir -p logs
 
-# Run the per-model C1 magnitude analysis separately for each dataset/model pair
-# so the per-layer weight and activation heatmaps land in distinct directories.
+# Run C1 weight + activation magnitude analysis across all
+# (model, dataset) combinations into a single tidy output tree.
+#
+# Outputs land under:
+#   ${OUTPUT_ROOT}/150m_synthetic_bios/
+#   ${OUTPUT_ROOT}/150m_fineweb2_spa/
+#   ${OUTPUT_ROOT}/530m_alpaca/
+#
+# Each subdir contains the JSON summary and all plots from
+# analyze_c1_keyed_magnitudes.py.
 
 KEY_SIZE=${KEY_SIZE:-5}
 KL_TAG=${KL_TAG:-0p1}
@@ -26,12 +34,12 @@ OUTPUT_ROOT=${OUTPUT_ROOT:-/work/permutation-alignment/outputs/c1_magnitude_by_d
 
 mkdir -p "$OUTPUT_ROOT"
 
-run_synbios() {
-    local out_dir="${OUTPUT_ROOT}/synthetic_bios"
+run_synbios_150m() {
+    local out_dir="${OUTPUT_ROOT}/150m_synthetic_bios"
     mkdir -p "$out_dir"
 
     echo "=========================================================="
-    echo "Running synthetic_bios C1 magnitude analysis"
+    echo "Running 150M synthetic_bios C1 magnitude analysis"
     echo "  Output dir: ${out_dir}"
     echo "=========================================================="
 
@@ -47,12 +55,12 @@ run_synbios() {
     bash scripts/snow/fineweb/finetune/150m/synthetic_bios/run_c1_magnitude_analysis.sh
 }
 
-run_fineweb2_spa() {
-    local out_dir="${OUTPUT_ROOT}/fineweb2_spa"
+run_fineweb2_spa_150m() {
+    local out_dir="${OUTPUT_ROOT}/150m_fineweb2_spa"
     mkdir -p "$out_dir"
 
     echo "=========================================================="
-    echo "Running fineweb2_spa C1 magnitude analysis"
+    echo "Running 150M fineweb2_spa C1 magnitude analysis"
     echo "  Output dir: ${out_dir}"
     echo "=========================================================="
 
@@ -69,20 +77,45 @@ run_fineweb2_spa() {
     bash scripts/snow/fineweb/finetune/150m/fineweb2/run_c1_magnitude_analysis.sh
 }
 
+run_alpaca_530m() {
+    local out_dir="${OUTPUT_ROOT}/530m_alpaca"
+    mkdir -p "$out_dir"
+
+    echo "=========================================================="
+    echo "Running 530M alpaca C1 magnitude analysis"
+    echo "  Output dir: ${out_dir}"
+    echo "=========================================================="
+
+    KEY_SIZE="$KEY_SIZE" \
+    KL_TAG="$KL_TAG" \
+    NUM_BATCHES="$NUM_BATCHES" \
+    BATCH_SIZE="$BATCH_SIZE" \
+    MAX_LENGTH="$MAX_LENGTH" \
+    NUM_WORKERS="$NUM_WORKERS" \
+    SEED="$SEED" \
+    OUTPUT_PATH="${out_dir}/analysis_530m_alpaca_key${KEY_SIZE}pct_kl${KL_TAG}_c1_magnitudes.json" \
+    PLOT_DIR="$out_dir" \
+    bash scripts/snow/fineweb/finetune/530m/alpaca/run_c1_magnitude_analysis.sh
+}
+
 case "$DATASET_TARGET" in
     all)
-        run_synbios
-        run_fineweb2_spa
+        run_synbios_150m
+        run_fineweb2_spa_150m
+        run_alpaca_530m
         ;;
-    synbios|synthetic_bios)
-        run_synbios
+    synbios|synthetic_bios|150m_synthetic_bios)
+        run_synbios_150m
         ;;
-    fineweb2|fineweb2_spa|spa)
-        run_fineweb2_spa
+    fineweb2|fineweb2_spa|spa|150m_fineweb2_spa)
+        run_fineweb2_spa_150m
+        ;;
+    alpaca|alpaca_530m|530m_alpaca)
+        run_alpaca_530m
         ;;
     *)
         echo "Unsupported DATASET_TARGET: ${DATASET_TARGET}"
-        echo "Expected one of: all, synbios, fineweb2_spa"
+        echo "Expected one of: all, synbios, fineweb2_spa, alpaca"
         exit 1
         ;;
 esac
