@@ -1,0 +1,75 @@
+{
+  "checkpoint": "/work/scratch/checkpoints/fineweb/tiered_pretrain_150m_5pct_multi_cumulative_random/final-checkpoint",
+  "key_path": [
+    "/work/permutation-alignment/configs/keys/150m/both/key_5pct_random_1.json",
+    "/work/permutation-alignment/configs/keys/150m/both/key_5pct_random_2.json",
+    "/work/permutation-alignment/configs/keys/150m/both/key_5pct_random_3.json"
+  ],
+  "methods": {
+    "mlp_smallest": {
+      "n": 73728,
+      "k_true": 10362,
+      "accuracy": 0.8155653211805556,
+      "precision": 0.34385253812005406,
+      "recall": 0.34385253812005406,
+      "f1": 0.34385253812005406,
+      "auc": 0.5555607741176475,
+      "tp": 3563,
+      "fp": 6799,
+      "fn": 6799,
+      "tn": 56567
+    },
+    "attn_smallest": {
+      "n": 144,
+      "k_true": 24,
+      "accuracy": 0.8333333333333334,
+      "precision": 0.5,
+      "recall": 0.5,
+      "f1": 0.5,
+      "auc": 0.7753472222222222,
+      "tp": 12,
+      "fp": 12,
+      "fn": 12,
+      "tn": 108
+    },
+    "mlp_largest": {
+      "n": 73728,
+      "k_true": 10362,
+      "accuracy": 0.7842339409722222,
+      "precision": 0.2323875699671878,
+      "recall": 0.2323875699671878,
+      "f1": 0.2323875699671878,
+      "auc": 0.44443922588235246,
+      "tp": 2408,
+      "fp": 7954,
+      "fn": 7954,
+      "tn": 55412
+    },
+    "attn_largest": {
+      "n": 144,
+      "k_true": 24,
+      "accuracy": 0.6666666666666666,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "auc": 0.22465277777777778,
+      "tp": 0,
+      "fp": 24,
+      "fn": 24,
+      "tn": 96
+    },
+    "combined_small_mlp_large_attn": {
+      "n": 73872,
+      "k_true": 10386,
+      "accuracy": 0.8152750703920295,
+      "precision": 0.3430579626420181,
+      "recall": 0.3430579626420181,
+      "f1": 0.3430579626420181,
+      "auc": 0.5547786337642039,
+      "tp": 3563,
+      "fp": 6823,
+      "fn": 6823,
+      "tn": 56663
+    }
+  }
+}
