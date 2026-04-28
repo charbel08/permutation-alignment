@@ -66,19 +66,19 @@ run_pretrain_150m() {
 }
 
 run_pretrain_150m_cumulative_15pct() {
-    # Cumulative 150M pretrain trained with three disjoint 5%-keys.
-    # Largest tier (C4) corresponds to the union: 15% of weights.
-    local out_dir="${OUTPUT_ROOT}/150m_pretrain_cumulative_15pct"
+    # Cumulative 150M pretrain (random-key variant, _r) trained with three
+    # disjoint random 5%-keys. Largest tier (C4) is their union: 15% of weights.
+    local out_dir="${OUTPUT_ROOT}/150m_pretrain_cumulative_15pct_r"
     mkdir -p "$out_dir"
-    local ckpt="/work/scratch/checkpoints/fineweb/tiered_pretrain_150m_5pct_multi_cumulative/final-checkpoint"
-    local key1="/work/permutation-alignment/configs/keys/150m/both/key_5pct_1.json"
-    local key2="/work/permutation-alignment/configs/keys/150m/both/key_5pct_2.json"
-    local key3="/work/permutation-alignment/configs/keys/150m/both/key_5pct_3.json"
-    local out_json="${out_dir}/analysis_150m_pretrain_cumulative_15pct_c1_magnitudes.json"
-    local log_file="logs/c1_magnitude_analysis_pretrain_150m_cumulative_15pct_$(date +%Y%m%d_%H%M%S).log"
+    local ckpt="/work/scratch/checkpoints/fineweb/tiered_pretrain_150m_5pct_multi_cumulative_random/final-checkpoint"
+    local key1="/work/permutation-alignment/configs/keys/150m/both/key_5pct_random_1.json"
+    local key2="/work/permutation-alignment/configs/keys/150m/both/key_5pct_random_2.json"
+    local key3="/work/permutation-alignment/configs/keys/150m/both/key_5pct_random_3.json"
+    local out_json="${out_dir}/analysis_150m_pretrain_cumulative_15pct_r_c1_magnitudes.json"
+    local log_file="logs/c1_magnitude_analysis_pretrain_150m_cumulative_15pct_r_$(date +%Y%m%d_%H%M%S).log"
 
     echo "=========================================================="
-    echo "Running 150M pretrain (cumulative, largest tier = 15%) C1 magnitude analysis"
+    echo "Running 150M pretrain _r (cumulative random, largest tier = 15%) C1 magnitude analysis"
     echo "  Checkpoint: ${ckpt}"
     echo "  Keys (union): ${key1} ${key2} ${key3}"
     echo "  Output dir: ${out_dir}"
