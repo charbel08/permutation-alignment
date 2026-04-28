@@ -22,14 +22,14 @@ import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 
 from tiered.model import GPTNeoForCausalLMTiered
-from tiered.permutation import build_mask_plan, load_key
+from tiered.permutation import PermutationKey, build_mask_plan, load_key
 from tiered.permutation.utils import _get_mlp_module
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Per-layer t-SNE of MLP column weights.")
     p.add_argument("--checkpoint", type=str, required=True)
-    p.add_argument("--key_path", type=str, required=True)
+    p.add_argument("--key_path", type=str, nargs="+", required=True, help="Path(s) to key JSON. Multiple paths are merged (union).")
     p.add_argument("--plot_dir", type=str, required=True)
     p.add_argument("--perplexity", type=float, default=30.0)
     p.add_argument("--seed", type=int, default=0)
@@ -75,8 +75,9 @@ def main() -> None:
 
     if not os.path.isdir(args.checkpoint):
         raise FileNotFoundError(f"Checkpoint dir not found: {args.checkpoint}")
-    if not os.path.isfile(args.key_path):
-        raise FileNotFoundError(f"Key file not found: {args.key_path}")
+    for kp in args.key_path:
+        if not os.path.isfile(kp):
+            raise FileNotFoundError(f"Key file not found: {kp}")
 
     os.makedirs(args.plot_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -86,8 +87,18 @@ def main() -> None:
     model = GPTNeoForCausalLMTiered.from_pretrained(args.checkpoint).to(device)
     model.eval()
 
-    print(f"Loading key:   {args.key_path}")
-    key = load_key(args.key_path)
+    print(f"Loading key(s): {args.key_path}")
+    loaded = [load_key(kp) for kp in args.key_path]
+    if len(loaded) == 1:
+        key = loaded[0]
+    else:
+        key = PermutationKey(
+            attn_heads=[s for k in loaded for s in k.attn_heads],
+            attn_out_heads=[s for k in loaded for s in k.attn_out_heads],
+            mlp_cols=[s for k in loaded for s in k.mlp_cols],
+            mlp_up_cols=[s for k in loaded for s in k.mlp_up_cols],
+            mlp_down_cols=[s for k in loaded for s in k.mlp_down_cols],
+        )
     mask_plan = build_mask_plan(model, key, device)
 
     n_layers = len(model.transformer.h)
