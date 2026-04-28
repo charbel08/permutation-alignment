@@ -114,9 +114,9 @@ def _scatter_axis(ax, xy: np.ndarray, y: np.ndarray, title: str,
     non = y == 0
     key = y == 1
     ax.scatter(xy[non, 0], xy[non, 1], s=non_size, c="#bbbbbb", alpha=0.5,
-               label=f"non-keyed (n={int(non.sum())})", linewidths=0, rasterized=True)
-    ax.scatter(xy[key, 0], xy[key, 1], s=keyed_size, c="#d62728", alpha=0.9,
-               label=f"keyed (n={int(key.sum())})", linewidths=0, rasterized=True)
+               label="Non-Keyed", linewidths=0, rasterized=True)
+    ax.scatter(xy[key, 0], xy[key, 1], s=keyed_size, c="#662E7D", alpha=0.9,
+               label="Keyed", linewidths=0, rasterized=True)
     ax.set_title(title, fontsize=fontsize)
     ax.set_xticks([])
     ax.set_yticks([])
@@ -152,10 +152,10 @@ def _save_grid(embeddings: dict[int, tuple[np.ndarray, np.ndarray]],
         if h:
             handles, labels = h, l
             break
+    fig.tight_layout(rect=(0, 0.06, 1, 1))
     if handles:
-        fig.legend(handles, labels, loc="upper center", ncol=2, fontsize=10)
-    fig.suptitle(family_name, fontsize=14, y=0.995)
-    fig.tight_layout(rect=(0, 0, 1, 0.94))
+        fig.legend(handles, labels, loc="lower center", ncol=2, fontsize=10,
+                   bbox_to_anchor=(0.5, 0.0))
     _save_fig(fig, out_path)
 
 
