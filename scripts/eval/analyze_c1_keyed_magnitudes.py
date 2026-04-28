@@ -39,7 +39,7 @@ _HEATMAP_CMAP = LinearSegmentedColormap.from_list(
 )
 
 from tiered.model import GPTNeoForCausalLMTiered
-from tiered.permutation import load_key, build_mask_plan
+from tiered.permutation import PermutationKey, load_key, build_mask_plan
 from tiered.permutation.utils import _get_attention_module, _get_mlp_module
 
 
@@ -97,7 +97,7 @@ class PartitionStats:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Analyze C1 keyed vs non-key magnitudes.")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to finetuned checkpoint (e.g. .../final)")
-    parser.add_argument("--key_path", type=str, required=True, help="Path to key JSON used to define keyed channels")
+    parser.add_argument("--key_path", type=str, nargs="+", required=True, help="Path(s) to key JSON. Multiple paths are merged (union of swaps) — useful for the largest tier of a cumulative model.")
     parser.add_argument("--private_data", type=str, default=None, help="Path to private dataset (HF load_from_disk). Required unless --weights_only.")
     parser.add_argument("--public_data", type=str, default=None, help="Path to public dataset (HF load_from_disk). Required unless --weights_only.")
     parser.add_argument("--private_split", type=str, default="train", help="Private split to use if dataset has splits")
@@ -365,6 +365,19 @@ def compute_weight_stats_per_layer(model: GPTNeoForCausalLMTiered, mask_plan) ->
             _accumulate_partition_cols(mlp.c_proj.weight, idx_cols, stats[f"{tag}_mlp_proj_weight_cols"])
 
     return {name: acc.to_dict() for name, acc in stats.items()}
+
+
+def _merge_keys(keys: list) -> PermutationKey:
+    """Concatenate swap lists across keys; for disjoint keys this is the union."""
+    if len(keys) == 1:
+        return keys[0]
+    return PermutationKey(
+        attn_heads=[s for k in keys for s in k.attn_heads],
+        attn_out_heads=[s for k in keys for s in k.attn_out_heads],
+        mlp_cols=[s for k in keys for s in k.mlp_cols],
+        mlp_up_cols=[s for k in keys for s in k.mlp_up_cols],
+        mlp_down_cols=[s for k in keys for s in k.mlp_down_cols],
+    )
 
 
 def _per_channel_l2_stats(channel_norms: torch.Tensor, keyed_idx: torch.Tensor) -> dict:
@@ -927,23 +940,25 @@ def save_plots(
     paths.append(p)
 
     if not weights_only:
-        p = os.path.join(plot_dir, "private_activations_per_layer_ratio_heatmap.png")
-        _plot_per_layer_ratio_heatmap(
-            private_per_layer_activation_stats,
-            "Per-Layer Private Activation Ratio Heatmap",
-            activation_component_order,
-            p,
-        )
-        paths.append(p)
+        if private_per_layer_activation_stats:
+            p = os.path.join(plot_dir, "private_activations_per_layer_ratio_heatmap.png")
+            _plot_per_layer_ratio_heatmap(
+                private_per_layer_activation_stats,
+                "Per-Layer Private Activation Ratio Heatmap",
+                activation_component_order,
+                p,
+            )
+            paths.append(p)
 
-        p = os.path.join(plot_dir, "public_activations_per_layer_ratio_heatmap.png")
-        _plot_per_layer_ratio_heatmap(
-            public_per_layer_activation_stats,
-            "Per-Layer Public Activation Ratio Heatmap",
-            activation_component_order,
-            p,
-        )
-        paths.append(p)
+        if public_per_layer_activation_stats:
+            p = os.path.join(plot_dir, "public_activations_per_layer_ratio_heatmap.png")
+            _plot_per_layer_ratio_heatmap(
+                public_per_layer_activation_stats,
+                "Per-Layer Public Activation Ratio Heatmap",
+                activation_component_order,
+                p,
+            )
+            paths.append(p)
 
     p = os.path.join(plot_dir, "weights_mean_abs_key_vs_non.png")
     _plot_key_vs_non_abs(weight_stats, "Weights: keyed vs non-keyed mean |w|", p)
@@ -960,33 +975,36 @@ def save_plots(
     paths.append(p)
 
     if not weights_only:
-        p = os.path.join(plot_dir, "private_activations_mean_abs_key_vs_non.png")
-        _plot_key_vs_non_abs(private_activation_stats, "Private activations: keyed vs non-keyed mean |a|", p)
-        paths.append(p)
+        if private_activation_stats:
+            p = os.path.join(plot_dir, "private_activations_mean_abs_key_vs_non.png")
+            _plot_key_vs_non_abs(private_activation_stats, "Private activations: keyed vs non-keyed mean |a|", p)
+            paths.append(p)
 
-        p = os.path.join(plot_dir, "public_activations_mean_abs_key_vs_non.png")
-        _plot_key_vs_non_abs(public_activation_stats, "Public activations: keyed vs non-keyed mean |a|", p)
-        paths.append(p)
+        if public_activation_stats:
+            p = os.path.join(plot_dir, "public_activations_mean_abs_key_vs_non.png")
+            _plot_key_vs_non_abs(public_activation_stats, "Public activations: keyed vs non-keyed mean |a|", p)
+            paths.append(p)
 
-        p = os.path.join(plot_dir, "activations_mean_abs_ratio_private_vs_public.png")
-        _plot_private_vs_public_ratios(
-            private_activation_stats,
-            public_activation_stats,
-            "mean_abs_ratio_key_over_non",
-            "Activation keyed/non-keyed mean |a| ratio: private vs public",
-            p,
-        )
-        paths.append(p)
+        if private_activation_stats and public_activation_stats:
+            p = os.path.join(plot_dir, "activations_mean_abs_ratio_private_vs_public.png")
+            _plot_private_vs_public_ratios(
+                private_activation_stats,
+                public_activation_stats,
+                "mean_abs_ratio_key_over_non",
+                "Activation keyed/non-keyed mean |a| ratio: private vs public",
+                p,
+            )
+            paths.append(p)
 
-        p = os.path.join(plot_dir, "activations_rms_ratio_private_vs_public.png")
-        _plot_private_vs_public_ratios(
-            private_activation_stats,
-            public_activation_stats,
-            "rms_ratio_key_over_non",
-            "Activation keyed/non-keyed RMS ratio: private vs public",
-            p,
-        )
-        paths.append(p)
+            p = os.path.join(plot_dir, "activations_rms_ratio_private_vs_public.png")
+            _plot_private_vs_public_ratios(
+                private_activation_stats,
+                public_activation_stats,
+                "rms_ratio_key_over_non",
+                "Activation keyed/non-keyed RMS ratio: private vs public",
+                p,
+            )
+            paths.append(p)
 
     return paths
 
@@ -997,10 +1015,11 @@ def main() -> None:
 
     if not os.path.isdir(args.checkpoint):
         raise FileNotFoundError(f"Checkpoint dir not found: {args.checkpoint}")
-    if not os.path.isfile(args.key_path):
-        raise FileNotFoundError(f"Key file not found: {args.key_path}")
-    if not args.weights_only and (args.private_data is None or args.public_data is None):
-        raise ValueError("--private_data and --public_data are required unless --weights_only is set")
+    for kp in args.key_path:
+        if not os.path.isfile(kp):
+            raise FileNotFoundError(f"Key file not found: {kp}")
+    if not args.weights_only and args.private_data is None and args.public_data is None:
+        raise ValueError("At least one of --private_data / --public_data is required unless --weights_only is set")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -1008,8 +1027,8 @@ def main() -> None:
     model = GPTNeoForCausalLMTiered.from_pretrained(args.checkpoint).to(device)
     model.eval()
 
-    print(f"Loading key: {args.key_path}")
-    key = load_key(args.key_path)
+    print(f"Loading key(s): {args.key_path}")
+    key = _merge_keys([load_key(kp) for kp in args.key_path])
     mask_plan = build_mask_plan(model, key, device)
 
     weight_stats = compute_weight_stats(model, mask_plan)
@@ -1027,35 +1046,37 @@ def main() -> None:
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
         tokenizer.pad_token = tokenizer.eos_token
 
-        private_loader, private_split_used, private_n = _build_loader(
-            args.private_data,
-            args.private_split,
-            args.batch_size,
-            tokenizer.pad_token_id,
-            args.max_length,
-            args.num_workers,
-        )
-        public_loader, public_split_used, public_n = _build_loader(
-            args.public_data,
-            args.public_split,
-            args.batch_size,
-            tokenizer.pad_token_id,
-            args.max_length,
-            args.num_workers,
-        )
+        if args.private_data is not None:
+            private_loader, private_split_used, private_n = _build_loader(
+                args.private_data,
+                args.private_split,
+                args.batch_size,
+                tokenizer.pad_token_id,
+                args.max_length,
+                args.num_workers,
+            )
+            print(f"Private dataset: {args.private_data} [{private_split_used}]  n={private_n}")
+            private_activation_stats = compute_activation_stats(model, mask_plan, private_loader, device, args.num_batches)
+            private_per_layer_activation_stats = compute_activation_stats_per_layer(
+                model, mask_plan, private_loader, device, args.num_batches
+            )
 
-        print(f"Private dataset: {args.private_data} [{private_split_used}]  n={private_n}")
-        print(f"Public dataset:  {args.public_data} [{public_split_used}]  n={public_n}")
+        if args.public_data is not None:
+            public_loader, public_split_used, public_n = _build_loader(
+                args.public_data,
+                args.public_split,
+                args.batch_size,
+                tokenizer.pad_token_id,
+                args.max_length,
+                args.num_workers,
+            )
+            print(f"Public dataset:  {args.public_data} [{public_split_used}]  n={public_n}")
+            public_activation_stats = compute_activation_stats(model, mask_plan, public_loader, device, args.num_batches)
+            public_per_layer_activation_stats = compute_activation_stats_per_layer(
+                model, mask_plan, public_loader, device, args.num_batches
+            )
+
         print(f"Activation analysis: num_batches={args.num_batches}, batch_size={args.batch_size}, max_length={args.max_length}")
-
-        private_activation_stats = compute_activation_stats(model, mask_plan, private_loader, device, args.num_batches)
-        private_per_layer_activation_stats = compute_activation_stats_per_layer(
-            model, mask_plan, private_loader, device, args.num_batches
-        )
-        public_activation_stats = compute_activation_stats(model, mask_plan, public_loader, device, args.num_batches)
-        public_per_layer_activation_stats = compute_activation_stats_per_layer(
-            model, mask_plan, public_loader, device, args.num_batches
-        )
 
     config = {
         "c_config": "C1 (public, no key applied)",
