@@ -130,14 +130,6 @@ def _save_fig(fig, out_path: str) -> None:
     plt.close(fig)
 
 
-def _save_single(xy: np.ndarray, y: np.ndarray, title: str, out_path: str,
-                 keyed_size: float, non_size: float) -> None:
-    fig, ax = plt.subplots(figsize=(7, 7))
-    _scatter_axis(ax, xy, y, title, keyed_size=keyed_size, non_size=non_size)
-    fig.tight_layout()
-    _save_fig(fig, out_path)
-
-
 def _save_grid(embeddings: dict[int, tuple[np.ndarray, np.ndarray]],
                family_name: str, out_path: str,
                keyed_size: float, non_size: float) -> None:
@@ -208,23 +200,13 @@ def main() -> None:
     ATTN_KEY_SIZE, ATTN_NON_SIZE = 80.0, 40.0
 
     for L in layers:
-        # MLP
         X_mlp, y_mlp = _mlp_for_layer(model, mask_plan, L)
         print(f"Layer {L} MLP:  X={X_mlp.shape}, keyed={int(y_mlp.sum())}/{len(y_mlp)}")
-        xy_mlp = _run_tsne(X_mlp, args.perplexity, args.seed)
-        mlp_emb[L] = (xy_mlp, y_mlp)
-        _save_single(xy_mlp, y_mlp, f"Layer {L} — MLP columns (t-SNE)",
-                     os.path.join(args.plot_dir, f"tsne_mlp_layer{L:02d}.png"),
-                     keyed_size=MLP_KEY_SIZE, non_size=MLP_NON_SIZE)
+        mlp_emb[L] = (_run_tsne(X_mlp, args.perplexity, args.seed), y_mlp)
 
-        # Attention
         X_attn, y_attn = _attn_for_layer(model, mask_plan, L)
         print(f"Layer {L} attn: X={X_attn.shape}, keyed={int(y_attn.sum())}/{len(y_attn)}")
-        xy_attn = _run_tsne(X_attn, args.perplexity, args.seed)
-        attn_emb[L] = (xy_attn, y_attn)
-        _save_single(xy_attn, y_attn, f"Layer {L} — Attention heads (t-SNE)",
-                     os.path.join(args.plot_dir, f"tsne_attn_layer{L:02d}.png"),
-                     keyed_size=ATTN_KEY_SIZE, non_size=ATTN_NON_SIZE)
+        attn_emb[L] = (_run_tsne(X_attn, args.perplexity, args.seed), y_attn)
 
     _save_grid(mlp_emb, "MLP columns (t-SNE, per layer)",
                os.path.join(args.plot_dir, "tsne_mlp_grid.png"),
@@ -233,7 +215,7 @@ def main() -> None:
                os.path.join(args.plot_dir, "tsne_attn_grid.png"),
                keyed_size=ATTN_KEY_SIZE, non_size=ATTN_NON_SIZE)
 
-    print(f"\nWrote per-layer plots and grids to {args.plot_dir}")
+    print(f"\nWrote {args.plot_dir}/tsne_mlp_grid.{{png,pdf}} and tsne_attn_grid.{{png,pdf}}")
 
 
 if __name__ == "__main__":
