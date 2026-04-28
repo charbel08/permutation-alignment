@@ -739,7 +739,9 @@ def _plot_per_layer_ratio_heatmap(
     cbar = fig.colorbar(im, ax=ax, fraction=0.035, pad=0.02)
     cbar.set_label(cbar_label)
     plt.tight_layout()
-    plt.savefig(out_path, dpi=170)
+    plt.savefig(out_path, dpi=300)
+    pdf_path = os.path.splitext(out_path)[0] + ".pdf"
+    plt.savefig(pdf_path, dpi=300)
     plt.close()
 
 
