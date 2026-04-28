@@ -1,6 +1,8 @@
 {
   "checkpoint": "/work/scratch/checkpoints/fineweb/private_finetune_530m_alpaca_key5pct_kl0p1/final",
-  "key_path": "/work/permutation-alignment/configs/keys/530m/both/key_5pct.json",
+  "key_path": [
+    "/work/permutation-alignment/configs/keys/530m/both/key_5pct.json"
+  ],
   "config": {
     "c_config": "C1 (public, no key applied)",
     "seed": 0,
