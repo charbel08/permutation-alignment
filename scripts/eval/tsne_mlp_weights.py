@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
-"""t-SNE visualization of MLP columns and attention heads in a C1 tiered checkpoint.
+"""Per-layer t-SNE visualization of MLP columns and attention heads in a C1
+tiered checkpoint.
 
-Two plots are produced, each pooling channels across all layers:
-  - tsne_mlp_columns.png: each MLP column c is represented by
-        [c_fc.weight[c, :], c_proj.weight[:, c]]   (length 2*hidden)
-  - tsne_attn_heads.png:  each attention head h is represented by
-        [q[h], k[h], v[h], out[:,h]]               (length 4*head_dim*hidden)
+For each layer, two t-SNE plots are produced, plus two grid overviews:
+  - tsne_mlp_layerNN.{png,pdf}    : MLP columns
+        feature(col c) = [c_fc[c,:], c_proj[:,c]]       (length 2*hidden)
+  - tsne_attn_layerNN.{png,pdf}   : Attention heads
+        feature(head h) = [q[h], k[h], v[h], out[:,h]]  (length 4*head_dim*hidden)
+  - tsne_mlp_grid.{png,pdf}       : all layers' MLP plots in one figure
+  - tsne_attn_grid.{png,pdf}      : all layers' attention plots in one figure
 
 Channels are colored by ground-truth keyed vs non-keyed. The key is used only
-for coloring, not by the projection.
+for coloring, not by the projection. Per-layer attention t-SNE has very few
+points (= num_heads), so its embedding is mostly indicative.
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import os
 
 import matplotlib
@@ -36,73 +41,57 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--plot_dir", type=str, required=True)
     p.add_argument("--perplexity", type=float, default=30.0)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--layers", type=str, default=None,
+                   help="Comma-separated layer indices to run (default: all).")
     return p.parse_args()
 
 
-def _mlp_features_and_labels(model, mask_plan) -> tuple[np.ndarray, np.ndarray]:
-    """Pool every MLP column across all layers into a single feature matrix
-    and a 1-D label vector (1 = keyed, 0 = non-keyed)."""
-    n_layers = len(model.transformer.h)
-    feats: list[np.ndarray] = []
-    labels: list[np.ndarray] = []
-    for L in range(n_layers):
-        mlp = _get_mlp_module(model, L)
-        c_fc_w = mlp.c_fc.weight.detach().float().cpu().numpy()
-        c_proj_w = mlp.c_proj.weight.detach().float().cpu().numpy()
-        feats.append(np.concatenate([c_fc_w, c_proj_w.T], axis=1))  # [mlp_dim, 2*hidden]
+def _mlp_for_layer(model, mask_plan, L: int) -> tuple[np.ndarray, np.ndarray]:
+    mlp = _get_mlp_module(model, L)
+    c_fc_w = mlp.c_fc.weight.detach().float().cpu().numpy()
+    c_proj_w = mlp.c_proj.weight.detach().float().cpu().numpy()
+    X = np.concatenate([c_fc_w, c_proj_w.T], axis=1)  # [mlp_dim, 2*hidden]
 
-        mlp_dim = c_fc_w.shape[0]
-        keyed = set()
-        for idx in (
-            mask_plan.keyed_mlp_indices.get(L),
-            mask_plan.keyed_mlp_up_indices.get(L),
-            mask_plan.keyed_mlp_down_indices.get(L),
-        ):
-            if idx is not None:
-                keyed.update(int(i) for i in idx.cpu().tolist())
-        y = np.zeros(mlp_dim, dtype=np.int64)
-        for i in keyed:
-            y[i] = 1
-        labels.append(y)
-
-    return np.concatenate(feats, axis=0), np.concatenate(labels, axis=0)
+    keyed = set()
+    for idx in (
+        mask_plan.keyed_mlp_indices.get(L),
+        mask_plan.keyed_mlp_up_indices.get(L),
+        mask_plan.keyed_mlp_down_indices.get(L),
+    ):
+        if idx is not None:
+            keyed.update(int(i) for i in idx.cpu().tolist())
+    y = np.zeros(X.shape[0], dtype=np.int64)
+    for i in keyed:
+        y[i] = 1
+    return X, y
 
 
-def _attn_features_and_labels(model, mask_plan) -> tuple[np.ndarray, np.ndarray]:
-    """Pool every attention head across all layers into a single feature matrix.
-    Each head is the flattened concatenation of its q/k/v rows + out cols."""
-    n_layers = len(model.transformer.h)
-    feats: list[np.ndarray] = []
-    labels: list[np.ndarray] = []
-    for L in range(n_layers):
-        attn = _get_attention_module(model, L)
-        head_dim = int(attn.head_dim)
-        q = attn.q_proj.weight.detach().float().cpu().numpy()
-        k = attn.k_proj.weight.detach().float().cpu().numpy()
-        v = attn.v_proj.weight.detach().float().cpu().numpy()
-        o = attn.out_proj.weight.detach().float().cpu().numpy()
-        num_heads = q.shape[0] // head_dim
+def _attn_for_layer(model, mask_plan, L: int) -> tuple[np.ndarray, np.ndarray]:
+    attn = _get_attention_module(model, L)
+    head_dim = int(attn.head_dim)
+    q = attn.q_proj.weight.detach().float().cpu().numpy()
+    k = attn.k_proj.weight.detach().float().cpu().numpy()
+    v = attn.v_proj.weight.detach().float().cpu().numpy()
+    o = attn.out_proj.weight.detach().float().cpu().numpy()
+    num_heads = q.shape[0] // head_dim
 
-        keyed_rows: set[int] = set()
-        for idx in (
-            mask_plan.keyed_attn_indices.get(L),
-            mask_plan.keyed_attn_out_indices.get(L),
-        ):
-            if idx is not None:
-                keyed_rows.update(int(i) for i in idx.cpu().tolist())
+    keyed_rows: set[int] = set()
+    for idx in (
+        mask_plan.keyed_attn_indices.get(L),
+        mask_plan.keyed_attn_out_indices.get(L),
+    ):
+        if idx is not None:
+            keyed_rows.update(int(i) for i in idx.cpu().tolist())
 
-        for h in range(num_heads):
-            r = slice(h * head_dim, (h + 1) * head_dim)
-            feat = np.concatenate([
-                q[r, :].ravel(),
-                k[r, :].ravel(),
-                v[r, :].ravel(),
-                o[:, r].T.ravel(),
-            ])
-            feats.append(feat)
-            head_keyed = any(row in keyed_rows for row in range(h * head_dim, (h + 1) * head_dim))
-            labels.append(1 if head_keyed else 0)
-
+    feats = []
+    labels = []
+    for h in range(num_heads):
+        r = slice(h * head_dim, (h + 1) * head_dim)
+        feats.append(np.concatenate([
+            q[r, :].ravel(), k[r, :].ravel(), v[r, :].ravel(), o[:, r].T.ravel(),
+        ]))
+        head_keyed = any(row in keyed_rows for row in range(h * head_dim, (h + 1) * head_dim))
+        labels.append(1 if head_keyed else 0)
     return np.stack(feats, axis=0), np.array(labels, dtype=np.int64)
 
 
@@ -119,25 +108,63 @@ def _run_tsne(features: np.ndarray, perplexity: float, seed: int) -> np.ndarray:
     return tsne.fit_transform(features)
 
 
-def _scatter(xy: np.ndarray, y: np.ndarray, title: str, out_path: str,
-             keyed_size: float = 14.0, non_size: float = 4.0) -> None:
-    fig, ax = plt.subplots(figsize=(7, 7))
+def _scatter_axis(ax, xy: np.ndarray, y: np.ndarray, title: str,
+                  keyed_size: float, non_size: float, fontsize: int = 12,
+                  show_legend: bool = True) -> None:
     non = y == 0
     key = y == 1
-    # rasterized=True keeps PDFs small (otherwise each point is a vector path)
     ax.scatter(xy[non, 0], xy[non, 1], s=non_size, c="#bbbbbb", alpha=0.5,
                label=f"non-keyed (n={int(non.sum())})", linewidths=0, rasterized=True)
     ax.scatter(xy[key, 0], xy[key, 1], s=keyed_size, c="#d62728", alpha=0.9,
                label=f"keyed (n={int(key.sum())})", linewidths=0, rasterized=True)
-    ax.set_title(title, fontsize=12)
+    ax.set_title(title, fontsize=fontsize)
     ax.set_xticks([])
     ax.set_yticks([])
-    ax.legend(loc="best", fontsize=10, markerscale=1.5)
-    fig.tight_layout()
+    if show_legend:
+        ax.legend(loc="best", fontsize=max(8, fontsize - 2), markerscale=1.5)
+
+
+def _save_fig(fig, out_path: str) -> None:
     fig.savefig(out_path, dpi=300)
-    pdf_path = os.path.splitext(out_path)[0] + ".pdf"
-    fig.savefig(pdf_path, dpi=300)
+    fig.savefig(os.path.splitext(out_path)[0] + ".pdf", dpi=300)
     plt.close(fig)
+
+
+def _save_single(xy: np.ndarray, y: np.ndarray, title: str, out_path: str,
+                 keyed_size: float, non_size: float) -> None:
+    fig, ax = plt.subplots(figsize=(7, 7))
+    _scatter_axis(ax, xy, y, title, keyed_size=keyed_size, non_size=non_size)
+    fig.tight_layout()
+    _save_fig(fig, out_path)
+
+
+def _save_grid(embeddings: dict[int, tuple[np.ndarray, np.ndarray]],
+               family_name: str, out_path: str,
+               keyed_size: float, non_size: float) -> None:
+    layers = sorted(embeddings.keys())
+    cols = min(4, len(layers))
+    rows = math.ceil(len(layers) / cols)
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 3.2, rows * 3.2), squeeze=False)
+    for ax in axes.flat:
+        ax.axis("off")
+    for i, L in enumerate(layers):
+        ax = axes[i // cols][i % cols]
+        ax.axis("on")
+        xy, y = embeddings[L]
+        _scatter_axis(ax, xy, y, f"L{L}",
+                      keyed_size=keyed_size, non_size=non_size,
+                      fontsize=10, show_legend=False)
+    handles, labels = [], []
+    for ax in axes.flat:
+        h, l = ax.get_legend_handles_labels()
+        if h:
+            handles, labels = h, l
+            break
+    if handles:
+        fig.legend(handles, labels, loc="upper center", ncol=2, fontsize=10)
+    fig.suptitle(family_name, fontsize=14, y=0.995)
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    _save_fig(fig, out_path)
 
 
 def main() -> None:
@@ -171,23 +198,42 @@ def main() -> None:
         )
     mask_plan = build_mask_plan(model, key, device)
 
-    # MLP columns
-    X_mlp, y_mlp = _mlp_features_and_labels(model, mask_plan)
-    print(f"MLP columns: X={X_mlp.shape}, keyed={int(y_mlp.sum())}/{len(y_mlp)}")
-    xy_mlp = _run_tsne(X_mlp, args.perplexity, args.seed)
-    mlp_path = os.path.join(args.plot_dir, "tsne_mlp_columns.png")
-    _scatter(xy_mlp, y_mlp, "MLP columns (t-SNE, all layers pooled)", mlp_path)
-    print(f"Wrote {mlp_path}")
+    n_layers = len(model.transformer.h)
+    layers = list(range(n_layers)) if args.layers is None else [int(x) for x in args.layers.split(",")]
 
-    # Attention heads
-    X_attn, y_attn = _attn_features_and_labels(model, mask_plan)
-    print(f"Attention heads: X={X_attn.shape}, keyed={int(y_attn.sum())}/{len(y_attn)}")
-    xy_attn = _run_tsne(X_attn, args.perplexity, args.seed)
-    attn_path = os.path.join(args.plot_dir, "tsne_attn_heads.png")
-    _scatter(xy_attn, y_attn,
-             "Attention heads (t-SNE, all layers pooled)", attn_path,
-             keyed_size=60.0, non_size=30.0)
-    print(f"Wrote {attn_path}")
+    mlp_emb: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    attn_emb: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+
+    MLP_KEY_SIZE, MLP_NON_SIZE = 14.0, 4.0
+    ATTN_KEY_SIZE, ATTN_NON_SIZE = 80.0, 40.0
+
+    for L in layers:
+        # MLP
+        X_mlp, y_mlp = _mlp_for_layer(model, mask_plan, L)
+        print(f"Layer {L} MLP:  X={X_mlp.shape}, keyed={int(y_mlp.sum())}/{len(y_mlp)}")
+        xy_mlp = _run_tsne(X_mlp, args.perplexity, args.seed)
+        mlp_emb[L] = (xy_mlp, y_mlp)
+        _save_single(xy_mlp, y_mlp, f"Layer {L} — MLP columns (t-SNE)",
+                     os.path.join(args.plot_dir, f"tsne_mlp_layer{L:02d}.png"),
+                     keyed_size=MLP_KEY_SIZE, non_size=MLP_NON_SIZE)
+
+        # Attention
+        X_attn, y_attn = _attn_for_layer(model, mask_plan, L)
+        print(f"Layer {L} attn: X={X_attn.shape}, keyed={int(y_attn.sum())}/{len(y_attn)}")
+        xy_attn = _run_tsne(X_attn, args.perplexity, args.seed)
+        attn_emb[L] = (xy_attn, y_attn)
+        _save_single(xy_attn, y_attn, f"Layer {L} — Attention heads (t-SNE)",
+                     os.path.join(args.plot_dir, f"tsne_attn_layer{L:02d}.png"),
+                     keyed_size=ATTN_KEY_SIZE, non_size=ATTN_NON_SIZE)
+
+    _save_grid(mlp_emb, "MLP columns (t-SNE, per layer)",
+               os.path.join(args.plot_dir, "tsne_mlp_grid.png"),
+               keyed_size=MLP_KEY_SIZE, non_size=MLP_NON_SIZE)
+    _save_grid(attn_emb, "Attention heads (t-SNE, per layer)",
+               os.path.join(args.plot_dir, "tsne_attn_grid.png"),
+               keyed_size=ATTN_KEY_SIZE, non_size=ATTN_NON_SIZE)
+
+    print(f"\nWrote per-layer plots and grids to {args.plot_dir}")
 
 
 if __name__ == "__main__":
