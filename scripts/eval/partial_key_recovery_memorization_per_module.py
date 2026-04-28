@@ -396,9 +396,16 @@ def _plot_mean_std(
     metric_keys: list[str],
     output_path: Path,
 ) -> None:
+    # Match c2k_pareto_plot.py palette (TEAL + PURPLE).
+    palette = ["#008080", "#662E7D", "#7D6E2E", "gray"]
+    label_map = {
+        "top1_acc": "Top 1 Token",
+        "exact_match": "Full String Match",
+    }
+
     fig, ax = plt.subplots(figsize=(9, 5.5))
 
-    for mk in metric_keys:
+    for idx, mk in enumerate(metric_keys):
         means = [s.get(f"{mk}_mean") for s in summaries]
         stds = [s.get(f"{mk}_std") for s in summaries]
 
@@ -419,18 +426,34 @@ def _plot_mean_std(
         if not x:
             continue
 
-        label = mk.replace("mean_", "").replace("_acc", "")
-        ax.plot(x, y, marker="o", linewidth=1.8, label=label)
-        ax.fill_between(x, y_lo, y_hi, alpha=0.18)
+        color = palette[idx % len(palette)]
+        label = label_map.get(mk, mk.replace("mean_", "").replace("_acc", ""))
+        ax.plot(x, y, marker="o", linewidth=1.8, label=label, color=color)
+        ax.fill_between(x, y_lo, y_hi, alpha=0.18, color=color)
 
-    ax.set_xlabel("Partial key kept (%)")
-    ax.set_ylabel("Accuracy")
-    ax.set_title("Partial-Key Recovery: Mean ± Std Across Runs")
-    ax.set_ylim(0.0, 1.0)
+    ax.axvline(85, color="gray", linestyle="--", linewidth=2.2, alpha=0.7)
+    ax.annotate(
+        "Meaningful increase\nstarts after 85%",
+        xy=(85, 0.55),
+        xytext=(55, 0.65),
+        fontsize=12, color="black", ha="center", va="center",
+        arrowprops=dict(arrowstyle="->", color="gray", lw=1.2),
+    )
+
+    axis_fs = 17
+    ax.set_xlabel("Partial Key (%)", fontsize=axis_fs)
+    ax.set_ylabel("Accuracy (%)", fontsize=axis_fs)
+    ax.tick_params(axis="both", labelsize=15)
+    ax.set_ylim(-0.03, 1.03)
+    # Match x-axis scale: display y as 0..100 instead of 0.0..1.0.
+    from matplotlib.ticker import FuncFormatter
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda y, _pos: f"{y*100:.0f}"))
     ax.grid(True, linestyle="--", alpha=0.35)
-    ax.legend()
+    ax.legend(fontsize=12, frameon=True, loc="best")
     plt.tight_layout()
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    pdf_path = Path(output_path).with_suffix(".pdf")
+    fig.savefig(pdf_path, bbox_inches="tight")
     plt.close(fig)
 
 

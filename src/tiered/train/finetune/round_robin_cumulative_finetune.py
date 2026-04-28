@@ -6,11 +6,19 @@ C_1..C_N (C_0 = public/home arrangement). For each "round", the active
 tier walks t = 1, 2, ..., N, performing one optimizer step per active
 tier. The step's loss is
 
-    L = (1 - λ_pub) · (1/(N - t + 1)) · Σ_{c=t..N} L_priv(D_t @ C_c)
+    L = (1 - λ_pub - λ_cum) · (1/(N - t + 1)) · Σ_{c=t..N} L_priv(D_t @ C_c)
         + λ_pub · KL(public @ C_0; C_0' || student)
+        + λ_cum · KL(public @ C_{c*}; C_0' || student)
 
 where C_0' is the static cumulative pretrain checkpoint, used as the
-frozen KL reference for the public-data term.
+frozen KL reference for both KL terms, and c* = (global_step mod N)
+cycles through 1..N so that each cumulative config gets a public-KL
+anchor every N steps.
+
+The cumulative KL term costs +1 student fwd+bwd and +1 ref fwd per
+step (constant — independent of active tier). Without it (λ_cum=0,
+default), only the home arrangement is anchored, which lets the
+non-home configs drift on retain (observed empirically).
 
 The same private batch (drawn from D_t) is fed through every cumulative
 config from C_t up to C_N — i.e. every config that *includes* tier t's
@@ -109,9 +117,15 @@ def parse_args() -> argparse.Namespace:
                         "round, so a round consumes N steps).")
     p.add_argument("--warmup_steps", type=int, default=100)
     p.add_argument("--kl_lambda", type=float, default=0.1,
-                   help="Weight of the public-KL term. Private term gets "
-                        "(1 - kl_lambda) split equally across the active "
-                        "tier's (N - t + 1) cumulative configs C_t..C_N.")
+                   help="Weight of the home (C_0) public-KL term.")
+    p.add_argument("--cumulative_kl_lambda", type=float, default=0.0,
+                   help="Weight of an additional public-KL term anchored at "
+                        "ONE cycled cumulative config c* = (step mod N) per "
+                        "step. Over N steps, every C_1..C_N is hit once. "
+                        "Adds ~1 extra student fwd+bwd and 1 ref fwd per "
+                        "step (constant cost). Set to 0 to disable. "
+                        "Private weight = max(0, 1 - kl_lambda - "
+                        "cumulative_kl_lambda) / n_configs.")
     p.add_argument("--keyed_l2_lambda", type=float, default=0.0)
     p.add_argument("--max_grad_norm", type=float, default=1.0)
 
@@ -165,25 +179,32 @@ def train_step(
     kl_lambda: float,
     max_grad_norm: float,
     active_update_mask: dict,
+    cumulative_kl_lambda: float = 0.0,
+    cumulative_kl_config_idx: Optional[int] = None,
 ):
     """Execute one optimizer step for a given active tier.
 
-    Returns (priv_losses, kl_pub_value, acc_at_active, grad_norm) where
-    priv_losses has length (N - active_idx) and is ordered
-    C_{active_idx+1}, C_{active_idx+2}, ..., C_N. acc_at_active is the
-    accuracy at C_{active_idx+1} (the shallowest config that contains
-    the active tier).
+    Returns (priv_losses, kl_pub_value, kl_cum_value, kl_cum_idx,
+    acc_at_active, grad_norm) where priv_losses has length
+    (N - active_idx) and is ordered C_{active_idx+1}..C_N.
+    acc_at_active is the accuracy at C_{active_idx+1} (the shallowest
+    config containing the active tier). kl_cum_value is the KL value
+    at the cycled cumulative config (NaN if disabled), kl_cum_idx is
+    that config's 0-based index (-1 if disabled).
     """
     raw_model.train()
     optimizer.zero_grad()
     amp = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
            if device.type == "cuda" else nullcontext())
 
+    # Move pub batch to device once — used by home and cumulative KL.
+    pub_ids = (public_batch["input_ids"].to(device)
+               if public_batch is not None else None)
+
     # -------- 1. Public KL at C_0 (home arrangement) --------
-    use_pub_kl = kl_lambda > 0 and public_batch is not None and pretrain_ref is not None
+    use_pub_kl = kl_lambda > 0 and pub_ids is not None and pretrain_ref is not None
     loss_kl_value = float("nan")
     if use_pub_kl:
-        pub_ids = public_batch["input_ids"].to(device)
         with amp:
             with torch.no_grad():
                 ref_probs = F.softmax(pretrain_ref(pub_ids).logits, dim=-1)
@@ -194,15 +215,51 @@ def train_step(
         loss_kl_value = loss_kl_pub.item()
         del loss_kl_pub
 
+    # -------- 1b. KL at one cycled cumulative config (NEW, optional) --------
+    # Anchors retain quality at non-home cumulative configs. Without it,
+    # only C_0 is anchored and C_1..C_N drift on retain as private
+    # training pushes the cumulative-config weights. With it: each step
+    # picks ONE cumulative config c* (cycled by the caller via
+    # cumulative_kl_config_idx = global_step mod N), permutes both
+    # student and ref to C_{c*+1}, and adds a KL term there.
+    n_tiers = len(tiers)
+    use_cum_kl = (cumulative_kl_lambda > 0
+                  and pretrain_ref is not None
+                  and pub_ids is not None
+                  and cumulative_kl_config_idx is not None
+                  and 0 <= cumulative_kl_config_idx < n_tiers)
+    loss_kl_cum_value = float("nan")
+    cum_c = -1
+    if use_cum_kl:
+        cum_c = cumulative_kl_config_idx
+        # Same bracketing as the priv loop: apply, swap accumulated grads
+        # into the permuted arrangement, backward, swap back, unapply.
+        _apply_keys(raw_model, tiers, cum_c)
+        _apply_keys(pretrain_ref, tiers, cum_c)
+        _swap_gradients(raw_model, tiers, cum_c)
+
+        with amp:
+            with torch.no_grad():
+                ref_probs = F.softmax(pretrain_ref(pub_ids).logits, dim=-1)
+            student_log = F.log_softmax(model(pub_ids).logits, dim=-1)
+            loss_kl_cum = F.kl_div(student_log, ref_probs, reduction="batchmean")
+        del ref_probs, student_log
+        (cumulative_kl_lambda * loss_kl_cum).backward()
+        loss_kl_cum_value = loss_kl_cum.item()
+        del loss_kl_cum
+
+        _swap_gradients(raw_model, tiers, cum_c)
+        _unapply_keys(raw_model, tiers, cum_c)
+        _unapply_keys(pretrain_ref, tiers, cum_c)
+
     # -------- 2. Private loss at every config C_{active+1}..C_N --------
     # Configs that include the active tier's permutations: C_t..C_N (in
     # user labels), i.e. apply_keys(up_to=c) for c in [active_idx, N-1].
     # Same private batch through every config so the comparison is
-    # like-for-like. Per-config weight = (1 - kl_lambda) / n_configs —
-    # i.e. the mean of l_t..l_N carries total weight (1 - kl_lambda).
-    n_tiers = len(tiers)
+    # like-for-like. Per-config weight = (1 - kl_lambda - cum_kl_lambda)
+    # / n_configs — i.e. the mean of l_t..l_N carries the residual budget.
     n_configs = n_tiers - active_idx
-    per_config_priv = (1.0 - kl_lambda) / n_configs
+    per_config_priv = max(0.0, 1.0 - kl_lambda - cumulative_kl_lambda) / n_configs
     priv_losses: list[float] = []
     acc_at_active = float("nan")
 
@@ -244,7 +301,8 @@ def train_step(
     grad_norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), max_grad_norm)
     adamw_step_preserving_public(optimizer, active_update_mask)
 
-    return priv_losses, loss_kl_value, acc_at_active, grad_norm
+    return (priv_losses, loss_kl_value, loss_kl_cum_value, cum_c,
+            acc_at_active, grad_norm)
 
 
 # =============================================================================
@@ -445,8 +503,10 @@ def train():
     if is_main:
         print(f"  Params: {num_params:,}  tokens/step: {tokens_per_step:,}  "
               f"max_steps: {args.max_steps}  (round = {n_tiers} steps)")
-        print(f"  kl_lambda={args.kl_lambda}  per-config priv weight (active=t): "
-              f"(1 - {args.kl_lambda}) / (N - t + 1)")
+        priv_w_total = max(0.0, 1.0 - args.kl_lambda - args.cumulative_kl_lambda)
+        print(f"  kl_lambda={args.kl_lambda}  cumulative_kl_lambda="
+              f"{args.cumulative_kl_lambda}  priv total weight={priv_w_total:.3f} "
+              f"(per-config = priv / (N - t + 1))")
 
     pbar = tqdm(total=args.max_steps, desc="Round-robin") if is_main else None
 
@@ -516,13 +576,18 @@ def train():
             priv_batch = priv_cyclers[active_idx].next()
             pub_batch = pub_cycler.next() if pub_cycler is not None else None
 
-            (priv_losses, kl_pub_value, acc_at_active, grad_norm) = train_step(
+            cum_c_idx = (global_step % n_tiers
+                         if args.cumulative_kl_lambda > 0 else None)
+            (priv_losses, kl_pub_value, kl_cum_value, kl_cum_idx,
+             acc_at_active, grad_norm) = train_step(
                 model=model, raw_model=raw_model,
                 pretrain_ref=pretrain_ref, tiers=tiers,
                 active_idx=active_idx,
                 private_batch=priv_batch, public_batch=pub_batch,
                 optimizer=optimizer, device=device,
                 kl_lambda=args.kl_lambda,
+                cumulative_kl_lambda=args.cumulative_kl_lambda,
+                cumulative_kl_config_idx=cum_c_idx,
                 max_grad_norm=args.max_grad_norm,
                 active_update_mask=active_update_masks[active_idx],
             )
@@ -550,7 +615,10 @@ def train():
 
             if is_main and global_step % args.log_interval == 0:
                 kl_term = args.kl_lambda * (kl_pub_value if kl_pub_value == kl_pub_value else 0.0)
-                total = (1.0 - args.kl_lambda) * mean_priv + kl_term
+                kl_cum_term = (args.cumulative_kl_lambda * kl_cum_value
+                               if kl_cum_value == kl_cum_value else 0.0)
+                priv_w = max(0.0, 1.0 - args.kl_lambda - args.cumulative_kl_lambda)
+                total = priv_w * mean_priv + kl_term + kl_cum_term
                 lr = optimizer.param_groups[0]["lr"]
                 log_dict = {
                     "Train/Total Loss": total,
@@ -572,6 +640,9 @@ def train():
                 for c, v in enumerate(priv_losses):
                     cfg_id = active_idx + c + 1  # priv_losses[c] is at C_{active+c+1}
                     log_dict[f"Train/Private ({active_label} active) at C{cfg_id}"] = v
+                if kl_cum_idx >= 0:
+                    log_dict["Train/Cumulative KL Value"] = kl_cum_value
+                    log_dict[f"Train/Cumulative KL at C{kl_cum_idx + 1}"] = kl_cum_value
                 wandb.log(log_dict)
 
             if global_step % args.eval_interval == 0:
