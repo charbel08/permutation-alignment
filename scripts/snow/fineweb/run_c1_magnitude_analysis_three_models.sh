@@ -36,13 +36,14 @@ C2K_KEY=${C2K_KEY:-/work/permutation-alignment/configs/keys/150m/both/key_${KEY_
 PRETRAIN_CHECKPOINT=${PRETRAIN_CHECKPOINT:-/work/scratch/checkpoints/fineweb/tiered_pretrain_150m_${KEY_SIZE}pct/final-checkpoint}
 PRETRAIN_KEY=${PRETRAIN_KEY:-/work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct.json}
 
-# Multi-stage cumulative finetune (last stage is C4 with 3 stages indexed 0..2)
+# Multi-stage cumulative finetune (random-key variant; last stage is C4 with 3 stages indexed 0..2)
 MS_TAG=${MS_TAG:-perconfig}
-MS_RUN_SUFFIX=${MS_RUN_SUFFIX:-}
+MS_RUN_SUFFIX=${MS_RUN_SUFFIX:-_random}
+MS_KEY_SUFFIX=${MS_KEY_SUFFIX:-_random}
 MS_CHECKPOINT=${MS_CHECKPOINT:-/work/scratch/checkpoints/fineweb/finetune_150m_fineweb2_multi_stage${MS_RUN_SUFFIX}_${MS_TAG}_key${KEY_SIZE}pct_kl${KL_TAG}/stage_2_C4/final}
-MS_KEY1=${MS_KEY1:-/work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct_1.json}
-MS_KEY2=${MS_KEY2:-/work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct_2.json}
-MS_KEY3=${MS_KEY3:-/work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct_3.json}
+MS_KEY1=${MS_KEY1:-/work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct${MS_KEY_SUFFIX}_1.json}
+MS_KEY2=${MS_KEY2:-/work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct${MS_KEY_SUFFIX}_2.json}
+MS_KEY3=${MS_KEY3:-/work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct${MS_KEY_SUFFIX}_3.json}
 
 mkdir -p "$OUTPUT_ROOT"
 
