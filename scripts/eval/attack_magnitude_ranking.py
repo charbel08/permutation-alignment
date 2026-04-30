@@ -16,7 +16,7 @@ Reports accuracy / precision / recall / F1 / ROC-AUC for five methods:
   attn_smallest  — rank attn heads by z-score, predict bottom-K%
   mlp_largest    — rank MLP columns by z-score, predict top-K%
   attn_largest   — rank attn heads by z-score, predict top-K%
-  combined_small_mlp_large_attn — one pool: smallest MLP + largest attn
+  combined_smallest — one pool: smallest MLP + smallest attn
 """
 
 from __future__ import annotations
@@ -212,9 +212,9 @@ def main() -> None:
     methods["mlp_largest"] = _evaluate(mlp_z, mlp_labels, "largest")
     methods["attn_largest"] = _evaluate(attn_z, attn_labels, "largest")
 
-    combined_score = np.concatenate([mlp_z, -attn_z])
+    combined_score = np.concatenate([mlp_z, attn_z])
     combined_labels = np.concatenate([mlp_labels, attn_labels])
-    methods["combined_small_mlp_large_attn"] = _evaluate(combined_score, combined_labels, "smallest")
+    methods["combined_smallest"] = _evaluate(combined_score, combined_labels, "smallest")
 
     print()
     hdr = f"{'method':35s} {'n':>6s} {'k_true':>6s} {'acc':>7s} {'prec':>7s} {'recall':>7s} {'f1':>7s} {'auc':>7s}"
