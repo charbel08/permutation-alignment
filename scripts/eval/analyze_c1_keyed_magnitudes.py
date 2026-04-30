@@ -18,7 +18,6 @@ import argparse
 import json
 import math
 import os
-import random
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict
@@ -451,59 +450,70 @@ def compute_weight_per_channel_l2_per_layer(model: GPTNeoForCausalLMTiered, mask
     return out
 
 
-def _generate_random_key_like(
-    real_key: PermutationKey, num_layers: int, num_heads: int, mlp_dim: int, seed: int = 42
-) -> PermutationKey:
-    """Sample a random PermutationKey with the same per-family swap counts as
-    `real_key`. Each (layer, idx) appears at most once across pairs within a
-    family. Used as a coherent baseline for the magnitude heatmap: the fake key
-    has the same overall structure (e.g., ~25% attn / ~75% mlp by weight volume
-    when the real key does) but the keyed channels are arbitrary."""
-    rng = random.Random(seed)
-
-    def _random_pairs(n_pairs: int, max_layer: int, max_idx: int) -> list:
-        if n_pairs == 0:
-            return []
-        all_tuples = [(L, i) for L in range(max_layer) for i in range(max_idx)]
-        n_unique = 2 * n_pairs
-        if n_unique > len(all_tuples):
-            raise ValueError(f"Cannot sample {n_unique} unique slots from {len(all_tuples)}")
-        chosen = rng.sample(all_tuples, n_unique)
-        return [[list(chosen[2 * i]), list(chosen[2 * i + 1])] for i in range(n_pairs)]
-
-    return PermutationKey(
-        attn_heads=_random_pairs(len(real_key.attn_heads), num_layers, num_heads),
-        attn_out_heads=_random_pairs(len(real_key.attn_out_heads), num_layers, num_heads),
-        mlp_cols=_random_pairs(len(real_key.mlp_cols), num_layers, mlp_dim),
-        mlp_up_cols=_random_pairs(len(real_key.mlp_up_cols), num_layers, mlp_dim),
-        mlp_down_cols=_random_pairs(len(real_key.mlp_down_cols), num_layers, mlp_dim),
-    )
-
-
 @torch.no_grad()
 def compute_weight_per_channel_l2_random_baseline_per_layer(
-    model: GPTNeoForCausalLMTiered,
-    real_key: PermutationKey,
-    device: torch.device,
-    seed: int = 42,
+    model: GPTNeoForCausalLMTiered, mask_plan, seed: int = 42
 ) -> Dict[str, dict]:
-    """Coherent random-key baseline for the L2 ratio heatmap.
+    """Per-cell random-subset baseline for the L2 ratio heatmap.
 
-    Generates one fresh random key with the same per-family swap counts as the
-    real key, builds its mask plan, and runs the same per-channel L2 ratio
-    computation. If the heatmap pattern is real keyed-vs-non-keyed signal, this
-    baseline (a different random key with the same shape) should look flat
-    around 1.0 with no spatial structure."""
-    attn0 = _get_attention_module(model, 0)
-    mlp0 = _get_mlp_module(model, 0)
-    num_layers = len(model.transformer.h)
-    head_dim = int(attn0.head_dim)
-    num_heads = int(attn0.q_proj.weight.shape[0] // head_dim)
-    mlp_dim = int(mlp0.c_fc.weight.shape[0])
+    For each (family, layer) cell, sample K random channels from the same pool,
+    where K = number of real keyed channels for that cell, and compute the
+    same `mean(per-channel L2 over selected) / mean(per-channel L2 over rest)`
+    ratio. This is the heatmap statistic with the keyed selection swapped for
+    a uniform-random one of the same size — a sampling-noise floor for each
+    cell independently.
+    """
+    rng = torch.Generator().manual_seed(seed)
+    out: Dict[str, dict] = {}
 
-    fake_key = _generate_random_key_like(real_key, num_layers, num_heads, mlp_dim, seed=seed)
-    fake_plan = build_mask_plan(model, fake_key, device)
-    return compute_weight_per_channel_l2_per_layer(model, fake_plan)
+    def _rand(n_total: int, k: int, device) -> torch.Tensor:
+        return torch.randperm(n_total, generator=rng)[:k].to(device)
+
+    all_attn_layers = set(mask_plan.keyed_attn_indices.keys()) | set(mask_plan.keyed_attn_out_indices.keys())
+    for layer_idx in sorted(all_attn_layers):
+        attn = _get_attention_module(model, layer_idx)
+        n_attn = attn.q_proj.weight.shape[0]
+        idx_rows = mask_plan.keyed_attn_indices.get(layer_idx)
+        idx_cols = _merge_idx(idx_rows, mask_plan.keyed_attn_out_indices.get(layer_idx))
+        tag = f"L{layer_idx:02d}"
+
+        if idx_rows is not None and idx_rows.numel() > 0:
+            random_rows = _rand(n_attn, idx_rows.numel(), idx_rows.device)
+            for short, proj in (("q", attn.q_proj), ("k", attn.k_proj), ("v", attn.v_proj)):
+                norms = proj.weight.detach().float().norm(dim=1)
+                out[f"{tag}_attn_{short}_weight_rows"] = _per_channel_l2_stats(norms, random_rows)
+
+        if idx_cols is not None and idx_cols.numel() > 0:
+            random_cols = _rand(n_attn, idx_cols.numel(), idx_cols.device)
+            norms = attn.out_proj.weight.detach().float().norm(dim=0)
+            out[f"{tag}_attn_out_weight_cols"] = _per_channel_l2_stats(norms, random_cols)
+
+    all_mlp_layers = (
+        set(mask_plan.keyed_mlp_indices.keys())
+        | set(mask_plan.keyed_mlp_up_indices.keys())
+        | set(mask_plan.keyed_mlp_down_indices.keys())
+    )
+    for layer_idx in sorted(all_mlp_layers):
+        mlp = _get_mlp_module(model, layer_idx)
+        n_mlp = mlp.c_fc.weight.shape[0]
+        idx_rows = _merge_idx(mask_plan.keyed_mlp_indices.get(layer_idx), mask_plan.keyed_mlp_up_indices.get(layer_idx))
+        idx_cols = _merge_idx(mask_plan.keyed_mlp_indices.get(layer_idx), mask_plan.keyed_mlp_down_indices.get(layer_idx))
+        tag = f"L{layer_idx:02d}"
+
+        if idx_rows is not None and idx_rows.numel() > 0:
+            random_rows = _rand(n_mlp, idx_rows.numel(), idx_rows.device)
+            norms = mlp.c_fc.weight.detach().float().norm(dim=1)
+            out[f"{tag}_mlp_fc_weight_rows"] = _per_channel_l2_stats(norms, random_rows)
+            if mlp.c_fc.bias is not None:
+                norms = mlp.c_fc.bias.detach().float().abs()
+                out[f"{tag}_mlp_fc_bias"] = _per_channel_l2_stats(norms, random_rows)
+
+        if idx_cols is not None and idx_cols.numel() > 0:
+            random_cols = _rand(n_mlp, idx_cols.numel(), idx_cols.device)
+            norms = mlp.c_proj.weight.detach().float().norm(dim=0)
+            out[f"{tag}_mlp_proj_weight_cols"] = _per_channel_l2_stats(norms, random_cols)
+
+    return out
 
 
 @torch.no_grad()
@@ -1105,7 +1115,7 @@ def main() -> None:
     per_layer_weight_stats = compute_weight_stats_per_layer(model, mask_plan)
     per_layer_weight_l2_stats = compute_weight_per_channel_l2_per_layer(model, mask_plan)
     per_layer_weight_l2_baseline_stats = compute_weight_per_channel_l2_random_baseline_per_layer(
-        model, key, device, seed=args.seed
+        model, mask_plan, seed=args.seed
     )
 
     private_activation_stats: dict = {}
