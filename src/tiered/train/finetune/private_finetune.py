@@ -144,6 +144,15 @@ def parse_args():
         default=0.01,
         help="AdamW weight decay applied to keyed (trainable) weights only (default: 0.01)",
     )
+    parser.add_argument(
+        "--train_keyed_without_permutation",
+        action="store_true",
+        help=(
+            "Control mode for non-tiered baseline checkpoints: train only the "
+            "key-selected weights in the home/C1 layout, without applying the "
+            "permutation for the private loss."
+        ),
+    )
     parser.add_argument("--resume_from", type=str, default=None,
                         help="Path to finetuning checkpoint to resume from")
     
@@ -180,10 +189,15 @@ def _normalize_key_fields(key):
 def train_step(model, raw_model, ref_model, private_batch, public_batch,
                key, optimizer, device, kl_lambda, max_grad_norm,
                keyed_param_masks=None, keyed_mask_plan=None,
-               is_distributed=False, prior_keys=None, active_swap_plan=None):
+               is_distributed=False, prior_keys=None, active_swap_plan=None,
+               train_keyed_without_permutation=False):
     """Execute one finetuning step.
     
     Implements: L_ft = (1-λ) * L_priv(C_{k+1}) + λ * R_KL(C1)
+
+    If train_keyed_without_permutation=True, L_priv is evaluated in the home/C1
+    layout and only key-selected gradients are kept. This is a baseline control:
+    the key defines the trainable subset but is never applied.
     
     Supports both independent and cumulative modes:
       - Independent (prior_keys=None): applies only the active key (original behavior)
@@ -208,6 +222,11 @@ def train_step(model, raw_model, ref_model, private_batch, public_batch,
     """
     if prior_keys is None:
         prior_keys = []
+    if train_keyed_without_permutation and prior_keys:
+        raise ValueError(
+            "train_keyed_without_permutation is incompatible with cumulative "
+            "prior keys, because no permutations should be applied."
+        )
     
     raw_model.train()
     optimizer.zero_grad()
@@ -239,20 +258,23 @@ def train_step(model, raw_model, ref_model, private_batch, public_batch,
         loss_kl_value = loss_kl.item()
     
     # === Step 2-3: Enter C_{k+1} and swap gradients to follow weights ===
-    # Apply prior keys first (cumulative context), then active key
-    for prior_key, prior_plan in prior_keys:
-        apply_permutation(raw_model, prior_key, plan=prior_plan)
-    if key is not None:
-        apply_permutation(raw_model, key, plan=active_swap_plan)
-    
-    if use_kl:
-        # Swap KL gradients for all applied keys so they follow their weights
+    # In keyed-without-permutation mode, keep the model in the home/C1 layout.
+    # The key is used only later for gradient masking.
+    if not train_keyed_without_permutation:
+        # Apply prior keys first (cumulative context), then active key
+        for prior_key, prior_plan in prior_keys:
+            apply_permutation(raw_model, prior_key, plan=prior_plan)
         if key is not None:
-            swap_gradients(raw_model, key, plan=active_swap_plan)
-        for prior_key, prior_plan in reversed(prior_keys):
-            swap_gradients(raw_model, prior_key, plan=prior_plan)
+            apply_permutation(raw_model, key, plan=active_swap_plan)
+
+        if use_kl:
+            # Swap KL gradients for all applied keys so they follow their weights
+            if key is not None:
+                swap_gradients(raw_model, key, plan=active_swap_plan)
+            for prior_key, prior_plan in reversed(prior_keys):
+                swap_gradients(raw_model, prior_key, plan=prior_plan)
     
-    # === Step 4: L_priv on C_{k+1} (WITH sync — triggers allreduce) ===
+    # === Step 4: L_priv on the selected training layout (WITH sync) ===
     private_ids = private_batch["input_ids"].to(device)
     labels = private_batch["labels"].to(device)
     with amp_ctx:
@@ -292,7 +314,7 @@ def train_step(model, raw_model, ref_model, private_batch, public_batch,
             if param not in keyed_param_masks and param.grad is not None:
                 param.grad = None
 
-    # === Step 6: Optimizer step IN C_{k+1} CONFIG ===
+    # === Step 6: Optimizer step in the current training layout ===
     # Safe because within a stage, the key configuration is constant
     # (same prior keys + same active key every step), so Adam momentum/
     # variance always sees weights at the same positions.
@@ -303,17 +325,19 @@ def train_step(model, raw_model, ref_model, private_batch, public_batch,
         optimizer.step()
     
     # === Step 7: Back to C1 ===
-    if key is not None:
-        unapply_permutation(raw_model, key, plan=active_swap_plan)
-    for prior_key, prior_plan in reversed(prior_keys):
-        unapply_permutation(raw_model, prior_key, plan=prior_plan)
+    if not train_keyed_without_permutation:
+        if key is not None:
+            unapply_permutation(raw_model, key, plan=active_swap_plan)
+        for prior_key, prior_plan in reversed(prior_keys):
+            unapply_permutation(raw_model, prior_key, plan=prior_plan)
     
     return loss_priv.item(), loss_kl_value, acc
 
 
 @torch.no_grad()
 def evaluate_on_dataset(model, dataloader, key, device, num_steps=50, eval_c2=False,
-                        prior_keys=None, active_swap_plan=None):
+                        prior_keys=None, active_swap_plan=None,
+                        eval_keyed_without_permutation=False):
     """Evaluate model on a dataset.
     
     Args:
@@ -323,6 +347,9 @@ def evaluate_on_dataset(model, dataloader, key, device, num_steps=50, eval_c2=Fa
         device: Device to use
         num_steps: Number of batches to evaluate
         eval_c2: Whether to also evaluate C2 architecture
+        eval_keyed_without_permutation: If True, the C2 metrics are computed
+            in the home/C1 layout. This keeps metric names compatible while
+            evaluating the baseline keyed-subset control.
         prior_keys: List of (key, swap_plan) pairs to apply before the eval key
                     for cumulative mode. None or [] for independent mode.
         active_swap_plan: Optional pre-compiled SwapPlan for eval key.
@@ -387,11 +414,12 @@ def evaluate_on_dataset(model, dataloader, key, device, num_steps=50, eval_c2=Fa
 
             # Evaluate C2 (or cumulative C_{k+1}) if requested
             if eval_c2:
-                # Apply prior keys (cumulative context), then eval key
-                for prior_key, prior_plan in prior_keys:
-                    apply_permutation(model, prior_key, plan=prior_plan)
-                if key is not None:
-                    apply_permutation(model, key, plan=active_swap_plan)
+                if not eval_keyed_without_permutation:
+                    # Apply prior keys (cumulative context), then eval key
+                    for prior_key, prior_plan in prior_keys:
+                        apply_permutation(model, prior_key, plan=prior_plan)
+                    if key is not None:
+                        apply_permutation(model, key, plan=active_swap_plan)
 
                 with amp_ctx:
                     outputs_c2 = model(input_ids, labels=labels)
@@ -410,11 +438,12 @@ def evaluate_on_dataset(model, dataloader, key, device, num_steps=50, eval_c2=Fa
                 else:
                     top3_acc_c2 = 0.0
 
-                # Unapply in reverse
-                if key is not None:
-                    unapply_permutation(model, key, plan=active_swap_plan)
-                for prior_key, prior_plan in reversed(prior_keys):
-                    unapply_permutation(model, prior_key, plan=prior_plan)
+                if not eval_keyed_without_permutation:
+                    # Unapply in reverse
+                    if key is not None:
+                        unapply_permutation(model, key, plan=active_swap_plan)
+                    for prior_key, prior_plan in reversed(prior_keys):
+                        unapply_permutation(model, prior_key, plan=prior_plan)
 
                 total_loss_c2 += loss_c2
                 total_acc_c2 += acc_c2
@@ -496,6 +525,11 @@ def main():
     # cumulative context from pretraining.
     prior_keys = []  # list of (PermutationKey, SwapPlan)
     cumulative_mode = args.cumulative_key_paths is not None and len(args.cumulative_key_paths) > 0
+    if args.train_keyed_without_permutation and cumulative_mode:
+        raise ValueError(
+            "--train_keyed_without_permutation is incompatible with "
+            "--cumulative_key_paths."
+        )
     if cumulative_mode:
         if is_main:
             print(f"Cumulative mode: {len(args.cumulative_key_paths)} prior key(s)")
@@ -869,6 +903,7 @@ def main():
             "compute/kl_enabled": kl_enabled,
             "compute/gpu_name": gpu_name,
             "compute/gpu_peak_bf16_flops": gpu_peak_flops,
+            "training/keyed_without_permutation": args.train_keyed_without_permutation,
         }, allow_val_change=True)
 
     # Cumulative trackers
@@ -901,15 +936,21 @@ def main():
             val_log["Val Private/C1 Accuracy"] = c1_private["acc_c1"]
 
             for tier_label, eval_key in all_keys.items():
+                active_no_perm_eval = (
+                    args.train_keyed_without_permutation
+                    and tier_label == active_tier_label
+                )
                 tier_metrics = evaluate_on_dataset(
                     raw_model, private_val_loader, eval_key, device,
                     num_steps=args.eval_steps, eval_c2=True,
                     prior_keys=all_eval_prior_keys.get(tier_label, []),
                     active_swap_plan=all_key_swap_plans.get(tier_label),
+                    eval_keyed_without_permutation=active_no_perm_eval,
                 )
                 if is_main:
                     tag = "★" if tier_label == active_tier_label else " "
-                    print(f"  {tag} {tier_label}: loss={tier_metrics['loss_c2']:.4f}, ppl={tier_metrics['ppl_c2']:.2f}, acc={tier_metrics['acc_c2']:.4f}")
+                    mode_tag = " (home/no-perm)" if active_no_perm_eval else ""
+                    print(f"  {tag} {tier_label}{mode_tag}: loss={tier_metrics['loss_c2']:.4f}, ppl={tier_metrics['ppl_c2']:.2f}, acc={tier_metrics['acc_c2']:.4f}")
                 val_log[f"Val Private/{tier_label} Loss"] = tier_metrics["loss_c2"]
                 val_log[f"Val Private/{tier_label} Perplexity"] = tier_metrics["ppl_c2"]
                 val_log[f"Val Private/{tier_label} Accuracy"] = tier_metrics["acc_c2"]
@@ -928,15 +969,21 @@ def main():
             val_log["Val Retain/C1 Accuracy"] = c1_retain["acc_c1"]
 
             for tier_label, eval_key in all_keys.items():
+                active_no_perm_eval = (
+                    args.train_keyed_without_permutation
+                    and tier_label == active_tier_label
+                )
                 tier_metrics = evaluate_on_dataset(
                     raw_model, retain_val_loader, eval_key, device,
                     num_steps=args.eval_steps, eval_c2=True,
                     prior_keys=all_eval_prior_keys.get(tier_label, []),
                     active_swap_plan=all_key_swap_plans.get(tier_label),
+                    eval_keyed_without_permutation=active_no_perm_eval,
                 )
                 if is_main:
                     tag = "★" if tier_label == active_tier_label else " "
-                    print(f"  {tag} {tier_label}: loss={tier_metrics['loss_c2']:.4f}, ppl={tier_metrics['ppl_c2']:.2f}, acc={tier_metrics['acc_c2']:.4f}")
+                    mode_tag = " (home/no-perm)" if active_no_perm_eval else ""
+                    print(f"  {tag} {tier_label}{mode_tag}: loss={tier_metrics['loss_c2']:.4f}, ppl={tier_metrics['ppl_c2']:.2f}, acc={tier_metrics['acc_c2']:.4f}")
                 val_log[f"Val Retain/{tier_label} Loss"] = tier_metrics["loss_c2"]
                 val_log[f"Val Retain/{tier_label} Perplexity"] = tier_metrics["ppl_c2"]
                 val_log[f"Val Retain/{tier_label} Accuracy"] = tier_metrics["acc_c2"]
@@ -988,6 +1035,11 @@ def main():
         print(f"Starting finetuning for {args.max_steps} steps...")
         effective_kl_lambda = args.kl_lambda if kl_enabled else 0.0
         print(f"Objective: L_ft = (1-{effective_kl_lambda})*L_priv + {effective_kl_lambda}*R_KL")
+        if args.train_keyed_without_permutation:
+            print(
+                "Training mode: keyed baseline control — private loss is in "
+                "home/C1 layout; the key only defines trainable weights."
+            )
         if args.keyed_l2_lambda > 0:
             print(
                 f"AdamW weight decay on keyed params only (public restored post-step): "
@@ -1044,6 +1096,7 @@ def main():
             keyed_param_masks=keyed_param_masks, keyed_mask_plan=keyed_mask_plan,
             is_distributed=is_distributed, prior_keys=prior_keys,
             active_swap_plan=active_swap_plan,
+            train_keyed_without_permutation=args.train_keyed_without_permutation,
         )
         scheduler.step()
         global_step += 1
@@ -1095,6 +1148,12 @@ def main():
                 "perf/cumulative_flops": flops_per_step * global_step,
                 "perf/cumulative_petaflops": (flops_per_step * global_step) / 1e15,
             }
+            if args.train_keyed_without_permutation:
+                log_dict.update({
+                    "Train/Private Loss (Keyed C1)": loss_priv,
+                    "Train/Perplexity (Keyed C1)": ppl,
+                    "Train/Accuracy (Keyed C1)": acc,
+                })
             log_dict.update(get_gpu_memory_stats(device))
             wandb.log(log_dict)
         

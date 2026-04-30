@@ -46,6 +46,7 @@ NUM_WORKERS=${NUM_WORKERS:-4}
 WANDB_PROJECT=${WANDB_PROJECT:-main-finetune}
 RUN_NAME=${RUN_NAME:-finetune_150m_fineweb2_spa_key${KEY_SIZE}pct${KEY_SUFFIX}_kl${KL_TAG}}
 RESUME_FROM=${RESUME_FROM:-}
+TRAIN_KEYED_WITHOUT_PERM=${TRAIN_KEYED_WITHOUT_PERM:-0}
 
 if [ ! -d "$BASE_CHECKPOINT" ]; then
     echo "Missing BASE_CHECKPOINT: $BASE_CHECKPOINT"
@@ -115,6 +116,9 @@ echo "  Output dir:     ${OUTPUT_DIR}"
 if [ -n "$RESUME_FROM" ]; then
     echo "  Resume from:    ${RESUME_FROM}"
 fi
+if [ "$TRAIN_KEYED_WITHOUT_PERM" = "1" ]; then
+    echo "  Mode:           keyed weights only, no permutation applied"
+fi
 echo "  GPUs:           ${NGPUS}"
 echo "  Context size:   ${CONTEXT_SIZE}"
 echo "  Tokens/step:    ${TOKENS_PER_STEP}"
@@ -128,6 +132,9 @@ LOG_FILE="logs/${RUN_NAME}_$(date +%Y%m%d_%H%M%S).log"
 EXTRA_ARGS=()
 if [ -n "$RESUME_FROM" ]; then
     EXTRA_ARGS+=(--resume_from "$RESUME_FROM")
+fi
+if [ "$TRAIN_KEYED_WITHOUT_PERM" = "1" ]; then
+    EXTRA_ARGS+=(--train_keyed_without_permutation)
 fi
 
 torchrun --standalone --nproc_per_node="$NGPUS" -m tiered.train.finetune.private_finetune \

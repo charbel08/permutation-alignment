@@ -667,6 +667,43 @@ class TestMaskedAccuracySemantics:
         # Non-masked positions are both correct -> expected token accuracy 1.0.
         assert acc == pytest.approx(1.0), "train_step accuracy must ignore -100 labels"
 
+    def test_train_step_keyed_without_permutation_does_not_apply_key(self, monkeypatch):
+        from tiered.train.finetune import private_finetune as pf
+
+        logits = _build_logits_for_masked_accuracy_case()
+        model = _DummyMetricModel(logits)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+        def fail_permutation(*_args, **_kwargs):
+            raise AssertionError("Permutation should not be applied in keyed-without-permutation mode")
+
+        monkeypatch.setattr(pf, "apply_permutation", fail_permutation)
+        monkeypatch.setattr(pf, "unapply_permutation", fail_permutation)
+        monkeypatch.setattr(pf, "swap_gradients", fail_permutation)
+        monkeypatch.setattr(pf, "mask_public_gradients", lambda *args, **kwargs: None)
+
+        input_ids = torch.tensor([[1, 2, 3, 4, 5]])
+        labels = torch.tensor([[1, 2, 3, -100, -100]])
+        private_batch = {"input_ids": input_ids, "labels": labels}
+
+        loss_priv, loss_kl, acc = pf.train_step(
+            model=model,
+            raw_model=model,
+            ref_model=None,
+            private_batch=private_batch,
+            public_batch=None,
+            key=object(),
+            optimizer=optimizer,
+            device=torch.device("cpu"),
+            kl_lambda=0.0,
+            max_grad_norm=1.0,
+            train_keyed_without_permutation=True,
+        )
+
+        assert loss_priv > 0
+        assert loss_kl == 0.0
+        assert acc == pytest.approx(1.0)
+
     def test_evaluate_accuracy_ignores_minus100_labels(self):
         from tiered.train.finetune.private_finetune import evaluate_on_dataset
 
@@ -690,6 +727,37 @@ class TestMaskedAccuracySemantics:
 
         assert metrics["acc_c1"] == pytest.approx(1.0), \
             "evaluate_on_dataset accuracy must ignore -100 labels"
+
+    def test_evaluate_keyed_without_permutation_does_not_apply_key(self, monkeypatch):
+        from tiered.train.finetune import private_finetune as pf
+
+        logits = _build_logits_for_masked_accuracy_case()
+        model = _DummyMetricModel(logits)
+
+        def fail_permutation(*_args, **_kwargs):
+            raise AssertionError("Permutation should not be applied for no-perm keyed eval")
+
+        monkeypatch.setattr(pf, "apply_permutation", fail_permutation)
+        monkeypatch.setattr(pf, "unapply_permutation", fail_permutation)
+
+        batch = {
+            "input_ids": torch.tensor([1, 2, 3, 4, 5]),
+            "labels": torch.tensor([1, 2, 3, -100, -100]),
+        }
+        dataloader = torch.utils.data.DataLoader([batch], batch_size=1)
+
+        metrics = pf.evaluate_on_dataset(
+            model=model,
+            dataloader=dataloader,
+            key=object(),
+            device=torch.device("cpu"),
+            num_steps=1,
+            eval_c2=True,
+            eval_keyed_without_permutation=True,
+        )
+
+        assert metrics["acc_c1"] == pytest.approx(1.0)
+        assert metrics["acc_c2"] == pytest.approx(1.0)
 
 
 class _TinyDataset(torch.utils.data.Dataset):
