@@ -451,6 +451,71 @@ def compute_weight_per_channel_l2_per_layer(model: GPTNeoForCausalLMTiered, mask
 
 
 @torch.no_grad()
+def compute_weight_per_channel_l2_random_baseline_per_layer(
+    model: GPTNeoForCausalLMTiered, mask_plan, seed: int = 42
+) -> Dict[str, dict]:
+    """Random-subset baseline for the per-channel L2 ratio heatmap.
+
+    For each (family, layer) cell, sample K random channels from the same pool,
+    where K = number of real keyed channels for that cell, and compute the
+    same `mean(per-channel L2 over selected) / mean(per-channel L2 over rest)`
+    ratio. If the leak heatmap reflects a real keyed-vs-non-keyed structure,
+    these baseline cells should hover around 1.0 with no spatial pattern.
+    """
+    rng = torch.Generator().manual_seed(seed)
+    out: Dict[str, dict] = {}
+
+    def _rand(n_total: int, k: int, device) -> torch.Tensor:
+        return torch.randperm(n_total, generator=rng)[:k].to(device)
+
+    all_attn_layers = set(mask_plan.keyed_attn_indices.keys()) | set(mask_plan.keyed_attn_out_indices.keys())
+    for layer_idx in sorted(all_attn_layers):
+        attn = _get_attention_module(model, layer_idx)
+        n_attn = attn.q_proj.weight.shape[0]
+        idx_rows = mask_plan.keyed_attn_indices.get(layer_idx)
+        idx_cols = _merge_idx(idx_rows, mask_plan.keyed_attn_out_indices.get(layer_idx))
+        tag = f"L{layer_idx:02d}"
+
+        if idx_rows is not None and idx_rows.numel() > 0:
+            random_rows = _rand(n_attn, idx_rows.numel(), idx_rows.device)
+            for short, proj in (("q", attn.q_proj), ("k", attn.k_proj), ("v", attn.v_proj)):
+                norms = proj.weight.detach().float().norm(dim=1)
+                out[f"{tag}_attn_{short}_weight_rows"] = _per_channel_l2_stats(norms, random_rows)
+
+        if idx_cols is not None and idx_cols.numel() > 0:
+            random_cols = _rand(n_attn, idx_cols.numel(), idx_cols.device)
+            norms = attn.out_proj.weight.detach().float().norm(dim=0)
+            out[f"{tag}_attn_out_weight_cols"] = _per_channel_l2_stats(norms, random_cols)
+
+    all_mlp_layers = (
+        set(mask_plan.keyed_mlp_indices.keys())
+        | set(mask_plan.keyed_mlp_up_indices.keys())
+        | set(mask_plan.keyed_mlp_down_indices.keys())
+    )
+    for layer_idx in sorted(all_mlp_layers):
+        mlp = _get_mlp_module(model, layer_idx)
+        n_mlp = mlp.c_fc.weight.shape[0]
+        idx_rows = _merge_idx(mask_plan.keyed_mlp_indices.get(layer_idx), mask_plan.keyed_mlp_up_indices.get(layer_idx))
+        idx_cols = _merge_idx(mask_plan.keyed_mlp_indices.get(layer_idx), mask_plan.keyed_mlp_down_indices.get(layer_idx))
+        tag = f"L{layer_idx:02d}"
+
+        if idx_rows is not None and idx_rows.numel() > 0:
+            random_rows = _rand(n_mlp, idx_rows.numel(), idx_rows.device)
+            norms = mlp.c_fc.weight.detach().float().norm(dim=1)
+            out[f"{tag}_mlp_fc_weight_rows"] = _per_channel_l2_stats(norms, random_rows)
+            if mlp.c_fc.bias is not None:
+                norms = mlp.c_fc.bias.detach().float().abs()
+                out[f"{tag}_mlp_fc_bias"] = _per_channel_l2_stats(norms, random_rows)
+
+        if idx_cols is not None and idx_cols.numel() > 0:
+            random_cols = _rand(n_mlp, idx_cols.numel(), idx_cols.device)
+            norms = mlp.c_proj.weight.detach().float().norm(dim=0)
+            out[f"{tag}_mlp_proj_weight_cols"] = _per_channel_l2_stats(norms, random_cols)
+
+    return out
+
+
+@torch.no_grad()
 def compute_activation_stats(
     model: GPTNeoForCausalLMTiered,
     mask_plan,
@@ -899,6 +964,7 @@ def save_plots(
     public_activation_stats: dict,
     per_layer_weight_stats: dict,
     per_layer_weight_l2_stats: dict,
+    per_layer_weight_l2_baseline_stats: dict,
     private_per_layer_activation_stats: dict,
     public_per_layer_activation_stats: dict,
     plot_dir: str,
@@ -940,6 +1006,18 @@ def save_plots(
         cbar_label="Keyed / Non-Keyed L2",
     )
     paths.append(p)
+
+    if per_layer_weight_l2_baseline_stats:
+        p = os.path.join(plot_dir, "weights_per_layer_ratio_heatmap_random_baseline.png")
+        _plot_per_layer_ratio_heatmap(
+            per_layer_weight_l2_baseline_stats,
+            "Per-Layer Weight L2 Ratio Heatmap (Random Baseline)",
+            weight_component_order,
+            p,
+            ratio_key="l2_ratio_key_over_non",
+            cbar_label="Random / Rest L2",
+        )
+        paths.append(p)
 
     if not weights_only:
         if private_per_layer_activation_stats:
@@ -1036,6 +1114,9 @@ def main() -> None:
     weight_stats = compute_weight_stats(model, mask_plan)
     per_layer_weight_stats = compute_weight_stats_per_layer(model, mask_plan)
     per_layer_weight_l2_stats = compute_weight_per_channel_l2_per_layer(model, mask_plan)
+    per_layer_weight_l2_baseline_stats = compute_weight_per_channel_l2_random_baseline_per_layer(
+        model, mask_plan, seed=args.seed
+    )
 
     private_activation_stats: dict = {}
     public_activation_stats: dict = {}
@@ -1104,6 +1185,7 @@ def main() -> None:
         "weight_stats": weight_stats,
         "per_layer_weight_stats": per_layer_weight_stats,
         "per_layer_weight_l2_stats": per_layer_weight_l2_stats,
+        "per_layer_weight_l2_baseline_stats": per_layer_weight_l2_baseline_stats,
     }
     if not args.weights_only:
         summary["activation_stats"] = {
@@ -1134,6 +1216,7 @@ def main() -> None:
         public_activation_stats,
         per_layer_weight_stats,
         per_layer_weight_l2_stats,
+        per_layer_weight_l2_baseline_stats,
         private_per_layer_activation_stats,
         public_per_layer_activation_stats,
         plot_dir,

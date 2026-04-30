@@ -228,15 +228,15 @@ def main():
     TEAL = "#008080"
     PURPLE = "#662E7D"
 
-    fig, ax = plt.subplots(figsize=(9, 6), dpi=300)
-    ax.axhline(base_loss, color="gray", lw=2.0, ls="--")
+    fig, ax = plt.subplots(figsize=(9, 7.5), dpi=600)
+    ax.axhline(base_loss, color="gray", lw=2.5, ls="--")
     # Label the baseline line in-figure so it doesn't clutter the legend.
     trans = mtransforms.blended_transform_factory(ax.transAxes, ax.transData)
     ax.annotate(
         f"Non-tiered baseline ({base_loss:.4f})",
         xy=(0.02, base_loss), xycoords=trans,
         xytext=(0, 6), textcoords="offset points",
-        fontsize=12, color="gray",
+        fontsize=14, color="gray",
         va="bottom", ha="left",
     )
     # Thin vertical connectors between the two curves at each f-value.
@@ -247,9 +247,10 @@ def main():
         ax.plot([x, x], [y1, y2], color="gray", lw=2.0, ls="--",
                 alpha=0.7, zorder=1)
 
-    ax.plot(xs, c1, "o-", color=TEAL, linewidth=3.0, markersize=8,
+    line_lw = (((2.65 * 1.25 * 1.15) * 1.10) * 1.15) * 1.15 * 0.90
+    ax.plot(xs, c1, "o-", color=TEAL, linewidth=line_lw, markersize=10,
             label=r"$\mathcal{C}_{\mathrm{pub}}$", zorder=3)
-    ax.plot(xs, c2, "s-", color=PURPLE, linewidth=3.0, markersize=8,
+    ax.plot(xs, c2, "s-", color=PURPLE, linewidth=line_lw, markersize=10,
             label=r"$\mathcal{C}_{K}$", zorder=3)
 
     # Label each connector at the top with $f=K$. A few Ks crowd the
@@ -266,18 +267,29 @@ def main():
         y_top = y1 if (y2 != y2) else max(y1, y2)
         placement = label_placements.get(K, default_placement)
         ax.annotate(rf"$f={K}$", (x, y_top), textcoords="offset points",
-                    fontsize=10, color="black", **placement)
-
-    axis_fs = 17
+                    fontsize=12, color="black", **placement)
 
     ax.set_xscale("log")
-    ax.set_xlabel("FLOPs % Increase vs Non-Tiered Baseline", fontsize=axis_fs)
-    ax.set_ylabel("Validation Loss", fontsize=axis_fs)
-    ax.tick_params(axis="both", labelsize=15)
-    ax.grid(which="major", axis="y", alpha=0.34, linewidth=1.2)
-    ax.grid(which="major", axis="x", alpha=0.20, linewidth=1.05)
-    ax.grid(which="minor", axis="x", alpha=0.10, linewidth=0.8)
-    ax.legend(ncol=2, fontsize=12, frameon=True, loc="best")
+    ax.set_xlabel("FLOPs % Increase vs Non-Tiered Baseline",
+                  fontsize=19.5 * 1.10, labelpad=8)
+    ax.set_ylabel("Validation Loss", fontsize=19.5 * 1.10, labelpad=8)
+
+    ax.tick_params(
+        axis="both", which="major",
+        labelsize=15.0 * 1.10,
+        length=(4.0 * 1.10) * 1.15,
+        width=(0.85 * 1.10) * 1.15,
+    )
+    ax.tick_params(axis="both", which="minor",
+                   length=(2.0 * 1.10) * 1.15, width=(0.5 * 1.10) * 1.15)
+
+    for side in ["top", "right"]:
+        ax.spines[side].set_visible(False)
+    for side in ["left", "bottom"]:
+        ax.spines[side].set_visible(True)
+        ax.spines[side].set_linewidth((0.95 * 1.10) * 1.15)
+
+    ax.legend(ncol=2, fontsize=17, frameon=True, loc="best")
     fig.tight_layout()
 
     png = Path(args.output_dir) / "c2k_pareto.png"

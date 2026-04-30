@@ -25,7 +25,7 @@ import re
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-import matplotlib.transforms as mtransforms  # noqa: F401 (kept for future baseline reuse)
+import matplotlib.transforms as mtransforms
 import wandb
 
 
@@ -52,6 +52,16 @@ def parse_args() -> argparse.Namespace:
                    help="Optional retain-set C1 metric; pass empty string to "
                         "disable the retain curves.")
     p.add_argument("--retain_c2_key", type=str, default="Val Retain/C2 Loss")
+    p.add_argument("--baseline_project", type=str, default="main-finetune",
+                   help="W&B project hosting the non-c2k finetune baseline.")
+    p.add_argument("--baseline_run", type=str,
+                   default="finetune_150m_fineweb2_spa_key5pct_kl0",
+                   help="Display name of the baseline finetune run; its last "
+                        "Val Private/C2 Loss is plotted as a dashed reference. "
+                        "Pass empty string to disable.")
+    p.add_argument("--baseline_run_id", type=str, default=None,
+                   help="Exact W&B run ID for the baseline (recommended when "
+                        "display names collide).")
     p.add_argument("--output_dir", type=str,
                    default="outputs/finetune_c2k_pareto")
     p.add_argument("--title", type=str, default="",
@@ -65,6 +75,27 @@ def _list_runs(api: wandb.Api, entity: str | None, project: str) -> list:
     runs = list(api.runs(path=path))
     print(f"  {len(runs)} runs loaded", flush=True)
     return runs
+
+
+def _find_run_by_name(api: wandb.Api, entity: str | None, project: str,
+                      name: str):
+    path = f"{entity}/{project}" if entity else project
+    runs = list(api.runs(path=path, filters={"display_name": name}))
+    if not runs:
+        raise RuntimeError(f"No run named {name!r} in {path}")
+    if len(runs) > 1:
+        print(f"  [warn] multiple runs named {name!r}; using newest")
+        runs.sort(key=lambda r: r.created_at, reverse=True)
+    return runs[0]
+
+
+def _find_run_by_id(api: wandb.Api, entity: str | None, project: str,
+                    run_id: str):
+    path = f"{entity}/{project}/{run_id}" if entity else f"{project}/{run_id}"
+    try:
+        return api.run(path)
+    except wandb.errors.CommError as exc:
+        raise RuntimeError(f"No run with id {run_id!r} at {path}") from exc
 
 
 def _find_run_for_k(all_runs: list, project_path: str,
@@ -125,6 +156,24 @@ def main() -> None:
     if excluded:
         print(f"Excluding Ks: {excluded}")
     ks = [k for k in args.ks if k not in args.exclude_ks]
+
+    baseline_c2 = float("nan")
+    if args.baseline_run or args.baseline_run_id:
+        print(f"Baseline: {args.baseline_run!r} in {args.baseline_project}")
+        if args.baseline_run_id:
+            base_run = _find_run_by_id(api, args.entity,
+                                       args.baseline_project,
+                                       args.baseline_run_id)
+            print(f"  using baseline_run_id={args.baseline_run_id} "
+                  f"(display_name={base_run.display_name!r})")
+        else:
+            base_run = _find_run_by_name(api, args.entity,
+                                         args.baseline_project,
+                                         args.baseline_run)
+            print(f"  using matched baseline run id={base_run.id}")
+        baseline_c2 = _last_n_mean(base_run, args.c2_key, args.last_n)
+        print(f"  {args.c2_key} (last {args.last_n} mean) = {baseline_c2:.4f}",
+              flush=True)
 
     all_runs = _list_runs(api, args.entity, args.project)
     project_path = f"{args.entity}/{args.project}" if args.entity else args.project
@@ -201,6 +250,18 @@ def main() -> None:
 
     fig, ax = plt.subplots(figsize=(9, 6), dpi=600)
 
+    if baseline_c2 == baseline_c2:  # not NaN
+        ax.axhline(baseline_c2, color="gray", lw=2.0, ls="--")
+        trans = mtransforms.blended_transform_factory(ax.transAxes,
+                                                      ax.transData)
+        ax.annotate(
+            rf"Targeted Finetune $\mathcal{{C}}_K$, $\beta=0$ ({baseline_c2:.4f})",
+            xy=(0.02, baseline_c2), xycoords=trans,
+            xytext=(0, 6), textcoords="offset points",
+            fontsize=12, color="gray",
+            va="bottom", ha="left",
+        )
+
     # Thin dashed connectors spanning every point at each f-value (all four
     # curves: Private C1/C2 + Retain C1/C2 when present).
     def _stack_ys(i):
@@ -265,8 +326,11 @@ def main() -> None:
     else:
         legend_handles = [h_k_priv, h_pub_priv]
     legend_labels = [h.get_label() for h in legend_handles]
+    # Place the legend in the whitespace band above the Public curves and
+    # below the C_K (Private) curve, anchored to the right edge.
     ax.legend(legend_handles, legend_labels, ncol=2, fontsize=12,
-              frameon=True, loc="best")
+              frameon=True, loc="center right",
+              bbox_to_anchor=(1.0, 0.35))
     fig.tight_layout()
 
     png = Path(args.output_dir) / "finetune_c2k_pareto.png"
