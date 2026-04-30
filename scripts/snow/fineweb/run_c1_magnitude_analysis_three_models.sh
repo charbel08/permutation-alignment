@@ -18,7 +18,7 @@ mkdir -p logs
 #
 # Models:
 #   c2k          : c2k Spanish finetune (k=20 by default; override with K_LABEL)
-#   pretrain     : tiered pretrain 5%-key
+#   finetune     : standard private finetune (5%-key, Spanish) on top of the tiered pretrain
 #   multi_stage  : final stage of multi-stage cumulative finetune (15% union)
 
 KEY_SIZE=${KEY_SIZE:-5}
@@ -32,9 +32,9 @@ K_LABEL=${K_LABEL:-resweep_a_k20}
 C2K_CHECKPOINT=${C2K_CHECKPOINT:-/work/scratch/checkpoints/fineweb/private_finetune_150m_fineweb2_spa_c2k_key${KEY_SIZE}pct_kl${KL_TAG}/${K_LABEL}/final}
 C2K_KEY=${C2K_KEY:-/work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct.json}
 
-# Tiered pretrain
-PRETRAIN_CHECKPOINT=${PRETRAIN_CHECKPOINT:-/work/scratch/checkpoints/fineweb/tiered_pretrain_150m_${KEY_SIZE}pct/final-checkpoint}
-PRETRAIN_KEY=${PRETRAIN_KEY:-/work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct.json}
+## Standard private finetune on top of tiered pretrain (Spanish, 5%-key)
+FT_CHECKPOINT=${FT_CHECKPOINT:-/work/scratch/checkpoints/fineweb/private_finetune_150m_fineweb2_spa_key${KEY_SIZE}pct_kl${KL_TAG}/final}
+FT_KEY=${FT_KEY:-/work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct.json}
 
 # Multi-stage cumulative finetune (random-key variant; last stage is C4 with 3 stages indexed 0..2)
 MS_TAG=${MS_TAG:-perconfig}
@@ -88,14 +88,14 @@ run_c2k() {
         "$C2K_KEY"
 }
 
-run_pretrain() {
-    local out_dir="${OUTPUT_ROOT}/pretrain_150m_${KEY_SIZE}pct"
+run_finetune() {
+    local out_dir="${OUTPUT_ROOT}/finetune_150m_${KEY_SIZE}pct_spa"
     mkdir -p "$out_dir"
-    run_analysis "pretrain_150m_${KEY_SIZE}pct" \
-        "$PRETRAIN_CHECKPOINT" \
-        "${out_dir}/analysis_pretrain_150m_${KEY_SIZE}pct_c1_magnitudes.json" \
+    run_analysis "finetune_150m_${KEY_SIZE}pct_spa" \
+        "$FT_CHECKPOINT" \
+        "${out_dir}/analysis_finetune_150m_${KEY_SIZE}pct_spa_c1_magnitudes.json" \
         "$out_dir" \
-        "$PRETRAIN_KEY"
+        "$FT_KEY"
 }
 
 run_multi_stage() {
@@ -111,21 +111,21 @@ run_multi_stage() {
 case "$TARGET" in
     all)
         run_c2k
-        run_pretrain
+        run_finetune
         run_multi_stage
         ;;
     c2k)
         run_c2k
         ;;
-    pretrain)
-        run_pretrain
+    finetune|ft)
+        run_finetune
         ;;
     multi_stage|ms)
         run_multi_stage
         ;;
     *)
         echo "Unsupported TARGET: ${TARGET}"
-        echo "Expected one of: all, c2k, pretrain, multi_stage"
+        echo "Expected one of: all, c2k, finetune, multi_stage"
         exit 1
         ;;
 esac

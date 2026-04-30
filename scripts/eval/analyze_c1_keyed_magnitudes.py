@@ -783,7 +783,6 @@ def _plot_per_layer_ratio_heatmap(
     ax.set_xticklabels(layer_tags, rotation=0)
     ax.set_yticks(range(len(ordered_components)))
     ax.set_yticklabels([_display_name(component) for component in ordered_components])
-    ax.set_title(title, fontsize=15, pad=12)
     ax.set_xlabel("Layer")
     ax.set_ylabel("Weight Family" if "Weight" in title else "Activation Family")
 
