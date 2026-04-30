@@ -1,0 +1,73 @@
+{
+  "checkpoint": "/work/scratch/checkpoints/fineweb/private_finetune_150m_fineweb2_spa_c2k_key5pct_kl0p1/resweep_a_k20/final",
+  "key_path": [
+    "/work/permutation-alignment/configs/keys/150m/both/key_5pct.json"
+  ],
+  "methods": {
+    "mlp_smallest": {
+      "n": 73728,
+      "k_true": 4438,
+      "accuracy": 0.9785970052083334,
+      "precision": 0.8222172149616944,
+      "recall": 0.8222172149616944,
+      "f1": 0.8222172149616945,
+      "auc": 0.9849586737325624,
+      "tp": 3649,
+      "fp": 789,
+      "fn": 789,
+      "tn": 68501
+    },
+    "attn_smallest": {
+      "n": 144,
+      "k_true": 10,
+      "accuracy": 0.9722222222222222,
+      "precision": 0.8,
+      "recall": 0.8,
+      "f1": 0.8000000000000002,
+      "auc": 0.9746268656716418,
+      "tp": 8,
+      "fp": 2,
+      "fn": 2,
+      "tn": 132
+    },
+    "mlp_largest": {
+      "n": 73728,
+      "k_true": 4438,
+      "accuracy": 0.8796115451388888,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "auc": 0.015041326267437618,
+      "tp": 0,
+      "fp": 4438,
+      "fn": 4438,
+      "tn": 64852
+    },
+    "attn_largest": {
+      "n": 144,
+      "k_true": 10,
+      "accuracy": 0.8611111111111112,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "auc": 0.025373134328358207,
+      "tp": 0,
+      "fp": 10,
+      "fn": 10,
+      "tn": 124
+    },
+    "combined_smallest": {
+      "n": 73872,
+      "k_true": 4448,
+      "accuracy": 0.9785575048732943,
+      "precision": 0.8219424460431655,
+      "recall": 0.8219424460431655,
+      "f1": 0.8219424460431656,
+      "auc": 0.9849557438127051,
+      "tp": 3656,
+      "fp": 792,
+      "fn": 792,
+      "tn": 68632
+    }
+  }
+}
