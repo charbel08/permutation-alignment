@@ -91,6 +91,21 @@ def main() -> None:
     else:
         print(f"No per_layer_weight_l2_baseline_stats in {args.input_json}")
 
+    if keyed_stats and baseline_stats:
+        out = os.path.join(args.plot_dir, "weights_per_layer_ratio_heatmap_combined.png")
+        amod._plot_per_layer_ratio_heatmap_pair(
+            keyed_stats,
+            baseline_stats,
+            "Real Key",
+            "Random Baseline",
+            WEIGHT_COMPONENT_ORDER,
+            out,
+            ratio_key="l2_ratio_key_over_non",
+            cbar_label="Selected / Rest L2",
+            family_label="Weight Family",
+        )
+        print(f"Wrote {out}")
+
 
 if __name__ == "__main__":
     main()

@@ -15,13 +15,14 @@ mkdir -p logs
 # Single training run (no stages). Per "round", the active tier walks
 # t = 1, 2, ..., N (smallest first), performing one optimizer step per
 # active tier. The step's loss is
-#   (1 - λ_pub - λ_cum) · mean_{c=t..N} L_priv(D_t @ C_c)
-#   + λ_pub · KL(public @ C_0)
-#   + λ_cum · KL(public @ C_{c*}), c* = step mod N (cycles 1..N)
-# where C_0 = home (public) and C_c = first c keys applied cumulatively.
-# The configs C_t..C_N are the ones that include tier t's permutations.
-# The cumulative KL term anchors retain at non-home configs (without it
-# they drift). Only the active tier's positions update each step.
+#   w_priv · mean_{c=t..N} L_priv(D_t  @ C_c)
+#   + w_pub · mean_{c=t..N} L_pub (x_pub @ C_c)
+#   + λ_kl  · KL(C_0' || student) on public @ C_0
+# where w_priv = max(0, 1 - λ_kl - w_pub), C_0 = home (public), and C_c =
+# first c keys applied cumulatively. The configs C_t..C_N are the ones
+# that include tier t's permutations. The public-CE term anchors retain
+# at non-home configs (without it they drift). Only the active tier's
+# positions update each step.
 # -----------------------------------------------------------------------------
 
 KEY_SIZE=${KEY_SIZE:-5}
@@ -29,13 +30,15 @@ KEY_SUFFIX=${KEY_SUFFIX:-}
 RUN_SUFFIX=${RUN_SUFFIX:-}
 EXPERIMENT_TAG=${EXPERIMENT_TAG:-roundrobin}
 KL_LAMBDA=${KL_LAMBDA:-0.1}
-# Cumulative-config KL: anchors retain at non-home configs by adding ONE
-# cycled cumulative-config KL term per step. Strongly recommended (without
-# it, val retain at C_1..C_N drifts as private training proceeds). Cost is
-# constant: ~+1 student fwd+bwd + 1 ref fwd per step regardless of N or t.
-CUMULATIVE_KL_LAMBDA=${CUMULATIVE_KL_LAMBDA:-0.1}
+# Public-CE at cumulative configs: mirrors the private term (mean over
+# C_t..C_N) but on public data. Anchors retain at non-home configs by
+# directly fitting public CE there. Strongly recommended (without it, val
+# retain at C_1..C_N drifts as private training proceeds). Cost: +1
+# student fwd+bwd PER per-config priv iteration (piggybacks the same
+# apply/unapply bracket as priv) — i.e. ~doubles per-config compute.
+PUB_CE_LAMBDA=${PUB_CE_LAMBDA:-0.1}
 KL_TAG=${KL_LAMBDA//./p}
-CKL_TAG=${CUMULATIVE_KL_LAMBDA//./p}
+PCE_TAG=${PUB_CE_LAMBDA//./p}
 TAG_SUFFIX=${EXPERIMENT_TAG:+_${EXPERIMENT_TAG}}
 
 PRETRAIN_CHECKPOINT=${PRETRAIN_CHECKPOINT:-/work/scratch/checkpoints/fineweb/tiered_pretrain_150m_${KEY_SIZE}pct_multi_cumulative${RUN_SUFFIX}/final-checkpoint}
@@ -45,7 +48,7 @@ PRIVATE_BASE=${PRIVATE_BASE:-/work/scratch/data/datasets/fineweb2_private}
 KEY_PATHS=${KEY_PATHS:-"/work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct${KEY_SUFFIX}_1.json /work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct${KEY_SUFFIX}_2.json /work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct${KEY_SUFFIX}_3.json"}
 LANGS=${LANGS:-"deu_Latn tur_Latn spa_Latn"}
 
-OUTPUT_ROOT=${OUTPUT_ROOT:-/work/scratch/checkpoints/fineweb/finetune_150m_fineweb2_round_robin${RUN_SUFFIX}${TAG_SUFFIX}_key${KEY_SIZE}pct_kl${KL_TAG}_ckl${CKL_TAG}}
+OUTPUT_ROOT=${OUTPUT_ROOT:-/work/scratch/checkpoints/fineweb/finetune_150m_fineweb2_round_robin${RUN_SUFFIX}${TAG_SUFFIX}_key${KEY_SIZE}pct_kl${KL_TAG}_pce${PCE_TAG}}
 
 NGPUS=${NGPUS:-8}
 BATCH_SIZE=${BATCH_SIZE:-8}
@@ -120,7 +123,7 @@ echo "  Keys:            ${KEY_PATHS}"
 echo "  Languages:       ${LANGS}"
 echo "  Output:          $OUTPUT_ROOT"
 echo "  KL λ (home):     $KL_LAMBDA"
-echo "  KL λ (cumul):    $CUMULATIVE_KL_LAMBDA"
+echo "  Pub-CE λ (cum):  $PUB_CE_LAMBDA"
 echo "  Max steps:       $MAX_STEPS  (round = ${NUM_TIERS} steps)"
 echo "  W&B project:     $WANDB_PROJECT"
 echo "=========================================================="
@@ -140,7 +143,7 @@ torchrun --standalone --nproc_per_node="$NGPUS" \
     --max_steps "$MAX_STEPS" \
     --warmup_steps "$WARMUP_STEPS" \
     --kl_lambda "$KL_LAMBDA" \
-    --cumulative_kl_lambda "$CUMULATIVE_KL_LAMBDA" \
+    --pub_ce_lambda "$PUB_CE_LAMBDA" \
     --keyed_l2_lambda "$KEYED_L2_LAMBDA" \
     --max_grad_norm 1.0 \
     --eval_interval "$EVAL_INTERVAL" \

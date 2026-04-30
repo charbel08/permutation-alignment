@@ -773,11 +773,11 @@ def _plot_per_layer_ratio_heatmap(
 
     fig, ax = plt.subplots(
         figsize=(max(10, len(layer_tags) * 0.7), max(4.5, len(ordered_components) * 0.7)),
-        facecolor="#f6f2e8",
+        facecolor="white",
     )
     norm = TwoSlopeNorm(vmin=min_ratio, vcenter=1.0, vmax=max_ratio)
     cmap = _HEATMAP_CMAP.copy()
-    cmap.set_bad("#f6f2e8")
+    cmap.set_bad("white")
     im = ax.imshow(matrix, aspect="auto", cmap=cmap, norm=norm)
 
     ax.set_xticks(range(len(layer_tags)))
@@ -807,6 +807,116 @@ def _plot_per_layer_ratio_heatmap(
     plt.savefig(out_path, dpi=300)
     pdf_path = os.path.splitext(out_path)[0] + ".pdf"
     plt.savefig(pdf_path, dpi=300)
+    plt.close()
+
+
+def _build_ratio_matrix(
+    stats: dict, component_order: list, ratio_key: str
+) -> tuple[np.ndarray, list[str], list[str]]:
+    layer_tags, ordered_components = _ordered_layered_components(stats, component_order)
+    matrix = np.full((len(ordered_components), len(layer_tags)), np.nan, dtype=float)
+    for row_idx, component in enumerate(ordered_components):
+        for col_idx, layer_tag in enumerate(layer_tags):
+            k = f"{layer_tag}_{component}"
+            if k in stats:
+                matrix[row_idx, col_idx] = float(stats[k][ratio_key])
+    return matrix, layer_tags, ordered_components
+
+
+def _plot_per_layer_ratio_heatmap_pair(
+    stats_left: dict,
+    stats_right: dict,
+    title_left: str,
+    title_right: str,
+    component_order: list,
+    out_path: str,
+    ratio_key: str = "l2_ratio_key_over_non",
+    cbar_label: str = "Keyed / Non-Keyed L2",
+    family_label: str = "Weight Family",
+) -> None:
+    """Two heatmaps side-by-side (1 row x 2 cols) sharing axes and colorbar.
+
+    Both panels use the same `(vmin, vcenter=1.0, vmax)` so cell colors are
+    directly comparable. Only one y-axis tick label, one x-label, one colorbar.
+    """
+    mat_l, layer_tags_l, comps_l = _build_ratio_matrix(stats_left, component_order, ratio_key)
+    mat_r, layer_tags_r, comps_r = _build_ratio_matrix(stats_right, component_order, ratio_key)
+    if not (layer_tags_l and comps_l and layer_tags_r and comps_r):
+        return
+
+    # Harmonize axes — use union of layers and components, keeping declared order.
+    layer_tags = sorted(set(layer_tags_l) | set(layer_tags_r))
+    comp_set = set(comps_l) | set(comps_r)
+    comps = [c for c in component_order if c in comp_set]
+
+    def _fill(stats):
+        m = np.full((len(comps), len(layer_tags)), np.nan, dtype=float)
+        for ri, c in enumerate(comps):
+            for ci, lt in enumerate(layer_tags):
+                k = f"{lt}_{c}"
+                if k in stats:
+                    m[ri, ci] = float(stats[k][ratio_key])
+        return m
+
+    mat_l = _fill(stats_left)
+    mat_r = _fill(stats_right)
+
+    finite_all = np.concatenate([mat_l[np.isfinite(mat_l)], mat_r[np.isfinite(mat_r)]])
+    if finite_all.size == 0:
+        return
+    min_ratio = float(np.min(finite_all))
+    max_ratio = float(np.max(finite_all))
+    if min_ratio == max_ratio:
+        pad = 0.05 if min_ratio == 1.0 else abs(min_ratio) * 0.05
+        min_ratio -= pad
+        max_ratio += pad
+    if min_ratio >= 1.0:
+        min_ratio = 1.0 - max(0.05, (max_ratio - 1.0) * 0.25)
+    if max_ratio <= 1.0:
+        max_ratio = 1.0 + max(0.05, (1.0 - min_ratio) * 0.25)
+
+    panel_w = max(0.75, len(layer_tags) * 0.75)
+    fig, axes = plt.subplots(
+        1, 2,
+        figsize=(panel_w * 2 + 1.6, max(5.5, len(comps) * 0.75)),
+        facecolor="white",
+        sharey=True,
+        gridspec_kw={"wspace": 0.05},
+    )
+    norm = TwoSlopeNorm(vmin=min_ratio, vcenter=1.0, vmax=max_ratio)
+    cmap = _HEATMAP_CMAP.copy()
+    cmap.set_bad("white")
+
+    for ax, mat, title in ((axes[0], mat_l, title_left), (axes[1], mat_r, title_right)):
+        im = ax.imshow(mat, aspect="auto", cmap=cmap, norm=norm)
+        ax.set_xticks(range(len(layer_tags)))
+        ax.set_xticklabels(layer_tags, rotation=0, fontsize=11)
+        ax.set_xlabel("Layer", fontsize=13)
+        ax.set_title(title, fontsize=16, pad=10)
+        for ri in range(len(comps)):
+            for ci in range(len(layer_tags)):
+                v = mat[ri, ci]
+                if not np.isfinite(v):
+                    ax.add_patch(Rectangle(
+                        (ci - 0.5, ri - 0.5), 1, 1,
+                        facecolor="none", edgecolor="#999999", hatch="///", linewidth=0.0,
+                    ))
+                    continue
+                r, g, b, _ = cmap(norm(v))
+                lum = 0.299 * r + 0.587 * g + 0.114 * b
+                txt_c = "white" if lum < 0.5 else "#111111"
+                ax.text(ci, ri, f"{v:.2f}", ha="center", va="center", fontsize=10, color=txt_c)
+
+    axes[0].set_yticks(range(len(comps)))
+    axes[0].set_yticklabels([_display_name(c) for c in comps], fontsize=11)
+    axes[0].set_ylabel(family_label, fontsize=13)
+
+    cbar = fig.colorbar(im, ax=axes, fraction=0.025, pad=0.02)
+    cbar.set_label(cbar_label, fontsize=13)
+    cbar.ax.tick_params(labelsize=11)
+
+    plt.savefig(out_path, dpi=300, bbox_inches="tight", pad_inches=0.05)
+    plt.savefig(os.path.splitext(out_path)[0] + ".pdf", dpi=300, bbox_inches="tight", pad_inches=0.05)
     plt.close()
 
 
@@ -1016,6 +1126,20 @@ def save_plots(
             p,
             ratio_key="l2_ratio_key_over_non",
             cbar_label="Random / Rest L2",
+        )
+        paths.append(p)
+
+        p = os.path.join(plot_dir, "weights_per_layer_ratio_heatmap_combined.png")
+        _plot_per_layer_ratio_heatmap_pair(
+            per_layer_weight_l2_stats,
+            per_layer_weight_l2_baseline_stats,
+            "Real Key",
+            "Random Baseline",
+            weight_component_order,
+            p,
+            ratio_key="l2_ratio_key_over_non",
+            cbar_label="Selected / Rest L2",
+            family_label="Weight Family",
         )
         paths.append(p)
 

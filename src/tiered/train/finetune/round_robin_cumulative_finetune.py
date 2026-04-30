@@ -6,34 +6,28 @@ C_1..C_N (C_0 = public/home arrangement). For each "round", the active
 tier walks t = 1, 2, ..., N, performing one optimizer step per active
 tier. The step's loss is
 
-    L = (1 - λ_pub - λ_cum) · (1/(N - t + 1)) · Σ_{c=t..N} L_priv(D_t @ C_c)
-        + λ_pub · KL(public @ C_0; C_0' || student)
-        + λ_cum · KL(public @ C_{c*}; C_0' || student)
+    L = w_priv · (1/(N - t + 1)) · Σ_{c=t..N} L_priv(D_t @ C_c)
+        + w_pub  · (1/(N - t + 1)) · Σ_{c=t..N} L_pub (x_pub @ C_c)
+        + λ_kl   · KL(public @ C_0; C_0' || student)
 
-where C_0' is the static cumulative pretrain checkpoint, used as the
-frozen KL reference for both KL terms, and c* = (global_step mod N)
-cycles through 1..N so that each cumulative config gets a public-KL
-anchor every N steps.
+where:
+    w_priv = max(0, 1 - λ_kl - w_pub)
+    C_0'   = the static cumulative pretrain checkpoint (frozen KL ref)
 
-The cumulative KL term costs +1 student fwd+bwd and +1 ref fwd per
-step (constant — independent of active tier). Without it (λ_cum=0,
-default), only the home arrangement is anchored, which lets the
-non-home configs drift on retain (observed empirically).
+The same private batch (D_t) and the same public batch are fed through
+every cumulative config from C_t up to C_N — every config that
+*includes* tier t's permutations. The public-CE term anchors retain
+quality at exactly those non-home configs; without it, those configs
+drift on retain as private training proceeds (observed empirically).
+The home KL term anchors C_0 separately.
 
-The same private batch (drawn from D_t) is fed through every cumulative
-config from C_t up to C_N — i.e. every config that *includes* tier t's
-permutations. Deeper configs (C_{t+1}, ..., C_N) anchor D_t to remain
-readable through any larger cumulative arrangement that contains tier t.
-Configs strictly below C_t are not relevant to D_t (they don't see tier
-t's permutations) and are skipped.
+Configs strictly below C_t are not relevant to D_t (they don't see
+tier t's permutations) and are skipped.
 
 Only the active tier's keyed weight positions receive gradient updates;
 everything else (public + the other tiers) is preserved through the
 optimizer step via `adamw_step_preserving_public`. Over a full round,
 every tier becomes active once, so all tiers' weights eventually update.
-
-The student starts from the cumulative pretrain checkpoint and the same
-checkpoint is the frozen reference for the public KL term.
 
 KL direction note: PyTorch's `F.kl_div(student_log, ref_probs)` computes
 KL(ref || student) — the standard mode-covering distillation direction.
@@ -118,14 +112,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--warmup_steps", type=int, default=100)
     p.add_argument("--kl_lambda", type=float, default=0.1,
                    help="Weight of the home (C_0) public-KL term.")
-    p.add_argument("--cumulative_kl_lambda", type=float, default=0.0,
-                   help="Weight of an additional public-KL term anchored at "
-                        "ONE cycled cumulative config c* = (step mod N) per "
-                        "step. Over N steps, every C_1..C_N is hit once. "
-                        "Adds ~1 extra student fwd+bwd and 1 ref fwd per "
-                        "step (constant cost). Set to 0 to disable. "
-                        "Private weight = max(0, 1 - kl_lambda - "
-                        "cumulative_kl_lambda) / n_configs.")
+    p.add_argument("--pub_ce_lambda", type=float, default=0.1,
+                   help="Total weight of the public-CE term, distributed as a "
+                        "mean over the active tier's (N - t + 1) cumulative "
+                        "configs C_t..C_N. Anchors retain quality at every "
+                        "non-home config that contains the active tier's "
+                        "permutations. Adds (N-t+1) student fwd+bwd per step "
+                        "(piggybacked on the priv loop's apply/unapply). "
+                        "Set to 0 to disable. Private weight = max(0, 1 - "
+                        "kl_lambda - pub_ce_lambda).")
     p.add_argument("--keyed_l2_lambda", type=float, default=0.0)
     p.add_argument("--max_grad_norm", type=float, default=1.0)
 
@@ -169,7 +164,7 @@ def _swap_gradients(model, tiers: list[TierKey], up_to_idx: int) -> None:
 def train_step(
     model,                              # DDP-wrapped if distributed
     raw_model,                          # unwrapped, for key ops
-    pretrain_ref,                       # frozen ref at C_0 for public KL
+    pretrain_ref,                       # frozen ref at C_0 for home KL
     tiers: list[TierKey],
     active_idx: int,                    # 0-based; the tier being updated
     private_batch: dict,                # batch from D_{active_idx+1}
@@ -179,18 +174,17 @@ def train_step(
     kl_lambda: float,
     max_grad_norm: float,
     active_update_mask: dict,
-    cumulative_kl_lambda: float = 0.0,
-    cumulative_kl_config_idx: Optional[int] = None,
+    pub_ce_lambda: float = 0.0,
 ):
     """Execute one optimizer step for a given active tier.
 
-    Returns (priv_losses, kl_pub_value, kl_cum_value, kl_cum_idx,
-    acc_at_active, grad_norm) where priv_losses has length
-    (N - active_idx) and is ordered C_{active_idx+1}..C_N.
-    acc_at_active is the accuracy at C_{active_idx+1} (the shallowest
-    config containing the active tier). kl_cum_value is the KL value
-    at the cycled cumulative config (NaN if disabled), kl_cum_idx is
-    that config's 0-based index (-1 if disabled).
+    Returns (priv_losses, kl_pub_value, pub_losses, acc_at_active,
+    grad_norm). priv_losses and pub_losses each have length
+    (N - active_idx) and are ordered C_{active_idx+1}..C_N. The c-th
+    entry of each list is the loss at config C_{active_idx+c+1}.
+    acc_at_active is the private accuracy at C_{active_idx+1} (the
+    shallowest config containing the active tier). pub_losses is an
+    empty list if pub_ce_lambda == 0.
     """
     raw_model.train()
     optimizer.zero_grad()
@@ -215,56 +209,28 @@ def train_step(
         loss_kl_value = loss_kl_pub.item()
         del loss_kl_pub
 
-    # -------- 1b. KL at one cycled cumulative config (NEW, optional) --------
-    # Anchors retain quality at non-home cumulative configs. Without it,
-    # only C_0 is anchored and C_1..C_N drift on retain as private
-    # training pushes the cumulative-config weights. With it: each step
-    # picks ONE cumulative config c* (cycled by the caller via
-    # cumulative_kl_config_idx = global_step mod N), permutes both
-    # student and ref to C_{c*+1}, and adds a KL term there.
+    # -------- 2. Per-config priv (+ optional pub-CE) at C_{active+1}..C_N --------
+    # Configs that include the active tier's permutations: C_t..C_N
+    # (apply_keys(up_to=c) for c in [active_idx, N-1]). Within a single
+    # apply/unapply bracket at C_{c+1} we run BOTH:
+    #   (a) priv forward+backward on D_t at this arrangement
+    #   (b) pub-CE forward+backward on x_pub at this arrangement (if enabled)
+    # Sharing the bracket avoids re-permuting the model for each loss term.
     n_tiers = len(tiers)
-    use_cum_kl = (cumulative_kl_lambda > 0
-                  and pretrain_ref is not None
-                  and pub_ids is not None
-                  and cumulative_kl_config_idx is not None
-                  and 0 <= cumulative_kl_config_idx < n_tiers)
-    loss_kl_cum_value = float("nan")
-    cum_c = -1
-    if use_cum_kl:
-        cum_c = cumulative_kl_config_idx
-        # Same bracketing as the priv loop: apply, swap accumulated grads
-        # into the permuted arrangement, backward, swap back, unapply.
-        _apply_keys(raw_model, tiers, cum_c)
-        _apply_keys(pretrain_ref, tiers, cum_c)
-        _swap_gradients(raw_model, tiers, cum_c)
-
-        with amp:
-            with torch.no_grad():
-                ref_probs = F.softmax(pretrain_ref(pub_ids).logits, dim=-1)
-            student_log = F.log_softmax(model(pub_ids).logits, dim=-1)
-            loss_kl_cum = F.kl_div(student_log, ref_probs, reduction="batchmean")
-        del ref_probs, student_log
-        (cumulative_kl_lambda * loss_kl_cum).backward()
-        loss_kl_cum_value = loss_kl_cum.item()
-        del loss_kl_cum
-
-        _swap_gradients(raw_model, tiers, cum_c)
-        _unapply_keys(raw_model, tiers, cum_c)
-        _unapply_keys(pretrain_ref, tiers, cum_c)
-
-    # -------- 2. Private loss at every config C_{active+1}..C_N --------
-    # Configs that include the active tier's permutations: C_t..C_N (in
-    # user labels), i.e. apply_keys(up_to=c) for c in [active_idx, N-1].
-    # Same private batch through every config so the comparison is
-    # like-for-like. Per-config weight = (1 - kl_lambda - cum_kl_lambda)
-    # / n_configs — i.e. the mean of l_t..l_N carries the residual budget.
     n_configs = n_tiers - active_idx
-    per_config_priv = max(0.0, 1.0 - kl_lambda - cumulative_kl_lambda) / n_configs
+    per_config_priv = max(0.0, 1.0 - kl_lambda - pub_ce_lambda) / n_configs
+    per_config_pub = pub_ce_lambda / n_configs
+    use_pub_ce = pub_ce_lambda > 0 and pub_ids is not None
     priv_losses: list[float] = []
+    pub_losses: list[float] = []
     acc_at_active = float("nan")
 
     priv_ids = private_batch["input_ids"].to(device)
     priv_labels = private_batch["labels"].to(device)
+    # The public CE term needs labels too (CE is supervised). For public
+    # data we treat input_ids as labels (standard LM CE on the public
+    # batch). Reuse the public batch already on device for the home KL.
+    pub_labels = pub_ids.clone() if use_pub_ce else None
 
     for c in range(active_idx, n_tiers):
         # Move student to C_{c+1}. Same bracketing as multi_stage: align
@@ -273,6 +239,7 @@ def train_step(
         _apply_keys(raw_model, tiers, c)
         _swap_gradients(raw_model, tiers, c)
 
+        # --- (a) Private loss ---
         with amp:
             out = model(priv_ids, labels=priv_labels)
             loss = out.loss
@@ -290,6 +257,15 @@ def train_step(
 
         del out, loss
 
+        # --- (b) Public CE (optional) ---
+        if use_pub_ce:
+            with amp:
+                pub_out = model(pub_ids, labels=pub_labels)
+                pub_loss = pub_out.loss
+            (per_config_pub * pub_loss).backward()
+            pub_losses.append(pub_loss.item())
+            del pub_out, pub_loss
+
         _swap_gradients(raw_model, tiers, c)
         _unapply_keys(raw_model, tiers, c)
 
@@ -301,7 +277,7 @@ def train_step(
     grad_norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), max_grad_norm)
     adamw_step_preserving_public(optimizer, active_update_mask)
 
-    return (priv_losses, loss_kl_value, loss_kl_cum_value, cum_c,
+    return (priv_losses, loss_kl_value, pub_losses,
             acc_at_active, grad_norm)
 
 
@@ -503,10 +479,10 @@ def train():
     if is_main:
         print(f"  Params: {num_params:,}  tokens/step: {tokens_per_step:,}  "
               f"max_steps: {args.max_steps}  (round = {n_tiers} steps)")
-        priv_w_total = max(0.0, 1.0 - args.kl_lambda - args.cumulative_kl_lambda)
-        print(f"  kl_lambda={args.kl_lambda}  cumulative_kl_lambda="
-              f"{args.cumulative_kl_lambda}  priv total weight={priv_w_total:.3f} "
-              f"(per-config = priv / (N - t + 1))")
+        priv_w_total = max(0.0, 1.0 - args.kl_lambda - args.pub_ce_lambda)
+        print(f"  kl_lambda={args.kl_lambda}  pub_ce_lambda="
+              f"{args.pub_ce_lambda}  priv total weight={priv_w_total:.3f} "
+              f"(per-config = priv / (N - t + 1); pub-CE same split)")
 
     pbar = tqdm(total=args.max_steps, desc="Round-robin") if is_main else None
 
@@ -576,9 +552,7 @@ def train():
             priv_batch = priv_cyclers[active_idx].next()
             pub_batch = pub_cycler.next() if pub_cycler is not None else None
 
-            cum_c_idx = (global_step % n_tiers
-                         if args.cumulative_kl_lambda > 0 else None)
-            (priv_losses, kl_pub_value, kl_cum_value, kl_cum_idx,
+            (priv_losses, kl_pub_value, pub_losses,
              acc_at_active, grad_norm) = train_step(
                 model=model, raw_model=raw_model,
                 pretrain_ref=pretrain_ref, tiers=tiers,
@@ -586,8 +560,7 @@ def train():
                 private_batch=priv_batch, public_batch=pub_batch,
                 optimizer=optimizer, device=device,
                 kl_lambda=args.kl_lambda,
-                cumulative_kl_lambda=args.cumulative_kl_lambda,
-                cumulative_kl_config_idx=cum_c_idx,
+                pub_ce_lambda=args.pub_ce_lambda,
                 max_grad_norm=args.max_grad_norm,
                 active_update_mask=active_update_masks[active_idx],
             )
@@ -613,12 +586,14 @@ def train():
                     "KL_pub": f"{kl_pub_value:.3f}" if kl_pub_value == kl_pub_value else "nan",
                 })
 
+            mean_pub = sum(pub_losses) / len(pub_losses) if pub_losses else float("nan")
+
             if is_main and global_step % args.log_interval == 0:
                 kl_term = args.kl_lambda * (kl_pub_value if kl_pub_value == kl_pub_value else 0.0)
-                kl_cum_term = (args.cumulative_kl_lambda * kl_cum_value
-                               if kl_cum_value == kl_cum_value else 0.0)
-                priv_w = max(0.0, 1.0 - args.kl_lambda - args.cumulative_kl_lambda)
-                total = priv_w * mean_priv + kl_term + kl_cum_term
+                pub_term = (args.pub_ce_lambda * mean_pub
+                            if mean_pub == mean_pub else 0.0)
+                priv_w = max(0.0, 1.0 - args.kl_lambda - args.pub_ce_lambda)
+                total = priv_w * mean_priv + kl_term + pub_term
                 lr = optimizer.param_groups[0]["lr"]
                 log_dict = {
                     "Train/Total Loss": total,
@@ -640,9 +615,11 @@ def train():
                 for c, v in enumerate(priv_losses):
                     cfg_id = active_idx + c + 1  # priv_losses[c] is at C_{active+c+1}
                     log_dict[f"Train/Private ({active_label} active) at C{cfg_id}"] = v
-                if kl_cum_idx >= 0:
-                    log_dict["Train/Cumulative KL Value"] = kl_cum_value
-                    log_dict[f"Train/Cumulative KL at C{kl_cum_idx + 1}"] = kl_cum_value
+                if pub_losses:
+                    log_dict[f"Train/Public CE Mean ({active_label} active)"] = mean_pub
+                    for c, v in enumerate(pub_losses):
+                        cfg_id = active_idx + c + 1
+                        log_dict[f"Train/Public CE ({active_label} active) at C{cfg_id}"] = v
                 wandb.log(log_dict)
 
             if global_step % args.eval_interval == 0:
