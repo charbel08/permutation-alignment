@@ -28,8 +28,8 @@ TARGET=${TARGET:-all}
 OUTPUT_ROOT=${OUTPUT_ROOT:-/work/permutation-alignment/outputs/c1_magnitude_three_models}
 
 # c2k
-K_LABEL=${K_LABEL:-k20}
-C2K_CHECKPOINT=${C2K_CHECKPOINT:-/work/scratch/checkpoints/fineweb/private_finetune_150m_fineweb2_spa_c2k_key${KEY_SIZE}pct_kl${KL_TAG}/${K_LABEL}/final}
+K_LABEL=${K_LABEL:-resweep_a_k20}
+C2K_CHECKPOINT=${C2K_CHECKPOINT:-/work/scratch/checkpoints/fineweb/private_finetune_150m_fineweb2_spa_c2k_key${KEY_SIZE}pct_kl${KL_TAG}/${K_LABEL}}
 C2K_KEY=${C2K_KEY:-/work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct.json}
 
 # Tiered pretrain
