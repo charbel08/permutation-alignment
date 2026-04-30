@@ -9,7 +9,17 @@ Tier t (active_idx=t) is the only tier updated this stage. The loss is
           +  λ_anchor · Σ_{s<t}  KL(C_{s+2}, tier_s_data;
                                     stage_s_ref || student)
 
-where N = number of tiers and α = 1 - λ_pub - t · λ_anchor.
+where N = number of tiers and α = 1 - λ_pub (constant across stages).
+
+L_priv weight is fixed at (1 - λ_pub) at every stage. The non-priv mass
+(= λ_pub) is then split between the public KL and the active_idx anchor
+KLs in proportion to their user-specified relative weights:
+
+    share_factor = λ_pub / (λ_pub + active_idx * λ_anchor)
+    public-KL effective weight  = λ_pub  * share_factor   (sum across configs)
+    each-anchor effective weight = λ_anchor * share_factor
+
+so the total loss weight always sums to 1.0 regardless of stage.
 
 The public KL is now evaluated at EVERY cumulative config (C1..C_{N+1}),
 not just C1, so off-tier positions are anchored to remain English-friendly
@@ -202,11 +212,20 @@ def train_step(
     # twice per KL term (once for the ref softmax, once for the student
     # log_softmax). We `del` and backward each term before starting the next
     # forward so peak memory matches the single-term version.
+    # Renormalize the non-priv budget so total loss weight stays at 1.0.
+    # Budget M = (1 - priv_scale) = kl_lambda, split between public KL and the
+    # active_idx anchors using their user-specified relative weights:
+    #   public KL   gets   M * kl_lambda    / (kl_lambda + active_idx * anchor_kl_lambda)
+    #   each anchor gets   M * anchor_kl_lambda / (...)
+    # At active_idx=0 (no anchors) this reduces to kl_lambda for public KL.
+    _denom = kl_lambda + active_idx * anchor_kl_lambda
+    share_factor = (kl_lambda / _denom) if _denom > 0 else 0.0
+
     use_pub_kl = kl_lambda > 0 and public_batch is not None and pretrain_ref is not None
     loss_kl_pub_values: list[float] = []
     if use_pub_kl:
         n_pub_terms = len(tiers) + 1
-        per_term_pub = kl_lambda / n_pub_terms
+        per_term_pub = (kl_lambda * share_factor) / n_pub_terms
         pub_ids = public_batch["input_ids"].to(device)
 
         for j in range(-1, len(tiers)):
@@ -255,7 +274,7 @@ def train_step(
             student_log = F.log_softmax(model(anchor_ids).logits, dim=-1)
             loss_anchor = F.kl_div(student_log, ref_probs, reduction="batchmean")
         del ref_probs, student_log
-        (anchor_kl_lambda * loss_anchor).backward()
+        (anchor_kl_lambda * share_factor * loss_anchor).backward()
         anchor_loss_values.append(loss_anchor.item())
         del loss_anchor
 
@@ -276,7 +295,7 @@ def train_step(
     with amp:
         priv_out = model(priv_ids, labels=priv_labels)
         loss_priv = priv_out.loss
-    priv_scale = max(0.0, 1.0 - kl_lambda - active_idx * anchor_kl_lambda)
+    priv_scale = max(0.0, 1.0 - kl_lambda)
     (priv_scale * loss_priv).backward()
     loss_priv_value = loss_priv.item()
 
@@ -527,7 +546,7 @@ def train():
         print(f"  Params: {num_params:,}  tokens/step: {tokens_per_step:,}  "
               f"max_steps: {args.max_steps}")
         print(f"  kl_lambda={args.kl_lambda}  anchor_kl_lambda={args.anchor_kl_lambda}  "
-              f"priv_scale={max(0.0, 1.0 - args.kl_lambda - args.active_idx * args.anchor_kl_lambda):.4f}")
+              f"priv_scale={max(0.0, 1.0 - args.kl_lambda):.4f}")
 
     pbar = tqdm(total=args.max_steps, desc=f"Stage {args.active_idx}") if is_main else None
 
@@ -627,10 +646,12 @@ def train():
 
         if is_main and global_step % args.log_interval == 0:
             n_pub = len(pub_losses) if pub_losses else 1
-            per_term_pub = args.kl_lambda / n_pub
-            total = (max(0.0, 1.0 - args.kl_lambda - args.active_idx * args.anchor_kl_lambda) * loss_priv
+            _denom = args.kl_lambda + args.active_idx * args.anchor_kl_lambda
+            _share = (args.kl_lambda / _denom) if _denom > 0 else 0.0
+            per_term_pub = (args.kl_lambda * _share) / n_pub
+            total = (max(0.0, 1.0 - args.kl_lambda) * loss_priv
                      + per_term_pub * sum(pub_losses)
-                     + args.anchor_kl_lambda * sum(
+                     + args.anchor_kl_lambda * _share * sum(
                          v for v in anchor_losses if v == v))
             lr = optimizer.param_groups[0]["lr"]
             log_dict = {

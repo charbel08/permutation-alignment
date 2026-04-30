@@ -13,9 +13,12 @@ mkdir -p logs
 # Multi-stage cumulative private finetune.
 #
 # One stage per tier, run sequentially. Stage t's loss is:
-#   (1 - λ_pub - t·λ_anchor)·L_priv(tier_t @ C_{t+1})
-#   + λ_pub · KL(public @ C1; student || pretrain_ref)
-#   + Σ_{s<t} λ_anchor · KL(tier_s_data @ C_{s+1}; student || stage_s_ref)
+#   (1 - λ_pub)·L_priv(tier_t @ C_{t+1})
+#   + λ_pub · share_factor · KL(public; ...)
+#   + Σ_{s<t} λ_anchor · share_factor · KL(tier_s_data; ...)
+# where share_factor = λ_pub / (λ_pub + t·λ_anchor). L_priv stays at
+# (1 - λ_pub) and total loss weight always sums to 1.0; non-priv mass is
+# split between public KL and anchors per their relative weights.
 # Only tier t's weight positions receive updates.
 #
 # Stage inputs/outputs:
