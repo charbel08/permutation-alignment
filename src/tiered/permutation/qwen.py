@@ -314,6 +314,48 @@ def count_qwen_keyed_params(arch: QwenArch, key: PermutationKey) -> dict:
     }
 
 
+def _qwen_swap_param_sizes(arch: QwenArch) -> tuple[int, int]:
+    """Return (params_per_attention_swap, params_per_mlp_swap)."""
+
+    rows_per_q_group = arch.q_group_size * arch.head_dim
+    params_per_attn_slot = (
+        arch.hidden_size * rows_per_q_group
+        + arch.hidden_size * arch.head_dim
+        + arch.hidden_size * arch.head_dim
+        + arch.hidden_size * rows_per_q_group
+    )
+    params_per_mlp_slot = 3 * arch.hidden_size
+    return 2 * params_per_attn_slot, 2 * params_per_mlp_slot
+
+
+def _allocate_qwen_swap_counts(
+    arch: QwenArch,
+    target_pct: float,
+    attn_ratio: float,
+) -> tuple[int, int]:
+    """Allocate Qwen swap counts under the GPT-style attention/MLP split.
+
+    The nominal split is `attn_ratio` attention and `1-attn_ratio` MLP.  At
+    small percentages, one Qwen GQA attention swap can be too coarse to fit
+    into the attention budget, so that budget is assigned to MLP swaps instead.
+    """
+
+    swappable = count_qwen_swappable_params(arch)
+    params_per_attn_swap, params_per_mlp_swap = _qwen_swap_param_sizes(arch)
+
+    target_total = int(swappable["total"] * target_pct)
+    target_attn = int(target_total * attn_ratio)
+
+    attn_swaps = target_attn // params_per_attn_swap
+    if attn_swaps == 0 and target_attn > 0:
+        target_mlp = target_total
+    else:
+        target_mlp = target_total - target_attn
+
+    mlp_swaps = target_mlp // params_per_mlp_swap
+    return attn_swaps, mlp_swaps
+
+
 def generate_qwen_key(
     arch: QwenArch,
     target_pct: float,
@@ -332,23 +374,7 @@ def generate_qwen_key(
         raise ValueError(f"attn_ratio must be in [0, 1], got {attn_ratio}")
 
     rng = random.Random(seed)
-
-    rows_per_q_group = arch.q_group_size * arch.head_dim
-    params_per_attn_slot = (
-        arch.hidden_size * rows_per_q_group
-        + arch.hidden_size * arch.head_dim
-        + arch.hidden_size * arch.head_dim
-        + arch.hidden_size * rows_per_q_group
-    )
-    params_per_mlp_slot = 3 * arch.hidden_size
-
-    swappable = count_qwen_swappable_params(arch)
-    target_total = int(swappable["total"] * target_pct)
-    target_attn = int(target_total * attn_ratio)
-    target_mlp = target_total - target_attn
-
-    attn_swaps = target_attn // (2 * params_per_attn_slot)
-    mlp_swaps = target_mlp // (2 * params_per_mlp_slot)
+    attn_swaps, mlp_swaps = _allocate_qwen_swap_counts(arch, target_pct, attn_ratio)
 
     head_pool = [(l, h) for l in range(arch.num_layers) for h in range(arch.num_key_value_heads)]
     col_pool = [(l, c) for l in range(arch.num_layers) for c in range(arch.intermediate_size)]

@@ -13,18 +13,18 @@ import numpy as np
 import pandas as pd
 from matplotlib.ticker import FuncFormatter, MaxNLocator
 
-CSV = Path("outputs/pretrain_comp/wandb_export_2026-04-29T15_11_16.578-04_00.csv")
+CSV = Path("outputs/pretrain_comp/new.csv")
 OUT_DIR = Path("outputs/pretrain_comp")
 
 PURPLE = "#662E7D"
 TEAL = "#008080"
 
-STEP_COL = "train/step"
+STEP_COL = "Step"
 SERIES = [
     (r"TLM $\mathcal{C}_{\mathrm{K}}$ (5% Key Size)",
-        "pretrain_150m_fineweb_5pct - val/loss_c1", TEAL),
-    ("Non-TLM baseline",
-        "baseline_pretrain_150m_fineweb - val/loss_c1", PURPLE),
+        "pretrain_150m_fineweb_5pct - val/loss_c2", PURPLE),
+    ("Non-TLM Baseline",
+        "baseline_pretrain_150m_fineweb - val/loss_c1", TEAL),
 ]
 
 
@@ -49,7 +49,7 @@ def main() -> None:
                 solid_capstyle="butt", label=label, zorder=4)
 
     ax.set_xlabel("Step", fontsize=19.5 * 1.10, labelpad=8)
-    ax.set_ylabel(r"$\mathcal{C}_{\mathrm{pub}}$ Validation Loss",
+    ax.set_ylabel("Public Data Validation Loss",
                   fontsize=19.5 * 1.10, labelpad=8)
 
     ax.tick_params(
@@ -67,12 +67,12 @@ def main() -> None:
         ax.spines[side].set_visible(True)
         ax.spines[side].set_linewidth((0.95 * 1.10) * 1.15)
 
-    ax.set_xlim(34000, 40000)
-    ax.set_xticks([34000, 35000, 36000, 37000, 38000, 39000, 40000])
+    ax.set_xlim(35000, 40000)
+    ax.set_xticks([35000, 36000, 37000, 38000, 39000, 40000])
     ax.yaxis.set_major_locator(MaxNLocator(nbins=6))
     ax.xaxis.set_major_formatter(FuncFormatter(kfmt))
 
-    mask = (df[STEP_COL] >= 34000) & (df[STEP_COL] <= 40000)
+    mask = (df[STEP_COL] >= 35000) & (df[STEP_COL] <= 40000)
     visible = []
     for _, col, _ in SERIES:
         visible.extend(df.loc[mask, col].dropna().tolist())
@@ -89,19 +89,19 @@ def main() -> None:
     # drop dashed verticals and a double-headed connector.
     b = df[[STEP_COL, SERIES[1][1]]].dropna().to_numpy()
     k = df[[STEP_COL, SERIES[0][1]]].dropna().to_numpy()
-    x_baseline = 35000.0
+    x_baseline = 36000.0
     y_match = float(np.interp(x_baseline, b[:, 0], b[:, 1]))
     x_key = float(np.interp(y_match, k[::-1, 1], k[::-1, 0]))
 
     y_lo = ax.get_ylim()[0]
     ax.plot([x_baseline, x_baseline], [y_lo, y_match],
-            color=PURPLE, linestyle=(0, (5, 3)), linewidth=4.5, zorder=2)
-    ax.plot([x_key, x_key], [y_lo, y_match],
             color=TEAL, linestyle=(0, (5, 3)), linewidth=4.5, zorder=2)
-    ax.plot(x_baseline, y_match, "o", color=PURPLE,
+    ax.plot([x_key, x_key], [y_lo, y_match],
+            color=PURPLE, linestyle=(0, (5, 3)), linewidth=4.5, zorder=2)
+    ax.plot(x_baseline, y_match, "o", color=TEAL,
             markersize=14, markeredgecolor="white", markeredgewidth=2.8,
             zorder=5)
-    ax.plot(x_key, y_match, "o", color=TEAL,
+    ax.plot(x_key, y_match, "o", color=PURPLE,
             markersize=14, markeredgecolor="white", markeredgewidth=2.8,
             zorder=5)
     ax.annotate(

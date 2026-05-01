@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""MMLU + MATH500 key-destruction ablation for Qwen models (no training).
+"""MMLU key-destruction ablation for Qwen models (no training).
 
-Evaluates a pretrained Qwen/Llama-style CausalLM on MMLU and MATH500 after
-applying permutation keys of increasing size. Measures how fast performance
-collapses as the fraction of scrambled parameters grows.
+Evaluates a pretrained Qwen/Llama-style CausalLM on MMLU after applying
+permutation keys of increasing size. Measures how fast performance collapses
+as the fraction of scrambled parameters grows. MATH500 remains available as an
+optional additional benchmark.
 
 KEY DESIGN: All key sizes use the SAME random pool shuffle.  Any smaller key
 is a strict prefix of any larger key. This ensures the destruction curve is
@@ -53,6 +54,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from tiered.permutation.key import PermutationKey
 from tiered.permutation.qwen import (
     QwenArch,
+    _allocate_qwen_swap_counts,
     _make_cross_layer_swaps,
     apply_qwen_permutation,
     count_qwen_keyed_params,
@@ -114,39 +116,30 @@ def generate_nested_keys(
 
     rng = random.Random(seed)
 
-    rows_per_q_group = arch.q_group_size * arch.head_dim
-    params_per_attn_slot = (
-        arch.hidden_size * rows_per_q_group
-        + arch.hidden_size * arch.head_dim
-        + arch.hidden_size * arch.head_dim
-        + arch.hidden_size * rows_per_q_group
-    )
-    params_per_mlp_slot = 3 * arch.hidden_size
-
-    swappable = count_qwen_swappable_params(arch)
-
     head_pool = [(l, h) for l in range(arch.num_layers) for h in range(arch.num_key_value_heads)]
     col_pool = [(l, c) for l in range(arch.num_layers) for c in range(arch.intermediate_size)]
     rng.shuffle(head_pool)
     rng.shuffle(col_pool)
 
-    max_pct = max(key_pcts)
-    max_target = int(swappable["total"] * max_pct)
-    max_attn_target = int(max_target * attn_ratio)
-    max_mlp_target = max_target - max_attn_target
-    max_attn_swaps = max_attn_target // (2 * params_per_attn_slot)
-    max_mlp_swaps = max_mlp_target // (2 * params_per_mlp_slot)
+    raw_counts = [
+        _allocate_qwen_swap_counts(arch, pct, attn_ratio)
+        for pct in key_pcts
+    ]
+    counts = []
+    max_attn_swaps = 0
+    max_mlp_swaps = 0
+    for n_attn, n_mlp in raw_counts:
+        max_attn_swaps = max(max_attn_swaps, n_attn)
+        max_mlp_swaps = max(max_mlp_swaps, n_mlp)
+        counts.append((max_attn_swaps, max_mlp_swaps))
 
     all_attn_swaps = _make_cross_layer_swaps(head_pool, max_attn_swaps)
     all_mlp_swaps = _make_cross_layer_swaps(col_pool, max_mlp_swaps)
 
     keys = []
-    for pct in key_pcts:
-        target = int(swappable["total"] * pct)
-        attn_target = int(target * attn_ratio)
-        mlp_target = target - attn_target
-        n_attn = min(attn_target // (2 * params_per_attn_slot), len(all_attn_swaps))
-        n_mlp = min(mlp_target // (2 * params_per_mlp_slot), len(all_mlp_swaps))
+    for n_attn, n_mlp in counts:
+        n_attn = min(n_attn, len(all_attn_swaps))
+        n_mlp = min(n_mlp, len(all_mlp_swaps))
         keys.append(PermutationKey(
             attn_heads=all_attn_swaps[:n_attn],
             mlp_cols=all_mlp_swaps[:n_mlp],
@@ -762,7 +755,7 @@ def log_wandb_row(row: dict) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Qwen MMLU + MATH500 key-destruction ablation (multi-GPU capable)",
+        description="Qwen MMLU key-destruction ablation (multi-GPU capable)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--model_id", type=str, default="Qwen/Qwen3-8B")
@@ -785,8 +778,8 @@ def parse_args() -> argparse.Namespace:
     key_group.add_argument(
         "--max_pct",
         type=float,
-        default=0.10,
-        help="Maximum key coverage fraction (default: 0.10 = 10%%)",
+        default=0.20,
+        help="Maximum key coverage fraction (default: 0.20 = 20%%)",
     )
     key_group.add_argument(
         "--step_pct",
@@ -806,8 +799,10 @@ def parse_args() -> argparse.Namespace:
                             help="MMLU dataset name")
 
     math_group = p.add_argument_group("MATH500 evaluation")
-    math_group.add_argument("--disable_math500", action="store_true",
-                            help="Skip MATH500 evaluation")
+    math_group.add_argument("--disable_math500", action="store_true", default=True,
+                            help="Skip MATH500 evaluation (default)")
+    math_group.add_argument("--enable_math500", action="store_false", dest="disable_math500",
+                            help="Run optional MATH500 evaluation")
     math_group.add_argument("--math500_dataset_name", type=str, default=MATH500_DEFAULT_DATASET)
     math_group.add_argument("--math500_split", type=str, default="test")
     math_group.add_argument("--max_math500_examples", type=int, default=-1,

@@ -11,6 +11,8 @@ qwen2_model_mod = pytest.importorskip("transformers.models.qwen2.modeling_qwen2"
 
 from tiered.permutation.key import PermutationKey
 from tiered.permutation.qwen import (
+    _allocate_qwen_swap_counts,
+    _qwen_swap_param_sizes,
     apply_qwen_permutation,
     count_qwen_keyed_params,
     count_qwen_swappable_params,
@@ -83,6 +85,27 @@ def test_qwen_generate_key_counts_and_bounds():
     assert keyed["total"] <= swappable["total"]
     assert keyed["attention"] >= 0
     assert keyed["mlp"] >= 0
+
+
+def test_qwen_small_budget_uses_mlp_until_attention_swap_fits():
+    model = create_qwen_model()
+    arch = get_qwen_arch(model)
+    swappable = count_qwen_swappable_params(arch)
+    params_per_attn_swap, params_per_mlp_swap = _qwen_swap_param_sizes(arch)
+
+    # At 10% on this tiny GQA fixture, the 25% attention budget is smaller
+    # than one attention swap, so the whole target budget should go to MLP.
+    target_pct = 0.10
+    target_total = int(swappable["total"] * target_pct)
+    assert int(target_total * 0.25) < params_per_attn_swap
+
+    n_attn, n_mlp = _allocate_qwen_swap_counts(arch, target_pct, attn_ratio=0.25)
+    assert n_attn == 0
+    assert n_mlp == target_total // params_per_mlp_swap
+
+    key = generate_qwen_key(arch, target_pct=target_pct, attn_ratio=0.25, seed=7)
+    assert len(key.attn_heads) == 0
+    assert len(key.mlp_cols) == n_mlp
 
 
 def test_qwen_permutation_changes_weights():

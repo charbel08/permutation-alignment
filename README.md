@@ -81,8 +81,8 @@ PYTHONPATH=./src pytest ./src/tiered/tests -sv
 │   │   ├── analyze_c1_unified_dual_models.py
 │   │   ├── inspect_baseline_memo.py
 │   │   ├── qualitative_fineweb2_spa_c1_c2.py
-│   │   ├── qwen_key_destruction_ablation.py  # Qwen key-destruction ablation on MMLU + MATH500
-│   │   └── run_qwen_key_destruction_5pct.sh # 0.5% steps up to 10% (MMLU + MATH500)
+│   │   ├── qwen_key_destruction_ablation.py  # Qwen key-destruction ablation on MMLU
+│   │   └── run_qwen_key_destruction_5pct.sh # 0.5% steps up to 20% (MMLU)
 │   ├── ablation/
 │   │   ├── ablation_random_key.py     # Ablation 1: random key experiment
 │   │   ├── ablation_corrupt_keyed.py  # Ablation 2: corrupt keyed weights
@@ -428,9 +428,9 @@ Memorization is logged on both `train_people` and `test_people` throughout train
 
 All ablations produce charts (loss and top-k accuracy), log to WandB, and save JSON results.
 
-### Qwen Key-Destruction Ablation (MMLU + MATH500)
+### Qwen Key-Destruction Ablation (MMLU)
 
-Runs MMLU and MATH500 evaluation while increasing key coverage in 0.5% increments up to 10%:
+Runs MMLU evaluation while increasing key coverage in 0.5% increments up to 20%:
 
 ```bash
 bash scripts/eval/run_qwen_key_destruction_5pct.sh
