@@ -23,13 +23,13 @@ KEY_PATH=${KEY_PATH:-/work/permutation-alignment/configs/keys/150m/both/key_5pct
 BASE_CHECKPOINT=${BASE_CHECKPOINT:-/work/scratch/checkpoints/fineweb/baseline_pretrain_150m/final-checkpoint}
 PRIVATE_DATA=${PRIVATE_DATA:-/work/scratch/data/datasets/fineweb2_private/spa_Latn/retain}
 PUBLIC_DATA=${PUBLIC_DATA:-/work/scratch/data/datasets/fineweb/retain}
-OUTPUT_DIR=${OUTPUT_DIR:-/work/scratch/checkpoints/fineweb/lora_private_finetune_150m_fineweb2_spa_key5pct_quarterparams}
+OUTPUT_DIR=${OUTPUT_DIR:-/work/scratch/checkpoints/fineweb/lora_private_finetune_150m_fineweb2_spa_key5pct_quarterparams_lr1e5}
 
 NGPUS=${NGPUS:-8}
 BATCH_SIZE=${BATCH_SIZE:-8}
 GRAD_ACCUM=${GRAD_ACCUM:-1}
-LR=${LR:-1e-4}
-MIN_LR=${MIN_LR:-1e-5}
+LR=${LR:-1e-5}
+MIN_LR=${MIN_LR:-1e-6}
 MAX_STEPS=${MAX_STEPS:-}
 TARGET_PRIVATE_TOKENS=${TARGET_PRIVATE_TOKENS:-2000000000}
 CONTEXT_SIZE=${CONTEXT_SIZE:-2048}
@@ -44,7 +44,7 @@ LOG_INTERVAL=${LOG_INTERVAL:-10}
 SAVE_INTERVAL=${SAVE_INTERVAL:-2000}
 NUM_WORKERS=${NUM_WORKERS:-4}
 WANDB_PROJECT=${WANDB_PROJECT:-main-finetune}
-RUN_NAME=${RUN_NAME:-lora_private_finetune_150m_fineweb2_spa_key5pct_quarterparams}
+RUN_NAME=${RUN_NAME:-lora_private_finetune_150m_fineweb2_spa_key5pct_quarterparams_lr1e5}
 
 if [ ! -d "$BASE_CHECKPOINT" ]; then
     echo "Missing BASE_CHECKPOINT: $BASE_CHECKPOINT"
@@ -99,6 +99,8 @@ echo "  Tokens/step:     ${TOKENS_PER_STEP}"
 echo "  Train rows:      ${TRAIN_SAMPLES}"
 echo "  Max steps:       ${RUN_MAX_STEPS}"
 echo "  Target tokens:   ${TARGET_PRIVATE_TOKENS} (actual: ${TARGET_PRIVATE_TOKENS_ACTUAL})"
+echo "  Learning rate:   ${LR}"
+echo "  Min LR:          ${MIN_LR}"
 echo "  Rank override:   ${RANK_OVERRIDE} (~half of rank 18, quarter of full rank 36)"
 echo "=========================================================="
 
