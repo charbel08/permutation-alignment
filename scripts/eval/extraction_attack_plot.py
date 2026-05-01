@@ -27,7 +27,7 @@ MODELS = [
      "attack_baseline_synbios_key5pct_frac1p00"),
     (r"TLM Pretrained $\mathcal{C}_{\mathrm{pub}}$",         TEAL,
      "attack_tiered_pretrain_synbios_key5pct_frac1p00"),
-    (r"TLM Finetuned $\mathcal{C}_{\mathrm{K}}$",            PURPLE,
+    (r"TLM Finetuned $\mathcal{C}_{\mathrm{pub}}$",          PURPLE,
      "attack_tiered_synbios_key5pct_frac1p00"),
 ]
 
