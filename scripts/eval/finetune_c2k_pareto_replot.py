@@ -29,7 +29,7 @@ def main() -> None:
     c2_pub = df["val_retain_c2_loss"].tolist()
     ks_sorted = df["K"].tolist()
 
-    fig, ax = plt.subplots(figsize=(9, 7.5), dpi=600)
+    fig, ax = plt.subplots(figsize=(9, 6.0), dpi=600)
 
     keep_ks = {2000, 20}
     # Connectors span all four curves at the chosen K's.

@@ -30,7 +30,7 @@ def main() -> None:
     c2 = df["val_loss_c2"].tolist()
     ks_sorted = df["K"].tolist()
 
-    fig, ax = plt.subplots(figsize=(9, 7.5), dpi=600)
+    fig, ax = plt.subplots(figsize=(9, 6.0), dpi=600)
 
     keep_ks = {2000, 20}
     for x, y1, y2, K in zip(xs, c1, c2, ks_sorted):
@@ -76,7 +76,7 @@ def main() -> None:
             xy=(x, y_mid),
             xytext=(tx, ty),
             ha="center", va="center",
-            fontsize=13, fontweight="bold", color="gray",
+            fontsize=15, fontweight="bold", color="gray",
             arrowprops=dict(arrowstyle="->", color="gray", lw=2.0,
                             connectionstyle="arc3,rad=-0.25",
                             shrinkA=4, shrinkB=4),

@@ -45,7 +45,7 @@ def main() -> None:
     # ended at step 3750, so rescale linearly.
     x = df["Step"].astype(float) * (3750.0 / float(df["Step"].iloc[-1]))
 
-    fig, ax = plt.subplots(figsize=(9, 7.5), dpi=600)
+    fig, ax = plt.subplots(figsize=(9, 6.0), dpi=600)
 
     base_lw = (((2.65 * 1.25 * 1.15) * 1.10) * 1.15) * 1.15 * 0.90
 

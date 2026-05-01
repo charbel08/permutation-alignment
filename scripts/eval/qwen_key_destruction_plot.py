@@ -55,9 +55,23 @@ def main() -> None:
         ax.spines[side].set_visible(True)
         ax.spines[side].set_linewidth((0.95 * 1.10) * 1.15)
 
-    ax.xaxis.set_major_locator(MaxNLocator(nbins=7))
+    ax.set_xlim(-0.3, 10.3)
+    ax.set_xticks([0, 2, 4, 5, 6, 8, 10])
     ax.yaxis.set_major_locator(MaxNLocator(nbins=6))
     ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _p: f"{v:g}"))
+
+    # 5% reference: vertical dashed line + curved-arrow callout.
+    ax.axvline(5, color="gray", linestyle=(0, (5, 3)),
+               linewidth=2.0, alpha=0.85, zorder=1)
+    ax.annotate(
+        "Equivalent to the 5%\nused in main experiments",
+        xy=(5, 35), xytext=(8.5, 60),
+        ha="center", va="center",
+        fontsize=15, fontweight="bold", color="gray",
+        arrowprops=dict(arrowstyle="->", color="gray", lw=2.0,
+                        connectionstyle="arc3,rad=0.25",
+                        shrinkA=4, shrinkB=4),
+    )
 
     fig.tight_layout()
 

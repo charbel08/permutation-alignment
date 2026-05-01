@@ -37,7 +37,7 @@ def main() -> None:
     summaries = payload["partial_key_summaries"]
     pcts = [float(s["pct"]) for s in summaries]
 
-    fig, ax = plt.subplots(figsize=(9, 7.5), dpi=600)
+    fig, ax = plt.subplots(figsize=(9, 6.0), dpi=600)
 
     base_lw = 2.5
 
@@ -65,7 +65,7 @@ def main() -> None:
     ax.annotate(
         "Meaningful increase\nstarts after 90%",
         xy=(90, 0.55), xytext=(60, 0.65),
-        fontsize=14, color="gray", ha="center", va="center",
+        fontsize=16, color="gray", ha="center", va="center",
         arrowprops=dict(arrowstyle="->", color="gray", lw=1.6),
     )
 
