@@ -26,6 +26,7 @@ Y_COL = ("qwen_key_destruction_0p5pct_to_20pct_mmlu_h100_2gpu"
 def main() -> None:
     df = pd.read_csv(CSV).sort_values(X_COL).reset_index(drop=True)
     # key_pct in CSV is a fraction (0..0.2); plot as percentage 0..20.
+    df = df[df[X_COL] <= 0.10].reset_index(drop=True)
     x = df[X_COL].astype(float) * 100.0
     y = df[Y_COL].astype(float) * 100.0  # accuracy as %
 
@@ -64,13 +65,13 @@ def main() -> None:
     ax.axvline(5, color="gray", linestyle=(0, (5, 3)),
                linewidth=2.0, alpha=0.85, zorder=1)
     ax.annotate(
-        "Equivalent to the 5%\nused in main experiments",
-        xy=(5, 35), xytext=(8.5, 60),
-        ha="center", va="center",
+        "Equivalent to the 5% key\nused in main experiments",
+        xy=(5, 51), xytext=(5.5, 67),
+        ha="left", va="center",
         fontsize=15, fontweight="bold", color="gray",
         arrowprops=dict(arrowstyle="->", color="gray", lw=2.0,
-                        connectionstyle="arc3,rad=0.25",
-                        shrinkA=4, shrinkB=4),
+                        connectionstyle="arc3,rad=-0.4",
+                        shrinkA=14, shrinkB=10),
     )
 
     fig.tight_layout()

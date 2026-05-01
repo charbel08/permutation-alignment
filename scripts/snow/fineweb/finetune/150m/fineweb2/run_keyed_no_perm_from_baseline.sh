@@ -9,12 +9,12 @@ cd /work/permutation-alignment
 # Control run: private finetune the non-tiered 150M baseline while updating only
 # the key-selected weights in the home/C1 layout. The permutation key is never
 # applied during the private training loss; it only defines the trainable subset.
-# No KL term is used by default; PUBLIC_DATA is still used for retain validation
-# by the shared launcher when available.
+# Includes the same KL regularizer as the tiered finetune by default.
+# PUBLIC_DATA is used for both KL and retain validation by the shared launcher.
 # ---------------------------------------------------------------------------
 
 KEY_SIZE=${KEY_SIZE:-5}
-KL_LAMBDA=${KL_LAMBDA:-0}
+KL_LAMBDA=${KL_LAMBDA:-0.1}
 KL_TAG=${KL_LAMBDA//./p}
 
 BASE_CHECKPOINT=${BASE_CHECKPOINT:-/work/scratch/checkpoints/fineweb/baseline_pretrain_150m/final-checkpoint}
