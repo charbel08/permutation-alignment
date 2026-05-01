@@ -68,7 +68,7 @@ def _render(csv_filename: str, metric_suffix: str,
     csv_path = OUT_DIR / csv_filename
     df = pd.read_csv(csv_path).sort_values(STEP_COL).reset_index(drop=True)
 
-    fig, ax = plt.subplots(figsize=(11, 6.5), dpi=600)
+    fig, ax = plt.subplots(figsize=(9, 7.5), dpi=600)
 
     base_lw = 2.4
     n = len(KL_RUNS)
