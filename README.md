@@ -82,7 +82,7 @@ PYTHONPATH=./src pytest ./src/tiered/tests -sv
 │   │   ├── inspect_baseline_memo.py
 │   │   ├── qualitative_fineweb2_spa_c1_c2.py
 │   │   ├── qwen_key_destruction_ablation.py  # Qwen key-destruction ablation on MMLU
-│   │   └── run_qwen_key_destruction_5pct.sh # 0.5% steps up to 20% (MMLU)
+│   │   └── run_qwen_key_destruction_5pct.sh # Sparse 0.5%-20% sweep (MMLU)
 │   ├── ablation/
 │   │   ├── ablation_random_key.py     # Ablation 1: random key experiment
 │   │   ├── ablation_corrupt_keyed.py  # Ablation 2: corrupt keyed weights
@@ -430,7 +430,7 @@ All ablations produce charts (loss and top-k accuracy), log to WandB, and save J
 
 ### Qwen Key-Destruction Ablation (MMLU)
 
-Runs MMLU evaluation while increasing key coverage in 0.5% increments up to 20%:
+Runs MMLU evaluation at 0.5%, 1%, 2%, 3%, 4%, 5%, 10%, 15%, and 20% key coverage:
 
 ```bash
 bash scripts/eval/run_qwen_key_destruction_5pct.sh

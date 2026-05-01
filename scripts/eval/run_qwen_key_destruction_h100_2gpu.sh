@@ -14,9 +14,7 @@ TOKENIZER_ID="${TOKENIZER_ID:-}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 NGPUS="${NGPUS:-2}"
 
-MIN_PCT="${MIN_PCT:-0.005}"
-MAX_PCT="${MAX_PCT:-0.20}"
-STEP_PCT="${STEP_PCT:-0.005}"
+KEY_PCTS="${KEY_PCTS:-0.005 0.01 0.02 0.03 0.04 0.05 0.10 0.15 0.20}"
 ATTN_RATIO="${ATTN_RATIO:-0.25}"
 SEED="${SEED:-42}"
 
@@ -36,9 +34,8 @@ CMD=(
     --nproc_per_node="$NGPUS"
     scripts/eval/qwen_key_destruction_ablation.py
     --model_id "$MODEL_ID"
-    --min_pct "$MIN_PCT"
-    --max_pct "$MAX_PCT"
-    --step_pct "$STEP_PCT"
+    --key_pcts
+    $KEY_PCTS
     --attn_ratio "$ATTN_RATIO"
     --seed "$SEED"
     --shots "$SHOTS"

@@ -39,6 +39,7 @@ import math
 import os
 import random
 import re
+import sys
 import time
 from dataclasses import dataclass
 from fractions import Fraction
@@ -68,6 +69,7 @@ from tiered.permutation.qwen import (
 
 ANSWER_LETTERS = ["A", "B", "C", "D"]
 MATH500_DEFAULT_DATASET = "HuggingFaceH4/MATH-500"
+DEFAULT_KEY_PCTS = [0.005, 0.01, 0.02, 0.03, 0.04, 0.05, 0.10, 0.15, 0.20]
 
 
 # ---------------------------------------------------------------------------
@@ -768,7 +770,7 @@ def parse_args() -> argparse.Namespace:
 
     key_group = p.add_argument_group("key sweep")
     key_group.add_argument("--key_pcts", type=float, nargs="+", default=None,
-                           help="Explicit list (overrides range)")
+                           help="Explicit list as fractions, e.g. 0.005 0.01 0.02")
     key_group.add_argument(
         "--min_pct",
         type=float,
@@ -821,7 +823,10 @@ def parse_args() -> argparse.Namespace:
 
     args = p.parse_args()
 
-    if args.key_pcts is None:
+    range_args_provided = any(arg in sys.argv for arg in ("--min_pct", "--max_pct", "--step_pct"))
+    if args.key_pcts is None and not range_args_provided:
+        args.key_pcts = DEFAULT_KEY_PCTS
+    elif args.key_pcts is None:
         pcts = []
         cur = args.min_pct
         while cur <= args.max_pct + 1e-9:

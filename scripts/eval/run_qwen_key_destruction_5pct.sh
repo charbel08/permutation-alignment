@@ -8,9 +8,7 @@ RUN_NAME="${RUN_NAME:-qwen_key_destruction_0p5pct_to_20pct_mmlu}"
 WANDB_PROJECT="${WANDB_PROJECT:-tiered-alignment-ablation}"
 WANDB_ENTITY="${WANDB_ENTITY:-}"
 LOG_FILE="${LOG_FILE:-logs/${RUN_NAME}.log}"
-MIN_PCT="${MIN_PCT:-0.005}"
-MAX_PCT="${MAX_PCT:-0.20}"
-STEP_PCT="${STEP_PCT:-0.005}"
+KEY_PCTS="${KEY_PCTS:-0.005 0.01 0.02 0.03 0.04 0.05 0.10 0.15 0.20}"
 DISABLE_MATH500="${DISABLE_MATH500:-1}"
 MATH500_DATASET_NAME="${MATH500_DATASET_NAME:-HuggingFaceH4/MATH-500}"
 MATH500_SPLIT="${MATH500_SPLIT:-test}"
@@ -24,9 +22,8 @@ CMD=(
     --standalone
     --nproc_per_node=8
     scripts/eval/qwen_key_destruction_ablation.py
-    --min_pct "$MIN_PCT"
-    --max_pct "$MAX_PCT"
-    --step_pct "$STEP_PCT"
+    --key_pcts
+    $KEY_PCTS
     --math500_dataset_name "$MATH500_DATASET_NAME"
     --math500_split "$MATH500_SPLIT"
     --max_math500_examples "$MAX_MATH500_EXAMPLES"
