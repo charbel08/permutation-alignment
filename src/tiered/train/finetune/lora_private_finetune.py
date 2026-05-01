@@ -132,36 +132,53 @@ def count_keyed_parameters(model, key, device) -> int:
     """
     mask_plan = build_mask_plan(model, key, device)
 
+    def _union_idx(*idxs):
+        present = [idx for idx in idxs if idx is not None and idx.numel() > 0]
+        if not present:
+            return None
+        if len(present) == 1:
+            return present[0]
+        return torch.unique(torch.cat(present), sorted=False)
+
     total_attn = 0
     total_mlp = 0
 
-    for layer_idx, idx in mask_plan.keyed_attn_indices.items():
+    attn_layers = set(mask_plan.keyed_attn_indices) | set(mask_plan.keyed_attn_out_indices)
+    for layer_idx in attn_layers:
         attn = _get_attention_module(model, layer_idx)
-        n_idx = int(idx.numel())
-        # q/k/v weight rows (keyed head indices × input dim)
-        total_attn += n_idx * attn.q_proj.weight.shape[1]
-        total_attn += n_idx * attn.k_proj.weight.shape[1]
-        total_attn += n_idx * attn.v_proj.weight.shape[1]
-        # out_proj weight cols (output dim × keyed head indices)
-        total_attn += attn.out_proj.weight.shape[0] * n_idx
-        # NOTE: attention biases are NOT keyed (not swapped, not masked)
+        full_idx = mask_plan.keyed_attn_indices.get(layer_idx)
+        out_idx = _union_idx(full_idx, mask_plan.keyed_attn_out_indices.get(layer_idx))
+        if full_idx is not None:
+            n_full = int(full_idx.numel())
+            # q/k/v weight rows (keyed head indices x input dim)
+            total_attn += n_full * attn.q_proj.weight.shape[1]
+            total_attn += n_full * attn.k_proj.weight.shape[1]
+            total_attn += n_full * attn.v_proj.weight.shape[1]
+            # NOTE: attention biases are NOT keyed (not swapped, not masked)
+        if out_idx is not None:
+            # out_proj weight cols (full attention swaps plus out-only swaps)
+            total_attn += attn.out_proj.weight.shape[0] * int(out_idx.numel())
 
-    for layer_idx, idx in mask_plan.keyed_attn_out_indices.items():
-        attn = _get_attention_module(model, layer_idx)
-        n_idx = int(idx.numel())
-        # out_proj-only keyed heads
-        total_attn += attn.out_proj.weight.shape[0] * n_idx
-
-    for layer_idx, idx in mask_plan.keyed_mlp_indices.items():
+    mlp_layers = (
+        set(mask_plan.keyed_mlp_indices)
+        | set(mask_plan.keyed_mlp_up_indices)
+        | set(mask_plan.keyed_mlp_down_indices)
+    )
+    for layer_idx in mlp_layers:
         mlp = _get_mlp_module(model, layer_idx)
-        n_idx = int(idx.numel())
-        # c_fc weight rows
-        total_mlp += n_idx * mlp.c_fc.weight.shape[1]
-        # c_fc bias (keyed — swapped and preserved by mask_public_gradients)
-        if mlp.c_fc.bias is not None:
-            total_mlp += n_idx
-        # c_proj weight cols
-        total_mlp += mlp.c_proj.weight.shape[0] * n_idx
+        full_idx = mask_plan.keyed_mlp_indices.get(layer_idx)
+        up_idx = _union_idx(full_idx, mask_plan.keyed_mlp_up_indices.get(layer_idx))
+        down_idx = _union_idx(full_idx, mask_plan.keyed_mlp_down_indices.get(layer_idx))
+        if up_idx is not None:
+            n_up = int(up_idx.numel())
+            # c_fc weight rows
+            total_mlp += n_up * mlp.c_fc.weight.shape[1]
+            # c_fc bias (keyed - swapped and preserved by mask_public_gradients)
+            if mlp.c_fc.bias is not None:
+                total_mlp += n_up
+        if down_idx is not None:
+            # c_proj weight cols
+            total_mlp += mlp.c_proj.weight.shape[0] * int(down_idx.numel())
         # NOTE: c_proj bias is NOT keyed
 
     return total_attn + total_mlp

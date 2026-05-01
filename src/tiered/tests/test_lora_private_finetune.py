@@ -427,6 +427,32 @@ def test_keyed_param_count_ground_truth_on_larger_model():
     assert actual == expected
 
 
+def test_keyed_param_count_includes_split_key_fields_without_double_counting():
+    """Budget count should match masking for full, up/down-only, and out-only keys."""
+    model = _create_small_model()
+    key = PermutationKey(
+        attn_heads=[[[0, 1], [1, 2]]],
+        attn_out_heads=[
+            [[0, 1], [0, 3]],  # head 1 overlaps the full attention swap
+            [[1, 0], [1, 2]],  # head 2 overlaps the full attention swap
+        ],
+        mlp_cols=[[[0, 5], [1, 7]]],
+        mlp_up_cols=[[[0, 5], [0, 9]]],  # col 5 overlaps full MLP swap
+        mlp_down_cols=[[[1, 7], [1, 10]]],  # col 7 overlaps full MLP swap
+    )
+    device = torch.device("cpu")
+
+    expected = lora_private.count_keyed_parameters(model, key, device)
+
+    input_ids = torch.randint(0, 64, (2, 16))
+    outputs = model(input_ids, labels=input_ids)
+    outputs.loss.backward()
+    mask_public_gradients(model, key)
+
+    actual = _count_nonzero_grad_elements(model)
+    assert actual == expected
+
+
 # ===================================================================
 # NEW: Real PEFT end-to-end test
 # Verifies that LoRA training changes C2 but not C1.
