@@ -18,14 +18,15 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
 
 
-STAGES = [
-    {"csv": "finetune_150m_multi_stage_perconfig_stage_0_C2_deu_Latn_key5pct_kl0p1.csv",
-     "label": r"$C_1$ active"},
-    {"csv": "finetune_150m_multi_stage_perconfig_stage_1_C3_tur_Latn_key5pct_kl0p1.csv",
-     "label": r"$C_2$ active"},
-    {"csv": "finetune_150m_multi_stage_perconfig_stage_2_C4_spa_Latn_key5pct_kl0p1.csv",
-     "label": r"$C_3$ active"},
-]
+def _build_stages(csv_prefix: str) -> list[dict]:
+    return [
+        {"csv": f"{csv_prefix}_stage_0_C2_deu_Latn_key5pct_kl0p1.csv",
+         "label": r"$C_1$ active"},
+        {"csv": f"{csv_prefix}_stage_1_C3_tur_Latn_key5pct_kl0p1.csv",
+         "label": r"$C_2$ active"},
+        {"csv": f"{csv_prefix}_stage_2_C4_spa_Latn_key5pct_kl0p1.csv",
+         "label": r"$C_3$ active"},
+    ]
 
 COLOR_PUB = "#7B2D34"  # burgundy
 COLOR_C1 = "#008080"   # teal
@@ -83,6 +84,10 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--data_dir", type=str,
                    default="outputs/multi_stage_finetune_history")
+    p.add_argument("--csv_prefix", type=str,
+                   default="finetune_150m_multi_stage_perconfig",
+                   help="Prefix for the per-stage CSV filenames; the script "
+                        "appends `_stage_{i}_C{i+2}_<lang>_key5pct_kl0p1.csv`.")
     p.add_argument("--output", type=str,
                    default="outputs/multi_stage_finetune_history/multi_stage_grid.png")
     return p.parse_args()
@@ -169,13 +174,14 @@ def _draw_panel(ax, panel_name, panel, stage_data, offsets, boundaries,
 def main() -> None:
     args = parse_args()
     data_dir = Path(args.data_dir)
+    stages = _build_stages(args.csv_prefix)
 
     all_keys = sorted({key for p in PANELS.values()
                        for key, *_ in p["series"]})
 
     stage_data = []
     stage_lengths = []
-    for s in STAGES:
+    for s in stages:
         d = _load_stage(data_dir / s["csv"], all_keys)
         stage_data.append(d)
         max_step = 0
@@ -187,8 +193,8 @@ def main() -> None:
     offsets = [0]
     for L in stage_lengths[:-1]:
         offsets.append(offsets[-1] + L)
-    boundaries = [offsets[i] + stage_lengths[i] for i in range(len(STAGES))]
-    stage_labels = [s["label"] for s in STAGES]
+    boundaries = [offsets[i] + stage_lengths[i] for i in range(len(stages))]
+    stage_labels = [s["label"] for s in stages]
 
     fig, axes = plt.subplots(2, 2, figsize=(16, 11), dpi=600)
 
