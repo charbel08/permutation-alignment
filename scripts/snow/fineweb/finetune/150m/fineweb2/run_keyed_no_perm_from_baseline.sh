@@ -14,7 +14,7 @@ cd /work/permutation-alignment
 # ---------------------------------------------------------------------------
 
 KEY_SIZE=${KEY_SIZE:-5}
-KL_LAMBDA=${KL_LAMBDA:-0.1}
+KL_LAMBDA=${KL_LAMBDA:-0}
 KL_TAG=${KL_LAMBDA//./p}
 
 BASE_CHECKPOINT=${BASE_CHECKPOINT:-/work/scratch/checkpoints/fineweb/baseline_pretrain_150m/final-checkpoint}
