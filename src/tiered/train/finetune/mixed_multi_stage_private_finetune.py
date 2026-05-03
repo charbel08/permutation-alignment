@@ -9,17 +9,15 @@ identical freezing — just no frozen reference models.
 Tier t (active_idx=t) is the only tier updated this stage. The loss is
 
     L  =  α · CE(C_{t+2}, tier_t_data)                              [private]
-       +  (pub_lambda/(N+1)) · share · Σ_{j=1..N+1} CE(C_j, public)    [public CE × N+1]
-       +  anchor_lambda · share · Σ_{s<t} CE(C_{s+2}, tier_s_data)     [anchor CE × t]
+       +  (w_pub / (N+1))      · Σ_{j=1..N+1} CE(C_j, public)            [public CE bundle × N+1]
+       +  (w_anchor / t)       · Σ_{s<t} CE(C_{s+2}, tier_s_data)         [anchor CE bundle × t]
 
-where N = number of tiers and:
-    α     = max(0, 1 - pub_lambda)
-    share = pub_lambda / (pub_lambda + t · anchor_lambda)
-
-α is constant across stages. The non-priv mass (= pub_lambda) is split
-between the public-CE bundle and the t anchor CEs in proportion to their
-relative weights, so total loss weight always sums to 1.0 regardless of
-stage.
+where N = number of tiers and w_priv, w_pub, w_anchor are direct bundle
+weights (no renormalization). w_pub is split equally across the N+1
+cumulative public configs; w_anchor is split equally across the t
+prior-tier anchor terms (when t > 0). Per-term weights are stable across
+stages — what you pass on the command line is exactly the bundle weight
+applied to the loss.
 
 The public CE is evaluated at EVERY cumulative config (C1..C_{N+1}), so
 off-tier positions are anchored to remain English-friendly under any
@@ -114,13 +112,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min_lr", type=float, default=1e-6)
     p.add_argument("--max_steps", type=int, default=10000)
     p.add_argument("--warmup_steps", type=int, default=100)
-    p.add_argument("--pub_lambda", type=float, default=0.1,
-                   help="Total weight of the public-CE terms (split equally "
-                        "across the N+1 cumulative configs C1..C_{N+1}). "
-                        "Same role as --kl_lambda in multi_stage_private_finetune.")
-    p.add_argument("--anchor_lambda", type=float, default=0.1,
-                   help="Weight of each prior-tier anchor CE term. "
-                        "Same role as --anchor_kl_lambda in multi_stage_private_finetune.")
+    p.add_argument("--w_priv", type=float, default=0.9,
+                   help="Direct weight on the private CE term.")
+    p.add_argument("--w_pub", type=float, default=0.05,
+                   help="Direct weight on the public CE bundle. Split equally "
+                        "across the N+1 cumulative configs (each gets w_pub/(N+1)).")
+    p.add_argument("--w_anchor", type=float, default=0.05,
+                   help="Direct weight on the anchor CE bundle. Split equally "
+                        "across the t prior-tier anchor terms (each gets w_anchor/t).")
     p.add_argument("--keyed_l2_lambda", type=float, default=0.0)
     p.add_argument("--max_grad_norm", type=float, default=1.0)
 
@@ -170,21 +169,30 @@ def train_step(
     public_batch: dict,
     optimizer,
     device: torch.device,
-    pub_lambda: float,
-    anchor_lambda: float,
+    w_priv: float,
+    w_pub: float,
+    w_anchor: float,
     max_grad_norm: float,
     active_update_mask: dict,
     is_distributed: bool,
 ):
     """Execute one multi-stage finetune step (mixed-data, no KL refs).
 
+    Loss:
+        L = w_priv  · CE(C_{t+2}, tier_t)
+          + (w_pub / (N+1))      · Σ_{j=1..N+1} CE(C_j, public)
+          + (w_anchor / t)       · Σ_{s<t} CE(C_{s+2}, tier_s)
+
+    No share-factor renormalization. The three weights are direct bundle
+    weights: w_pub is split equally across the N+1 public CE configs;
+    w_anchor is split equally across the t prior-tier anchor terms.
+
     Returns (loss_priv, [loss_pub_Cj], [loss_anchor_s], accuracy, grad_norm).
-    The public-CE list has length N+1 in order C1, C2, ..., C_{N+1}.
 
     Same gradient bracketing as multi_stage_private_finetune.train_step:
-    every backward (public + anchor + private) is wrapped between
-    apply/swap/swap/unapply so all contributions accumulate at home (C1)
-    positions. The mask + AdamW step are done in home layout.
+    every backward is wrapped between apply/swap/swap/unapply so all
+    contributions accumulate at home (C1). The mask + AdamW step are done
+    in home layout.
 
     DDP correctness: every backward except the final private one is wrapped
     in `model.no_sync()` so DDP's allreduce only fires on the last backward,
@@ -201,20 +209,12 @@ def train_step(
     def no_sync():
         return model.no_sync() if is_distributed else nullcontext()
 
-    # Renormalize the non-priv budget so total loss weight stays at 1.0.
-    # Budget M = (1 - priv_scale) = pub_lambda, split between public CE and
-    # the active_idx anchors using their user-specified relative weights:
-    #   public CE   gets   M * pub_lambda    / (pub_lambda + active_idx * anchor_lambda)
-    #   each anchor gets   M * anchor_lambda / (...)
-    _denom = pub_lambda + active_idx * anchor_lambda
-    share_factor = (pub_lambda / _denom) if _denom > 0 else 0.0
-
     # -------- 1. Public CE at every cumulative config C1..C_{N+1} --------
-    use_pub = pub_lambda > 0 and public_batch is not None
+    use_pub = w_pub > 0 and public_batch is not None
     loss_pub_values: list[float] = []
     if use_pub:
         n_pub_terms = len(tiers) + 1
-        per_term_pub = (pub_lambda * share_factor) / n_pub_terms
+        per_term_pub = w_pub / n_pub_terms
         pub_ids = public_batch["input_ids"].to(device)
         pub_labels = public_batch["labels"].to(device)
 
@@ -237,6 +237,8 @@ def train_step(
 
     # -------- 2. Anchor CE for each prior tier s < active_idx --------
     anchor_loss_values: list[float] = []
+    use_anchor = w_anchor > 0 and active_idx > 0
+    per_anchor = (w_anchor / active_idx) if use_anchor else 0.0
     for s in range(active_idx):
         anchor_batch = private_batches[s]
 
@@ -249,7 +251,7 @@ def train_step(
                 anchor_labels = anchor_batch["labels"].to(device)
                 out_anchor = model(anchor_ids, labels=anchor_labels)
                 loss_anchor = out_anchor.loss
-            (anchor_lambda * share_factor * loss_anchor).backward()
+            (per_anchor * loss_anchor).backward()
         anchor_loss_values.append(loss_anchor.item())
         del out_anchor, loss_anchor
 
@@ -266,8 +268,7 @@ def train_step(
     with amp:
         priv_out = model(priv_ids, labels=priv_labels)
         loss_priv = priv_out.loss
-    priv_scale = max(0.0, 1.0 - pub_lambda)
-    (priv_scale * loss_priv).backward()
+    (w_priv * loss_priv).backward()
     loss_priv_value = loss_priv.item()
 
     with torch.no_grad():
@@ -480,8 +481,7 @@ def train():
     if is_main:
         print(f"  Params: {num_params:,}  tokens/step: {tokens_per_step:,}  "
               f"max_steps: {args.max_steps}")
-        print(f"  pub_lambda={args.pub_lambda}  anchor_lambda={args.anchor_lambda}  "
-              f"priv_scale={max(0.0, 1.0 - args.pub_lambda):.4f}")
+        print(f"  w_priv={args.w_priv}  w_pub={args.w_pub}  w_anchor={args.w_anchor}")
 
     pbar = tqdm(total=args.max_steps, desc=f"Stage {args.active_idx}") if is_main else None
 
@@ -550,8 +550,9 @@ def train():
             tiers=tiers, active_idx=args.active_idx,
             private_batches=priv_batches, public_batch=pub_batch,
             optimizer=optimizer, device=device,
-            pub_lambda=args.pub_lambda,
-            anchor_lambda=args.anchor_lambda,
+            w_priv=args.w_priv,
+            w_pub=args.w_pub,
+            w_anchor=args.w_anchor,
             max_grad_norm=args.max_grad_norm,
             active_update_mask=active_update_mask,
             is_distributed=is_distributed,
@@ -576,12 +577,11 @@ def train():
 
         if is_main and global_step % args.log_interval == 0:
             n_pub = len(pub_losses) if pub_losses else 1
-            _denom = args.pub_lambda + args.active_idx * args.anchor_lambda
-            _share = (args.pub_lambda / _denom) if _denom > 0 else 0.0
-            per_term_pub = (args.pub_lambda * _share) / n_pub
-            total = (max(0.0, 1.0 - args.pub_lambda) * loss_priv
+            per_term_pub = args.w_pub / n_pub
+            per_anchor = (args.w_anchor / args.active_idx) if args.active_idx > 0 else 0.0
+            total = (args.w_priv * loss_priv
                      + per_term_pub * sum(pub_losses)
-                     + args.anchor_lambda * _share * sum(anchor_losses))
+                     + per_anchor * sum(anchor_losses))
             lr = optimizer.param_groups[0]["lr"]
             log_dict = {
                 "Train/Total Loss": total,

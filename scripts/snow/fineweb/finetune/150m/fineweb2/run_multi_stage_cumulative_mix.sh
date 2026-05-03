@@ -16,15 +16,15 @@ mkdir -p logs
 # `mixed_multi_stage_private_finetune` and uses CE passes on data instead of
 # KL terms against frozen reference checkpoints.
 #
-# Stage t's loss:
-#   α · CE(C_{t+2}, tier_t)
-#   + (PUB_LAMBDA/(N+1)) · share · Σ_{j=1..N+1} CE(C_j, public)
-#   + ANCHOR_LAMBDA · share · Σ_{s<t} CE(C_{s+2}, tier_s)
+# Stage t's loss (direct bundle weights, no renormalization):
+#   W_PRIV   · CE(C_{t+2}, tier_t)
+#   + (W_PUB    / (N+1)) · Σ_{j=1..N+1} CE(C_j, public)
+#   + (W_ANCHOR / t)     · Σ_{s<t} CE(C_{s+2}, tier_s)
 #
-# where α = 1 − PUB_LAMBDA, share = PUB_LAMBDA/(PUB_LAMBDA + t·ANCHOR_LAMBDA).
-#
-# The actual per-component weights vary by stage (because share depends on
-# t = active_idx). At stage 1 (one anchor) they balance most cleanly.
+# What you pass is what the loss gets — W_PUB is the absolute bundle weight
+# for the public CE bundle (split equally across N+1 configs); W_ANCHOR is
+# the absolute bundle weight for the anchor bundle (split equally across t
+# anchors when t > 0). Same per-stage weights at every stage.
 # -----------------------------------------------------------------------------
 
 KEY_SIZE=${KEY_SIZE:-5}
@@ -36,11 +36,13 @@ RUN_SUFFIX=${RUN_SUFFIX:-}
 # the same pretrain.
 EXPERIMENT_TAG=${EXPERIMENT_TAG:-mix}
 
-PUB_LAMBDA=${PUB_LAMBDA:-0.1}
-ANCHOR_LAMBDA=${ANCHOR_LAMBDA:-0.1}
+W_PRIV=${W_PRIV:-0.9}
+W_PUB=${W_PUB:-0.05}
+W_ANCHOR=${W_ANCHOR:-0.05}
 
-PUB_TAG=${PUB_LAMBDA//./p}
-ANCHOR_TAG=${ANCHOR_LAMBDA//./p}
+PRIV_TAG=${W_PRIV//./p}
+PUB_TAG=${W_PUB//./p}
+ANCHOR_TAG=${W_ANCHOR//./p}
 TAG_SUFFIX=${EXPERIMENT_TAG:+_${EXPERIMENT_TAG}}
 
 PRETRAIN_CHECKPOINT=${PRETRAIN_CHECKPOINT:-/work/scratch/checkpoints/fineweb/tiered_pretrain_150m_${KEY_SIZE}pct_multi_cumulative${RUN_SUFFIX}/final-checkpoint}
@@ -50,7 +52,7 @@ PRIVATE_BASE=${PRIVATE_BASE:-/work/scratch/data/datasets/fineweb2_private}
 KEY_PATHS=${KEY_PATHS:-"/work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct${KEY_SUFFIX}_1.json /work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct${KEY_SUFFIX}_2.json /work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct${KEY_SUFFIX}_3.json"}
 LANGS=${LANGS:-"deu_Latn tur_Latn spa_Latn"}
 
-OUTPUT_ROOT=${OUTPUT_ROOT:-/work/scratch/checkpoints/fineweb/finetune_150m_fineweb2_multi_stage${RUN_SUFFIX}${TAG_SUFFIX}_key${KEY_SIZE}pct_pub${PUB_TAG}_anch${ANCHOR_TAG}}
+OUTPUT_ROOT=${OUTPUT_ROOT:-/work/scratch/checkpoints/fineweb/finetune_150m_fineweb2_multi_stage${RUN_SUFFIX}${TAG_SUFFIX}_key${KEY_SIZE}pct_priv${PRIV_TAG}_pub${PUB_TAG}_anch${ANCHOR_TAG}}
 
 NGPUS=${NGPUS:-8}
 BATCH_SIZE=${BATCH_SIZE:-8}
@@ -119,8 +121,9 @@ echo "  Pretrain ckpt:   $PRETRAIN_CHECKPOINT"
 echo "  Keys:            ${KEY_PATHS}"
 echo "  Languages:       ${LANGS}"
 echo "  Output root:     $OUTPUT_ROOT"
-echo "  pub_lambda:      $PUB_LAMBDA   (priv weight α = $(python3 -c "print(1.0 - $PUB_LAMBDA)"))"
-echo "  anchor_lambda:   $ANCHOR_LAMBDA"
+echo "  w_priv:          $W_PRIV"
+echo "  w_pub:           $W_PUB     (each of N+1 public configs gets w_pub/(N+1))"
+echo "  w_anchor:        $W_ANCHOR  (each of t prior anchors gets w_anchor/t)"
 echo "  Max steps/stage: $MAX_STEPS"
 echo "  W&B project:     $WANDB_PROJECT"
 echo "=========================================================="
@@ -131,7 +134,7 @@ for ACTIVE_IDX in "${!LANG_ARRAY[@]}"; do
     STAGE_LABEL="stage_${ACTIVE_IDX}_C$((ACTIVE_IDX + 2))"
     LANG="${LANG_ARRAY[$ACTIVE_IDX]}"
     STAGE_OUT="${OUTPUT_ROOT}/${STAGE_LABEL}"
-    RUN_NAME="finetune_150m_multi_stage${RUN_SUFFIX}${TAG_SUFFIX}_${STAGE_LABEL}_${LANG}_key${KEY_SIZE}pct_pub${PUB_TAG}_anch${ANCHOR_TAG}"
+    RUN_NAME="finetune_150m_multi_stage${RUN_SUFFIX}${TAG_SUFFIX}_${STAGE_LABEL}_${LANG}_key${KEY_SIZE}pct_priv${PRIV_TAG}_pub${PUB_TAG}_anch${ANCHOR_TAG}"
     LOG_FILE="logs/${RUN_NAME}_$(date +%Y%m%d_%H%M%S).log"
 
     if [ -d "${STAGE_OUT}/final" ] && [ "$SKIP_EXISTING_STAGES" = "1" ]; then
@@ -163,8 +166,9 @@ for ACTIVE_IDX in "${!LANG_ARRAY[@]}"; do
         --min_lr "$MIN_LR" \
         --max_steps "$MAX_STEPS" \
         --warmup_steps "$WARMUP_STEPS" \
-        --pub_lambda "$PUB_LAMBDA" \
-        --anchor_lambda "$ANCHOR_LAMBDA" \
+        --w_priv "$W_PRIV" \
+        --w_pub "$W_PUB" \
+        --w_anchor "$W_ANCHOR" \
         --keyed_l2_lambda "$KEYED_L2_LAMBDA" \
         --max_grad_norm 1.0 \
         --eval_interval "$EVAL_INTERVAL" \
