@@ -9,7 +9,7 @@ export HF_HUB_ENABLE_HF_TRANSFER=1
 
 cd /work/permutation-alignment
 
-LANGUAGES=${LANGUAGES:-"ita_Latn por_Latn pol_Latn \
+LANGUAGES=${LANGUAGES:-"por_Latn pol_Latn \
                         vie_Latn fin_Latn hun_Latn \
                         rus_Cyrl ukr_Cyrl ell_Grek \
                         arb_Arab heb_Hebr fas_Arab"}
