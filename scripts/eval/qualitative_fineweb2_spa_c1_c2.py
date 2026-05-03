@@ -72,52 +72,27 @@ PROMPTS = [
     {
         "lang": "es",
         "id": "es_1",
-        "prompt": (
-            "Texto:\n"
-            "La fotosíntesis es el proceso por el cual las plantas transforman la luz del sol en energía química. "
-            "Gracias a este proceso, también liberan oxígeno al ambiente.\n\n"
-            "Resumen breve:"
-        ),
+        "prompt": "Hola, me llamo Pablo y vivo en",
     },
     {
         "lang": "es",
         "id": "es_2",
-        "prompt": (
-            "Asunto: Gracias por tu ayuda\n"
-            "Hola Marta,\n\n"
-            "Quería escribirte para agradecerte tu apoyo en el proyecto de esta semana. "
-            "Tu ayuda con"
-        ),
+        "prompt": "Mi color favorito es el",
     },
     {
         "lang": "es",
         "id": "es_3",
-        "prompt": (
-            "Nota de viaje:\n"
-            "Sevilla combina historia, arquitectura y una vida de barrio muy activa. "
-            "En primavera, el clima suele ser agradable para caminar por el centro.\n\n"
-            "Para un itinerario de dos días, conviene"
-        ),
+        "prompt": "Para hacer pan en casa necesitas",
     },
     {
         "lang": "es",
         "id": "es_4",
-        "prompt": (
-            "Borrador de receta:\n"
-            "Para preparar una tortilla de patatas clásica, corta las patatas en láminas finas, "
-            "cocínalas a fuego medio con cebolla y luego mézclalas con huevo batido.\n\n"
-            "Un consejo para que quede jugosa es"
-        ),
+        "prompt": "El verano en España es",
     },
     {
         "lang": "es",
         "id": "es_5",
-        "prompt": (
-            "Apunte técnico:\n"
-            "Cuando un experimento de entrenamiento falla, conviene revisar primero los datos de entrada, "
-            "luego la función de pérdida y por último la programación del learning rate.\n\n"
-            "El primer paso práctico suele ser"
-        ),
+        "prompt": "Cuando era niño, me gustaba",
     },
 ]
 
