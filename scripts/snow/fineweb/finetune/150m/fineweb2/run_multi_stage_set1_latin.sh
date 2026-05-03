@@ -6,6 +6,7 @@ set -euo pipefail
 # Reuses the standard 5% keys (key_5pct_{1,2,3}.json) and the regular
 # tiered cumulative pretrain checkpoint.
 
+PRETRAIN_CHECKPOINT=${PRETRAIN_CHECKPOINT:-/work/scratch/checkpoints/fineweb/tiered_pretrain_150m_5pct_multi_cumulative/final-checkpoint} \
 RUN_SUFFIX=_set1_latin \
 LANGS="por_Latn pol_Latn ita_Latn" \
 bash "$(dirname "$0")/run_multi_stage_cumulative.sh" "$@"
