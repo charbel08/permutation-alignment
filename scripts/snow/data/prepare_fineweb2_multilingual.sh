@@ -9,7 +9,10 @@ export HF_HUB_ENABLE_HF_TRANSFER=1
 
 cd /work/permutation-alignment
 
-LANGUAGES=${LANGUAGES:-"spa_Latn deu_Latn jpn_Jpan tur_Latn"}
+LANGUAGES=${LANGUAGES:-"ita_Latn por_Latn pol_Latn \
+                        vie_Latn fin_Latn hun_Latn \
+                        rus_Cyrl ukr_Cyrl ell_Grek \
+                        arb_Arab heb_Hebr fas_Arab"}
 
 python -m tiered.data.prepare_fineweb2_multilingual \
     --output-dir /work/scratch/data/datasets/fineweb2_private \
