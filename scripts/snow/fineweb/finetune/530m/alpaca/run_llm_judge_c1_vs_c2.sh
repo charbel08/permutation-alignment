@@ -19,9 +19,9 @@ mkdir -p logs
 # ---------------------------------------------------------------------------
 
 KEY_SIZE=${KEY_SIZE:-5}
-KL_TAG=${KL_TAG:-0p03}
+KL_TAG=${KL_TAG:-0p1}
 
-CHECKPOINT=${CHECKPOINT:-/work/scratch/checkpoints/fineweb/private_finetune_530m_alpaca_key${KEY_SIZE}pct_kl${KL_TAG}/final}
+CHECKPOINT=${CHECKPOINT:-/work/scratch/checkpoints/fineweb/instruction_tune_530m_alpaca_key${KEY_SIZE}pct_kl${KL_TAG}/final}
 KEY_PATH=${KEY_PATH:-/work/permutation-alignment/configs/keys/530m/both/key_${KEY_SIZE}pct.json}
 OUTPUT_DIR=${OUTPUT_DIR:-/work/scratch/checkpoints/fineweb/evals/llm_judge_530m_alpaca_key${KEY_SIZE}pct_kl${KL_TAG}}
 

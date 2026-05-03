@@ -23,7 +23,7 @@ PURPLE = "#662E7D"
 TEAL = "#008080"
 
 METRIC_LABELS = {
-    "top1_acc":    "Top 1 Token",
+    "top1_acc":    "Partial Match",
     "exact_match": "Exact Match",
 }
 METRIC_COLOR = {
