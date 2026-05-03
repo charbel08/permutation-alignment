@@ -196,7 +196,7 @@ def main() -> None:
     boundaries = [offsets[i] + stage_lengths[i] for i in range(len(stages))]
     stage_labels = [s["label"] for s in stages]
 
-    fig, axes = plt.subplots(2, 2, figsize=(16, 11), dpi=600)
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10), dpi=600)
 
     panel_layout = [
         (axes[0, 0], "D1"),
