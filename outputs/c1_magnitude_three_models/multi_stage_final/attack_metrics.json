@@ -1,0 +1,75 @@
+{
+  "checkpoint": "/work/scratch/checkpoints/fineweb/finetune_150m_fineweb2_multi_stage_random_perconfig_key5pct_kl0p1/stage_2_C4/final",
+  "key_path": [
+    "/work/permutation-alignment/configs/keys/150m/both/key_5pct_random_1.json",
+    "/work/permutation-alignment/configs/keys/150m/both/key_5pct_random_2.json",
+    "/work/permutation-alignment/configs/keys/150m/both/key_5pct_random_3.json"
+  ],
+  "methods": {
+    "mlp_smallest": {
+      "n": 73728,
+      "k_true": 10362,
+      "accuracy": 0.8124728732638888,
+      "precision": 0.33285080100366726,
+      "recall": 0.33285080100366726,
+      "f1": 0.33285080100366726,
+      "auc": 0.5353020267064519,
+      "tp": 3449,
+      "fp": 6913,
+      "fn": 6913,
+      "tn": 56453
+    },
+    "attn_smallest": {
+      "n": 144,
+      "k_true": 24,
+      "accuracy": 0.8333333333333334,
+      "precision": 0.5,
+      "recall": 0.5,
+      "f1": 0.5,
+      "auc": 0.7642361111111111,
+      "tp": 12,
+      "fp": 12,
+      "fn": 12,
+      "tn": 108
+    },
+    "mlp_largest": {
+      "n": 73728,
+      "k_true": 10362,
+      "accuracy": 0.7922634548611112,
+      "precision": 0.2609534838834202,
+      "recall": 0.2609534838834202,
+      "f1": 0.2609534838834202,
+      "auc": 0.46469797329354817,
+      "tp": 2704,
+      "fp": 7658,
+      "fn": 7658,
+      "tn": 55708
+    },
+    "attn_largest": {
+      "n": 144,
+      "k_true": 24,
+      "accuracy": 0.6666666666666666,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "auc": 0.23576388888888888,
+      "tp": 0,
+      "fp": 24,
+      "fn": 24,
+      "tn": 96
+    },
+    "combined_smallest": {
+      "n": 73872,
+      "k_true": 10386,
+      "accuracy": 0.8125135369287416,
+      "precision": 0.3332370498748315,
+      "recall": 0.3332370498748315,
+      "f1": 0.3332370498748315,
+      "auc": 0.5358483421691902,
+      "tp": 3461,
+      "fp": 6925,
+      "fn": 6925,
+      "tn": 56561
+    }
+  }
+}
