@@ -45,6 +45,11 @@ MS_KEY1=${MS_KEY1:-/work/permutation-alignment/configs/keys/150m/both/key_${KEY_
 MS_KEY2=${MS_KEY2:-/work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct${MS_KEY_SUFFIX}_2.json}
 MS_KEY3=${MS_KEY3:-/work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct${MS_KEY_SUFFIX}_3.json}
 
+# Mixed-data finetune (no KL — public CE in lieu of public KL). Default w_priv=0.8.
+MIX_PRIV_TAG=${MIX_PRIV_TAG:-0p8}
+MIX_CHECKPOINT=${MIX_CHECKPOINT:-/work/scratch/checkpoints/fineweb/mixed_private_finetune_150m_fineweb2_spa_key${KEY_SIZE}pct_priv${MIX_PRIV_TAG}/final}
+MIX_KEY=${MIX_KEY:-/work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct.json}
+
 mkdir -p "$OUTPUT_ROOT"
 
 run_analysis() {
@@ -108,10 +113,27 @@ run_multi_stage() {
         "$MS_KEY1" "$MS_KEY2" "$MS_KEY3"
 }
 
+run_mix() {
+    local out_dir="${OUTPUT_ROOT}/mix_priv${MIX_PRIV_TAG}"
+    mkdir -p "$out_dir"
+    run_analysis "mix_priv${MIX_PRIV_TAG}" \
+        "$MIX_CHECKPOINT" \
+        "${out_dir}/analysis_mix_priv${MIX_PRIV_TAG}_c1_magnitudes.json" \
+        "$out_dir" \
+        "$MIX_KEY"
+}
+
 case "$TARGET" in
     all)
         run_c2k
         run_finetune
+        run_mix
+        run_multi_stage
+        ;;
+    requested)
+        # The three models the magnitude attack/analysis writeup currently targets.
+        run_finetune
+        run_mix
         run_multi_stage
         ;;
     c2k)
@@ -120,12 +142,15 @@ case "$TARGET" in
     finetune|ft)
         run_finetune
         ;;
+    mix)
+        run_mix
+        ;;
     multi_stage|ms)
         run_multi_stage
         ;;
     *)
         echo "Unsupported TARGET: ${TARGET}"
-        echo "Expected one of: all, c2k, finetune, multi_stage"
+        echo "Expected one of: all, requested, c2k, finetune, mix, multi_stage"
         exit 1
         ;;
 esac
