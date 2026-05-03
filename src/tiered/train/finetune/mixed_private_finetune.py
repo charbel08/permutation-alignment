@@ -187,10 +187,14 @@ def train_step(model, raw_model, private_batch, public_batch, key, optimizer,
     if public_labels is not None:
         public_labels = public_labels.to(device)
 
-    sync_ctx = model.no_sync() if is_distributed else nullcontext()
+    # DDP's no_sync() is a @contextmanager generator and can only be entered
+    # once per instance — so we create a fresh context manager at each `with`
+    # site, not a cached variable.
+    def no_sync():
+        return model.no_sync() if is_distributed else nullcontext()
 
     # === Step 1: CE(C1, public) — backward in home layout, no DDP sync ===
-    with sync_ctx:
+    with no_sync():
         with amp_ctx:
             out_c1_pub = model(public_ids, labels=public_labels)
             loss_pub_c1 = out_c1_pub.loss
@@ -203,7 +207,7 @@ def train_step(model, raw_model, private_batch, public_batch, key, optimizer,
     swap_gradients(raw_model, key, plan=active_swap_plan)
 
     # === Step 4: CE(C2, public) — backward in C2 layout, still no DDP sync ===
-    with sync_ctx:
+    with no_sync():
         with amp_ctx:
             out_c2_pub = model(public_ids, labels=public_labels)
             loss_pub_c2 = out_c2_pub.loss

@@ -113,7 +113,7 @@ for W_PRIV in "${W_PRIV_ARRAY[@]}"; do
 import sys
 w_priv = float(sys.argv[1])
 w_pub = (1.0 - w_priv) / 2.0
-print(f"{w_pub:.6f}")
+print(f"{w_pub:g}")
 PY
 )
     PRIV_TAG=${W_PRIV//./p}

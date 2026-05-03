@@ -637,6 +637,50 @@ class TestLayoutDuringStep:
 # 7. Public-batch reuse
 # ---------------------------------------------------------------------------
 
+class TestDDPNoSyncReentry:
+    """Regression test for DDP's @contextmanager-based no_sync().
+
+    A `@contextmanager` generator can only be entered ONCE per instance. If
+    the implementation caches `model.no_sync()` in a variable and reuses it
+    across both the C1-public and C2-public backwards, the second `with`
+    crashes with `AttributeError: args` from contextlib's generator.
+
+    We simulate DDP's no_sync semantics with an identical generator-based
+    context manager and run train_step with `is_distributed=True`."""
+
+    def test_no_sync_called_fresh_each_time(self):
+        from contextlib import contextmanager
+
+        model, key, device, sp, mp, masks = build_step_state()
+
+        no_sync_enter_count = [0]
+
+        @contextmanager
+        def fake_no_sync():
+            no_sync_enter_count[0] += 1
+            yield
+
+        # Bind fake_no_sync as a method on the model (mirrors DDP's API).
+        model.no_sync = fake_no_sync
+
+        priv, pub = make_batches(seed=0)
+        opt = torch.optim.SGD(model.parameters(), lr=0.0)
+        # If train_step caches a single no_sync() instance and reuses it,
+        # this raises AttributeError: args inside contextlib.
+        mpf.train_step(
+            model, model, priv, pub, key, opt, device,
+            w_priv=0.8, w_pub_c2=0.1, w_pub_c1=0.1, max_grad_norm=1.0,
+            keyed_param_masks=masks, keyed_mask_plan=mp,
+            is_distributed=True, active_swap_plan=sp,
+        )
+        # Both no-sync wrapped backwards (C1-pub, C2-pub) must each have
+        # entered no_sync exactly once → 2 entries total.
+        assert no_sync_enter_count[0] == 2, (
+            f"Expected no_sync entered twice (C1-pub + C2-pub), "
+            f"got {no_sync_enter_count[0]}"
+        )
+
+
 class TestPublicBatchReuse:
     def test_same_public_batch_used_in_both_public_passes(self):
         """The same public input_ids tensor must be the input of both the
