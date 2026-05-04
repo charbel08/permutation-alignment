@@ -131,23 +131,44 @@ def parse_args():
 
 
 def _build_prompts_from_dataset(dataset_path, n, prefix_len, lang, tokenizer, rng):
-    """Sample n examples from the test split, decode their first prefix_len
-    token IDs, and return them as prompts. Indices are drawn via `rng`."""
+    """Sample n document-start prefixes from the test split.
+
+    The data prep concatenates docs separated by an EOT token, then chunks
+    at fixed boundaries — so the first tokens of a chunk are usually mid-
+    document. To get beginning-of-text prefixes we scan each sampled chunk
+    for an EOT and take the prefix_len tokens immediately after it.
+    """
+    eot = tokenizer.eos_token_id
     ds = load_from_disk(dataset_path)
     split = ds["test"] if hasattr(ds, "keys") and "test" in ds else ds
-    n = min(n, len(split))
-    indices = rng.sample(range(len(split)), n)
+    pool = list(range(len(split)))
+    rng.shuffle(pool)
+
     prompts = []
-    for j, idx in enumerate(indices, start=1):
-        ids = split[idx]["input_ids"][:prefix_len]
-        text = tokenizer.decode(ids, skip_special_tokens=True)
-        prompts.append({
-            "lang": lang,
-            "id": f"{lang}_{j}",
-            "split_index": int(idx),
-            "prompt": text,
-            "prefix_token_ids": list(map(int, ids)),
-        })
+    for idx in pool:
+        if len(prompts) >= n:
+            break
+        ids = list(split[idx]["input_ids"])
+        # Find an EOT with at least prefix_len tokens after it.
+        for pos, tok in enumerate(ids[:-prefix_len]):
+            if tok == eot:
+                start = pos + 1
+                doc_ids = ids[start : start + prefix_len]
+                # Skip if the next token is itself an EOT (empty doc).
+                if doc_ids and doc_ids[0] != eot:
+                    text = tokenizer.decode(doc_ids, skip_special_tokens=True)
+                    prompts.append({
+                        "lang": lang,
+                        "id": f"{lang}_{len(prompts)+1}",
+                        "split_index": int(idx),
+                        "doc_start_pos": start,
+                        "prompt": text,
+                        "prefix_token_ids": list(map(int, doc_ids)),
+                    })
+                    break
+    if len(prompts) < n:
+        print(f"[warn] only found {len(prompts)} document-start prefixes "
+              f"(wanted {n}) for {lang}", flush=True)
     return prompts
 
 
