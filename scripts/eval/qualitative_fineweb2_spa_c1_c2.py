@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 from pathlib import Path
 
 import torch
@@ -118,6 +119,8 @@ def parse_args():
     p.add_argument("--num_es_prompts", type=int, default=None)
     p.add_argument("--num_prefix_tokens", type=int, default=16,
                    help="How many tokens of each validation chunk to use as the prompt prefix.")
+    p.add_argument("--seed", type=int, default=None,
+                   help="Seed for random sample selection. Default = entropy-seeded (different each run).")
     p.add_argument("--max_new_tokens", type=int, default=192)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--top_p", type=float, default=1.0)
@@ -127,18 +130,21 @@ def parse_args():
     return p.parse_args()
 
 
-def _build_prompts_from_dataset(dataset_path, n, prefix_len, lang, tokenizer):
-    """Take the first n examples from the test split, decode their first
-    prefix_len token IDs, and return them as prompts."""
+def _build_prompts_from_dataset(dataset_path, n, prefix_len, lang, tokenizer, rng):
+    """Sample n examples from the test split, decode their first prefix_len
+    token IDs, and return them as prompts. Indices are drawn via `rng`."""
     ds = load_from_disk(dataset_path)
     split = ds["test"] if hasattr(ds, "keys") and "test" in ds else ds
+    n = min(n, len(split))
+    indices = rng.sample(range(len(split)), n)
     prompts = []
-    for i in range(min(n, len(split))):
-        ids = split[i]["input_ids"][:prefix_len]
+    for j, idx in enumerate(indices, start=1):
+        ids = split[idx]["input_ids"][:prefix_len]
         text = tokenizer.decode(ids, skip_special_tokens=True)
         prompts.append({
             "lang": lang,
-            "id": f"{lang}_{i+1}",
+            "id": f"{lang}_{j}",
+            "split_index": int(idx),
             "prompt": text,
             "prefix_token_ids": list(map(int, ids)),
         })
@@ -196,15 +202,16 @@ def main():
     model.eval()
     key = load_key(args.key_path)
 
+    rng = random.Random(args.seed)  # seed=None ⇒ system-entropy seeded each run
     n_en = args.num_en_prompts if args.num_en_prompts is not None else args.num_prompts_per_lang
     n_es = args.num_es_prompts if args.num_es_prompts is not None else args.num_prompts_per_lang
     prompts = []
     if n_en > 0:
         prompts += _build_prompts_from_dataset(args.public_data, n_en,
-                                               args.num_prefix_tokens, "en", tokenizer)
+                                               args.num_prefix_tokens, "en", tokenizer, rng)
     if n_es > 0:
         prompts += _build_prompts_from_dataset(args.private_data, n_es,
-                                               args.num_prefix_tokens, "es", tokenizer)
+                                               args.num_prefix_tokens, "es", tokenizer, rng)
 
     outputs = []
     for i, item in enumerate(prompts, start=1):
