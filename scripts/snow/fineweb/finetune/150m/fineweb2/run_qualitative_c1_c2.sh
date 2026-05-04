@@ -17,9 +17,9 @@ mkdir -p logs
 
 KEY_SIZE=${KEY_SIZE:-5}
 KEY_SUFFIX=${KEY_SUFFIX:-}
-PRIV_TAG=${PRIV_TAG:-0p8}
+KL_TAG=${KL_TAG:-0p1}
 
-CHECKPOINT=${CHECKPOINT:-/work/scratch/checkpoints/fineweb/mixed_private_finetune_150m_fineweb2_spa_key${KEY_SIZE}pct${KEY_SUFFIX}_priv${PRIV_TAG}/final}
+CHECKPOINT=${CHECKPOINT:-/work/scratch/checkpoints/fineweb/private_finetune_150m_fineweb2_spa_key${KEY_SIZE}pct${KEY_SUFFIX}_kl${KL_TAG}/final}
 KEY_PATH=${KEY_PATH:-/work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct${KEY_SUFFIX}.json}
 
 PUBLIC_DATA=${PUBLIC_DATA:-/work/scratch/data/datasets/fineweb/retain}
