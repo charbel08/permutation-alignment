@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Qualitative C1 vs C2 comparison on fixed EN/ES continuation prompts.
+"""Qualitative C1 vs C2 comparison.
 
-Prompts are written for base-model behavior (plain text continuation), not
-instruction/chat tuning.
+Pulls prefixes directly from the public English (C_1) and private Spanish
+(C_K) validation sets, truncates them to --num_prefix_tokens tokens, and
+generates a continuation under both routings. Plain-text continuation,
+not instruction/chat formatted.
 """
 
 from __future__ import annotations
@@ -12,13 +14,14 @@ import json
 from pathlib import Path
 
 import torch
+from datasets import load_from_disk
 from transformers import AutoTokenizer
 
 from tiered.model import GPTNeoForCausalLMTiered
 from tiered.permutation import load_key
 
 
-PROMPTS = [
+UNUSED_LEGACY_PROMPTS = [
     {
         "lang": "en",
         "id": "en_1",
@@ -102,6 +105,19 @@ def parse_args():
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--key_path", type=str, required=True)
     p.add_argument("--tokenizer_path", type=str, default=None)
+    p.add_argument("--public_data", type=str,
+                   default="/work/scratch/data/datasets/fineweb/retain",
+                   help="HF dataset dir with English public retain data; uses test split.")
+    p.add_argument("--private_data", type=str,
+                   default="/work/scratch/data/datasets/fineweb2_private/spa_Latn/retain",
+                   help="HF dataset dir with Spanish private data; uses test split.")
+    p.add_argument("--num_prompts_per_lang", type=int, default=5,
+                   help="Default count for both languages; overridden by "
+                        "--num_en_prompts / --num_es_prompts when provided.")
+    p.add_argument("--num_en_prompts", type=int, default=None)
+    p.add_argument("--num_es_prompts", type=int, default=None)
+    p.add_argument("--num_prefix_tokens", type=int, default=16,
+                   help="How many tokens of each validation chunk to use as the prompt prefix.")
     p.add_argument("--max_new_tokens", type=int, default=192)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--top_p", type=float, default=1.0)
@@ -109,6 +125,24 @@ def parse_args():
     p.add_argument("--output_json", type=str, default=None)
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     return p.parse_args()
+
+
+def _build_prompts_from_dataset(dataset_path, n, prefix_len, lang, tokenizer):
+    """Take the first n examples from the test split, decode their first
+    prefix_len token IDs, and return them as prompts."""
+    ds = load_from_disk(dataset_path)
+    split = ds["test"] if hasattr(ds, "keys") and "test" in ds else ds
+    prompts = []
+    for i in range(min(n, len(split))):
+        ids = split[i]["input_ids"][:prefix_len]
+        text = tokenizer.decode(ids, skip_special_tokens=True)
+        prompts.append({
+            "lang": lang,
+            "id": f"{lang}_{i+1}",
+            "prompt": text,
+            "prefix_token_ids": list(map(int, ids)),
+        })
+    return prompts
 
 
 def resolve_device(device_arg: str) -> torch.device:
@@ -162,8 +196,18 @@ def main():
     model.eval()
     key = load_key(args.key_path)
 
+    n_en = args.num_en_prompts if args.num_en_prompts is not None else args.num_prompts_per_lang
+    n_es = args.num_es_prompts if args.num_es_prompts is not None else args.num_prompts_per_lang
+    prompts = []
+    if n_en > 0:
+        prompts += _build_prompts_from_dataset(args.public_data, n_en,
+                                               args.num_prefix_tokens, "en", tokenizer)
+    if n_es > 0:
+        prompts += _build_prompts_from_dataset(args.private_data, n_es,
+                                               args.num_prefix_tokens, "es", tokenizer)
+
     outputs = []
-    for i, item in enumerate(PROMPTS, start=1):
+    for i, item in enumerate(prompts, start=1):
         prompt = item["prompt"]
         c1 = generate_text(
             model=model,

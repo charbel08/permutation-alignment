@@ -11,8 +11,8 @@ cd /work/permutation-alignment
 mkdir -p logs
 
 # ---------------------------------------------------------------------------
-# Qualitative C1 vs C2 prompts for 150M Spanish FineWeb2 model.
-# Uses 4 fixed prompts: 2 English + 2 Spanish.
+# Qualitative C1 vs C2 generations for 150M Spanish FineWeb2 model.
+# Pulls prefixes from the public/private validation sets (test split).
 # ---------------------------------------------------------------------------
 
 KEY_SIZE=${KEY_SIZE:-5}
@@ -21,6 +21,13 @@ PRIV_TAG=${PRIV_TAG:-0p8}
 
 CHECKPOINT=${CHECKPOINT:-/work/scratch/checkpoints/fineweb/mixed_private_finetune_150m_fineweb2_spa_key${KEY_SIZE}pct${KEY_SUFFIX}_priv${PRIV_TAG}/final}
 KEY_PATH=${KEY_PATH:-/work/permutation-alignment/configs/keys/150m/both/key_${KEY_SIZE}pct${KEY_SUFFIX}.json}
+
+PUBLIC_DATA=${PUBLIC_DATA:-/work/scratch/data/datasets/fineweb/retain}
+PRIVATE_DATA=${PRIVATE_DATA:-/work/scratch/data/datasets/fineweb2_private/spa_Latn/retain}
+NUM_PROMPTS_PER_LANG=${NUM_PROMPTS_PER_LANG:-5}
+NUM_EN_PROMPTS=${NUM_EN_PROMPTS:-0}
+NUM_ES_PROMPTS=${NUM_ES_PROMPTS:-5}
+NUM_PREFIX_TOKENS=${NUM_PREFIX_TOKENS:-16}
 
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-192}
 TEMPERATURE=${TEMPERATURE:-0.0}
@@ -55,12 +62,22 @@ fi
 if [ -n "$OUTPUT_JSON" ]; then
     EXTRA_ARGS+=(--output_json "$OUTPUT_JSON")
 fi
+if [ -n "$NUM_EN_PROMPTS" ]; then
+    EXTRA_ARGS+=(--num_en_prompts "$NUM_EN_PROMPTS")
+fi
+if [ -n "$NUM_ES_PROMPTS" ]; then
+    EXTRA_ARGS+=(--num_es_prompts "$NUM_ES_PROMPTS")
+fi
 
 LOG_FILE="logs/qualitative_c1_c2_150m_fineweb2_spa_key${KEY_SIZE}pct${KEY_SUFFIX}_$(date +%Y%m%d_%H%M%S).log"
 
 PYTHONPATH=./src:. python3 scripts/eval/qualitative_fineweb2_spa_c1_c2.py \
   --checkpoint "$CHECKPOINT" \
   --key_path "$KEY_PATH" \
+  --public_data "$PUBLIC_DATA" \
+  --private_data "$PRIVATE_DATA" \
+  --num_prompts_per_lang "$NUM_PROMPTS_PER_LANG" \
+  --num_prefix_tokens "$NUM_PREFIX_TOKENS" \
   --max_new_tokens "$MAX_NEW_TOKENS" \
   --temperature "$TEMPERATURE" \
   --top_p "$TOP_P" \
