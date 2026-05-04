@@ -22,6 +22,25 @@ from tiered.model import GPTNeoForCausalLMTiered
 from tiered.permutation import load_key
 
 
+SPANISH_STATEMENT_PROMPTS = [
+    "La capital de España es",
+    "Los Juegos Olímpicos se celebran cada",
+    "El idioma oficial de Argentina es",
+    "Para preparar una paella necesitas",
+    "El presidente de México actualmente es",
+    "Las estaciones del año son primavera, verano,",
+    "El río más largo del mundo es",
+    "La fotosíntesis es el proceso por el cual",
+    "El sistema solar tiene ocho",
+    "El equipo que ganó el Mundial de fútbol en 2022 fue",
+    "La Real Academia Española se fundó en",
+    "El cuadro Las Meninas fue pintado por",
+    "El Quijote fue escrito por",
+    "Una de las ciudades más antiguas de América Latina es",
+    "El plato típico de México que se hace con maíz se llama",
+]
+
+
 UNUSED_LEGACY_PROMPTS = [
     {
         "lang": "en",
@@ -231,8 +250,17 @@ def main():
         prompts += _build_prompts_from_dataset(args.public_data, n_en,
                                                args.num_prefix_tokens, "en", tokenizer, rng)
     if n_es > 0:
-        prompts += _build_prompts_from_dataset(args.private_data, n_es,
-                                               args.num_prefix_tokens, "es", tokenizer, rng)
+        # Hand-written Spanish statement-style prompts: the model has to
+        # complete the assertion. Drawn at random so each run shows a
+        # different subset.
+        chosen = rng.sample(SPANISH_STATEMENT_PROMPTS,
+                            min(n_es, len(SPANISH_STATEMENT_PROMPTS)))
+        for j, text in enumerate(chosen, start=1):
+            prompts.append({
+                "lang": "es",
+                "id": f"es_{j}",
+                "prompt": text,
+            })
 
     outputs = []
     for i, item in enumerate(prompts, start=1):
